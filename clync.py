@@ -629,6 +629,69 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
+BIN_LINK = Path.home() / ".local/bin/clync"
+SKILL_LINK = Path.home() / ".claude/skills/clync"
+MCP_NAME = "clync"
+
+
+def _relink(link: Path, target: Path) -> None:
+    """Idempotently point a symlink at target; refuse to clobber a real file."""
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        raise RuntimeError(f"{link} exists and is not a symlink — refusing to overwrite.")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+
+
+def cmd_setup(args) -> int:
+    """One command to wire everything up from the repo: deps, CLI, MCP, scheduler,
+    skill. Every artifact is defined in this repo and symlinked/registered out;
+    `clync unsetup` reverses it."""
+    profile = _require_profile(args)
+
+    subprocess.run(["uv", "sync", "--quiet"], cwd=REPO_DIR, check=True)
+    print("✓ deps synced (uv)")
+
+    _relink(BIN_LINK, REPO_DIR / "clync")
+    on_path = str(BIN_LINK.parent) in os.environ.get("PATH", "").split(":")
+    print(f"✓ CLI: {BIN_LINK} -> clync"
+          + ("" if on_path else f"   ⚠ {BIN_LINK.parent} is NOT on your PATH"))
+
+    uv = shutil.which("uv") or "uv"
+    subprocess.run(["claude", "mcp", "remove", MCP_NAME], capture_output=True, text=True)
+    r = subprocess.run(
+        ["claude", "mcp", "add", "--scope", "user", MCP_NAME, "--",
+         uv, "run", "--project", str(REPO_DIR), "python", str(REPO_DIR / "mcp_server.py")],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"`claude mcp add` failed: {r.stderr.strip()}")
+    print("✓ MCP server registered with Claude Code (user scope)")
+
+    cmd_install(args)  # launchd daily job (prints its own lines)
+
+    _relink(SKILL_LINK, REPO_DIR / "skill")
+    print(f"✓ skill: {SKILL_LINK} -> skill/  (resolves to {SKILL_LINK.resolve()})")
+
+    print("\nSetup complete. Open a NEW Claude Code session to load the MCP tools "
+          "+ skill. Reverse anytime with `clync unsetup`.")
+    return 0
+
+
+def cmd_unsetup(args) -> int:
+    """Remove every external artifact setup created (repo stays intact)."""
+    cmd_uninstall(args)  # launchd
+    subprocess.run(["claude", "mcp", "remove", MCP_NAME], capture_output=True, text=True)
+    print(f"✓ MCP server '{MCP_NAME}' unregistered")
+    for link in (BIN_LINK, SKILL_LINK):
+        if link.is_symlink():
+            link.unlink()
+            print(f"✓ removed {link}")
+    print("Unset complete. The local DB in ~/.local/share/clync was left intact.")
+    return 0
+
+
 def cmd_status(args) -> int:
     """Scheduled-sync status: last success, launchd state, recent run log."""
     con = connect()
@@ -652,19 +715,26 @@ def cmd_status(args) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--profile", default=os.environ.get(PROFILE_ENV),
-                   help=f"Chrome profile display name (default: ${PROFILE_ENV})")
-    p.add_argument("--org", help="target org name or uuid (default: first/active org)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("whoami", help="print the resolved account + org").set_defaults(func=cmd_whoami)
+    # Shared account flags, attached to the subcommands that authenticate — so
+    # `clync sync --profile X` works (a top-level flag would have to precede the
+    # subcommand, which is a footgun).
+    cred = argparse.ArgumentParser(add_help=False)
+    cred.add_argument("--profile", default=os.environ.get(PROFILE_ENV),
+                      help=f"Chrome profile display name (default: ${PROFILE_ENV})")
+    cred.add_argument("--org", help="target org name or uuid (default: first/active org)")
 
-    sp = sub.add_parser("sync", help="incremental sync into the local DB")
+    sub.add_parser("whoami", parents=[cred], help="print the resolved account + org"
+                   ).set_defaults(func=cmd_whoami)
+
+    sp = sub.add_parser("sync", parents=[cred], help="incremental sync into the local DB")
     sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
     sp.set_defaults(func=cmd_sync)
 
-    sub.add_parser("scheduled", help="launchd entry point (sync + loud fail/late notify)"
+    sub.add_parser("scheduled", parents=[cred],
+                   help="launchd entry point (sync + loud fail/late notify)"
                    ).set_defaults(func=cmd_scheduled)
 
     sp = sub.add_parser("search", help="FTS5 search over message + attachment text")
@@ -678,11 +748,19 @@ def main() -> int:
 
     sub.add_parser("doctor", help="health check DB / deps / launchd / MCP").set_defaults(func=cmd_doctor)
 
-    sp = sub.add_parser("install", help="install the daily launchd sync")
+    sp = sub.add_parser("setup", parents=[cred],
+                        help="one-shot install: deps, CLI, MCP, scheduler, skill")
+    sp.add_argument("--at", default="09:00", help="daily sync time HH:MM (default 09:00)")
+    sp.set_defaults(func=cmd_setup)
+
+    sub.add_parser("unsetup", help="remove everything setup installed (keeps the DB)"
+                   ).set_defaults(func=cmd_unsetup)
+
+    sp = sub.add_parser("install", parents=[cred], help="install just the daily launchd sync")
     sp.add_argument("--at", default="09:00", help="daily time HH:MM (default 09:00)")
     sp.set_defaults(func=cmd_install)
 
-    sub.add_parser("uninstall", help="remove the launchd sync").set_defaults(func=cmd_uninstall)
+    sub.add_parser("uninstall", help="remove just the launchd sync").set_defaults(func=cmd_uninstall)
 
     sp = sub.add_parser("status", help="scheduled-sync status + recent run log")
     sp.add_argument("--tail", type=int, default=15, help="log lines to show")
