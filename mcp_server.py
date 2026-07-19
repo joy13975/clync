@@ -1,10 +1,10 @@
 """MCP server exposing the local claude.ai history DB to Claude Code (stdio).
 
-Read-only query layer over the SQLite/FTS5 database that `claude_history.py sync`
-populates. Registered with:
+Read-only query layer over the SQLite/FTS5 database that `clync sync` populates.
+Registered with:
 
-    claude mcp add --scope user claude-history -- \
-        uv run --project ~/code/claude-history python ~/code/claude-history/mcp_server.py
+    claude mcp add --scope user clync -- \
+        uv run --project ~/code/clync python ~/code/clync/mcp_server.py
 """
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ import json
 
 from mcp.server.fastmcp import FastMCP
 
-from claude_history import connect
+from clync import connect
 
-mcp = FastMCP("claude-history")
+mcp = FastMCP("clync")
 
 
 @mcp.tool()

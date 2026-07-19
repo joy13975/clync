@@ -1,5 +1,5 @@
 [project]
-name = "claude-history"
+name = "clync"
 version = "0.1.0"
 description = "Headless sync of claude.ai conversation history into a local SQLite/FTS5 DB, exposed to Claude Code over MCP."
 requires-python = ">=3.11"
