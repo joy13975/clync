@@ -39,13 +39,20 @@ uv run python clync.py doctor
 
 | Command | Purpose |
 |---|---|
-| `sync [--full]` | incremental sync (`--full` re-fetches everything) |
+| `sync [--full] [--no-files]` | incremental sync (`--full` re-fetches all; `--no-files` skips image downloads) |
 | `scheduled` | launchd entry point: sync + loud fail/late notification |
 | `search <q> [--limit N]` | FTS5 search over message + attachment text |
 | `list [--limit N]` | most recently updated conversations |
 | `whoami` | resolved account + org |
 | `doctor` | health check: DB, deps, launchd job, MCP registration |
+| `status [--tail N]` | last successful sync, launchd state, recent scheduled-run log |
 | `install [--at HH:MM]` / `uninstall` | manage the daily launchd job |
+
+A `clync` wrapper script sits in the repo; symlink it onto your PATH for global use:
+
+```sh
+ln -s ~/code/clync/clync ~/.local/bin/clync   # then: clync search "…", clync sync, clync status
+```
 
 ## Config
 
@@ -69,9 +76,17 @@ this Mac only.
   message to open claude.ai in the Chrome profile. There is no silent recovery —
   refreshing requires a real browser session (Cloudflare's JS challenge can't be
   solved headlessly).
-- **Binary file uploads** (images, non-text files in the `files` field) are
-  recorded as metadata in the stored raw JSON but **not downloaded**. Text
-  attachments (`.md`/`.txt`/`.docx` etc.) are fully indexed via their
-  `extracted_content`.
-- **Auth cookies are per Chrome profile**, so the tool is pointed at a profile,
-  not directly at an org — the org is selected after authenticating.
+- **File uploads:**
+  - *Text attachments* (`.md`/`.txt`/`.docx` …) — fully indexed via their
+    `extracted_content` (searchable).
+  - *Images* — downloaded to `~/.local/share/clync/files/<uuid>.<ext>` and
+    recorded in the `files` table. Note claude.ai serves them re-encoded as
+    **webp**, so this is the full-resolution image, not the byte-identical
+    original upload.
+  - *Binary blobs* (non-image, non-text uploads) — recorded as metadata only.
+    claude.ai exposes no download URL for them (the file object gives only a
+    server-sandbox path), so their bytes are not retrievable.
+- **Auth cookies are per Chrome profile** — a browser-level cookie jar, one
+  claude.ai login per profile. The tool is pointed at a profile because that is
+  where the login cookie physically lives; the org is selected after
+  authenticating (`--org` to pick a non-default one).

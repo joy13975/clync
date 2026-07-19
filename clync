@@ -1,0 +1,4 @@
+#!/bin/zsh
+# Convenience wrapper so you can run `clync <cmd>` from anywhere.
+# Symlink onto your PATH, e.g.:  ln -s ~/code/clync/clync ~/.local/bin/clync
+exec uv run --project /path/to/clync python /path/to/clync/clync.py "$@"

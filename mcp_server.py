@@ -67,11 +67,21 @@ def get_conversation(uuid: str) -> str:
             "WHERE conversation_uuid=? ORDER BY idx",
             (uuid,),
         ).fetchall()
+        files = con.execute(
+            "SELECT file_kind, file_name, local_path FROM files "
+            "WHERE conversation_uuid=?", (uuid,),
+        ).fetchall()
     finally:
         con.close()
     header = (f"# {conv['name'] or '(untitled)'}\n"
               f"model={conv['model']} updated={conv['updated_at']}\n"
               f"summary: {conv['summary'] or '(none)'}\n")
+    if files:
+        header += "attached files:\n" + "\n".join(
+            f"  - [{f['file_kind']}] {f['file_name']}"
+            + (f" -> {f['local_path']}" if f['local_path'] else " (not downloaded)")
+            for f in files
+        ) + "\n"
     body = "\n\n".join(
         f"## {m['sender']} ({m['created_at']})\n{m['text']}" for m in msgs
     )

@@ -31,8 +31,13 @@ PROFILE_ENV = "CLYNC_PROFILE"  # deployment sets this (e.g. in the launchd plist
 CHROME_DIR = Path.home() / "Library/Application Support/Google/Chrome"
 DB_PATH = Path(os.environ.get("CLYNC_DB",
                               Path.home() / ".local/share/clync/history.db"))
-BASE = "https://claude.ai/api"
+FILES_DIR = DB_PATH.parent / "files"
+HOST = "https://claude.ai"
+BASE = f"{HOST}/api"
 IMPERSONATE = "chrome"
+# content-type -> extension for downloaded image files (claude.ai serves webp)
+IMAGE_EXT = {"image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg",
+             "image/gif": ".gif"}
 # Cookies the browser sends that matter for auth + Cloudflare clearance. sessionKey
 # is the durable account credential; cf_clearance is Cloudflare's per-browser token
 # — without it, claude.ai intermittently serves a JS challenge (HTTP 403) under load.
@@ -122,8 +127,8 @@ def read_auth_cookies(profile_display_name: str) -> dict[str, str]:
     cookies = {name: _decrypt_cookie(val, key) for name, val in rows}
     if "sessionKey" not in cookies:
         raise RuntimeError(
-            f"Profile {profile_display_name!r} has no claude.ai sessionKey — "
-            "log into claude.ai in that Chrome profile."
+            f"No claude.ai login found in the {profile_display_name!r} Chrome "
+            f"profile. Open {HOST} in that profile and LOG IN, then re-run."
         )
     if not cookies["sessionKey"].startswith("sk-ant-sid"):
         raise RuntimeError("Decrypted sessionKey has an unexpected format.")
@@ -134,37 +139,47 @@ def read_auth_cookies(profile_display_name: str) -> dict[str, str]:
 # claude.ai private API client (Cloudflare-passing via TLS impersonation)
 # --------------------------------------------------------------------------- #
 class ClaudeClient:
-    def __init__(self, cookies: dict[str, str]):
+    def __init__(self, cookies: dict[str, str], profile: str | None = None):
         self._s = creq.Session()
         for name, value in cookies.items():
             self._s.cookies.set(name, value, domain=".claude.ai")
         self._last_request = 0.0
+        self._profile = profile
 
-    def _get(self, path: str) -> object:
+    def _request(self, url: str):
         # Cloudflare (external, not ours) intermittently 403s a JS challenge under
-        # load. Pace requests and retry a 403 with backoff; a persistent 403 after
-        # retries is a real auth/clearance failure and is raised loudly.
+        # load. Pace requests and retry a 403 with backoff; a persistent 401/403
+        # after retries is a real auth/clearance failure and is raised loudly.
         backoff = 2.0
         for attempt in range(3):
             gap = REQUEST_PACING_S - (time.monotonic() - self._last_request)
             if gap > 0:
                 time.sleep(gap)
-            r = self._s.get(f"{BASE}{path}", impersonate=IMPERSONATE, timeout=30)
+            r = self._s.get(url, impersonate=IMPERSONATE, timeout=30)
             self._last_request = time.monotonic()
             if r.status_code == 200:
-                return r.json()
+                return r
             if r.status_code == 403 and attempt < 2:
                 time.sleep(backoff)
                 backoff *= 2
                 continue
             if r.status_code in (401, 403):
+                where = f"the '{self._profile}' Chrome profile" if self._profile else "Chrome"
                 raise RuntimeError(
-                    f"claude.ai returned {r.status_code} for {path} after retries — "
-                    "the sessionKey/cf_clearance is expired or Cloudflare is "
-                    "blocking. Open claude.ai in the Chrome profile to refresh, "
-                    "then re-run."
+                    f"claude.ai returned {r.status_code} — your login is expired or "
+                    f"Cloudflare is blocking. Open {HOST} in {where} and LOG IN "
+                    "(a Chrome profile existing does NOT mean it is logged into "
+                    "Claude), then re-run."
                 )
-            raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:200]}")
+            raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
+
+    def _get(self, path: str) -> object:
+        return self._request(f"{BASE}{path}").json()
+
+    def get_file(self, rel_url: str) -> tuple[str, bytes]:
+        """Download a file by its relative API url (e.g. .../files/{uuid}/preview)."""
+        r = self._request(f"{HOST}{rel_url}")
+        return r.headers.get("content-type", "").split(";")[0], r.content
 
     def list_orgs(self) -> list[dict]:
         return self._get("/organizations")
@@ -226,6 +241,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text, conversation_uuid UNINDEXED, message_uuid UNINDEXED,
     tokenize='porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS files (
+    file_uuid          TEXT PRIMARY KEY,
+    conversation_uuid  TEXT NOT NULL,
+    message_uuid       TEXT,
+    file_kind          TEXT,
+    file_name          TEXT,
+    size_bytes         INTEGER,
+    local_path         TEXT,          -- set once downloaded (images only)
+    created_at         TEXT,
+    raw                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_files_conv ON files(conversation_uuid);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -303,9 +330,50 @@ def upsert_conversation(con: sqlite3.Connection, org_uuid: str, full: dict) -> N
             )
 
 
-def run_sync(profile: str, org_ref: str | None, full: bool) -> dict:
+def sync_files(con: sqlite3.Connection, client: ClaudeClient, conv: dict,
+               download: bool) -> int:
+    """Record file metadata for a conversation; download image files (not yet
+    local) to FILES_DIR. Returns how many files were newly downloaded.
+
+    Binary blobs (file_kind='blob') expose only a server sandbox `path`, no
+    download URL, so they are recorded as metadata only — not a silent skip.
+    """
+    downloaded = 0
+    for m in conv.get("chat_messages") or []:
+        for f in m.get("files") or []:
+            fid = f.get("file_uuid") or f.get("uuid")
+            if not fid:
+                continue
+            row = con.execute("SELECT local_path FROM files WHERE file_uuid=?",
+                              (fid,)).fetchone()
+            local = row[0] if row else None
+            if (download and not local and f.get("file_kind") == "image"
+                    and f.get("preview_url")):
+                ctype, data = client.get_file(f["preview_url"])  # full-res (webp)
+                FILES_DIR.mkdir(parents=True, exist_ok=True)
+                path = FILES_DIR / f"{fid}{IMAGE_EXT.get(ctype, '.bin')}"
+                path.write_bytes(data)
+                local = str(path)
+                downloaded += 1
+            con.execute(
+                """INSERT INTO files (file_uuid, conversation_uuid, message_uuid,
+                     file_kind, file_name, size_bytes, local_path, created_at, raw)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(file_uuid) DO UPDATE SET
+                     file_kind=excluded.file_kind, file_name=excluded.file_name,
+                     size_bytes=excluded.size_bytes, local_path=excluded.local_path,
+                     raw=excluded.raw""",
+                (fid, conv["uuid"], m.get("uuid"), f.get("file_kind"),
+                 f.get("file_name"), f.get("size_bytes"), local,
+                 f.get("created_at"), json.dumps(f, ensure_ascii=False)),
+            )
+    return downloaded
+
+
+def run_sync(profile: str, org_ref: str | None, full: bool,
+             download_files: bool = True) -> dict:
     """Core incremental sync. Returns stats. Raises loudly on any failure."""
-    client = ClaudeClient(read_auth_cookies(profile))
+    client = ClaudeClient(read_auth_cookies(profile), profile)
     org = resolve_org(client, org_ref)
     org_uuid = org["uuid"]
     print(f"[{_now()}] syncing profile={profile!r} org={org.get('name')!r} ({org_uuid})")
@@ -317,7 +385,7 @@ def run_sync(profile: str, org_ref: str | None, full: bool) -> dict:
     remote = client.list_conversations(org_uuid)
     print(f"  remote conversations: {len(remote)} | already stored: {len(stored)}")
 
-    fetched = skipped = 0
+    fetched = skipped = files_dl = 0
     for c in remote:
         cid = c["uuid"]
         if not full and stored.get(cid) == c.get("updated_at"):
@@ -325,6 +393,7 @@ def run_sync(profile: str, org_ref: str | None, full: bool) -> dict:
             continue
         full_conv = client.get_conversation(org_uuid, cid)
         upsert_conversation(con, org_uuid, full_conv)
+        files_dl += sync_files(con, client, full_conv, download_files)
         con.commit()
         fetched += 1
         print(f"  [{fetched}] {c.get('name') or '(untitled)'} "
@@ -335,8 +404,9 @@ def run_sync(profile: str, org_ref: str | None, full: bool) -> dict:
     con.commit()
     con.close()
     print(f"[done] fetched/updated={fetched} unchanged={skipped} "
-          f"total_messages_in_db={total_msgs} db={DB_PATH}")
-    return {"fetched": fetched, "skipped": skipped, "org": org.get("name")}
+          f"images_downloaded={files_dl} total_messages_in_db={total_msgs} db={DB_PATH}")
+    return {"fetched": fetched, "skipped": skipped, "images_downloaded": files_dl,
+            "org": org.get("name")}
 
 
 # --------------------------------------------------------------------------- #
@@ -380,7 +450,7 @@ def _require_profile(args) -> str:
 
 def cmd_whoami(args) -> int:
     profile = _require_profile(args)
-    org = resolve_org(ClaudeClient(read_auth_cookies(profile)), args.org)
+    org = resolve_org(ClaudeClient(read_auth_cookies(profile), profile), args.org)
     print(f"Chrome profile : {profile}")
     print(f"Org            : {org.get('name')!r}")
     print(f"Org uuid       : {org['uuid']}")
@@ -389,7 +459,8 @@ def cmd_whoami(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    run_sync(_require_profile(args), args.org, args.full)
+    run_sync(_require_profile(args), args.org, args.full,
+             download_files=not args.no_files)
     return 0
 
 
@@ -463,10 +534,14 @@ def cmd_doctor(args) -> int:
         con = connect()
         nconv = con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
         nmsg = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        nfile = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        ndl = con.execute("SELECT COUNT(*) FROM files WHERE local_path IS NOT NULL"
+                          ).fetchone()[0]
         last = get_meta(con, "last_success")
         con.close()
         print(f"DB          : {DB_PATH}\n              {nconv} conversations, "
-              f"{nmsg} messages, last_success={last}")
+              f"{nmsg} messages, {nfile} files ({ndl} images downloaded), "
+              f"last_success={last}")
         if last:
             gap = datetime.now(timezone.utc) - datetime.fromisoformat(last)
             if gap > timedelta(hours=LATE_THRESHOLD_H):
@@ -554,6 +629,27 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
+def cmd_status(args) -> int:
+    """Scheduled-sync status: last success, launchd state, recent run log."""
+    con = connect()
+    last = get_meta(con, "last_success")
+    con.close()
+    print(f"last successful sync : {last or '(never)'}")
+    loaded = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+        capture_output=True, text=True,
+    ).returncode == 0
+    print(f"launchd job          : {'loaded (daily)' if loaded else 'NOT loaded'}")
+    if SCHED_LOG.exists():
+        lines = SCHED_LOG.read_text(errors="replace").splitlines()
+        print(f"\nlast {min(args.tail, len(lines))} scheduled-log lines ({SCHED_LOG}):")
+        for ln in lines[-args.tail:]:
+            print(f"  {ln}")
+    else:
+        print(f"\nno scheduled runs logged yet ({SCHED_LOG} absent).")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--profile", default=os.environ.get(PROFILE_ENV),
@@ -565,6 +661,7 @@ def main() -> int:
 
     sp = sub.add_parser("sync", help="incremental sync into the local DB")
     sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
+    sp.add_argument("--no-files", action="store_true", help="skip image downloads")
     sp.set_defaults(func=cmd_sync)
 
     sub.add_parser("scheduled", help="launchd entry point (sync + loud fail/late notify)"
@@ -586,6 +683,10 @@ def main() -> int:
     sp.set_defaults(func=cmd_install)
 
     sub.add_parser("uninstall", help="remove the launchd sync").set_defaults(func=cmd_uninstall)
+
+    sp = sub.add_parser("status", help="scheduled-sync status + recent run log")
+    sp.add_argument("--tail", type=int, default=15, help="log lines to show")
+    sp.set_defaults(func=cmd_status)
 
     args = p.parse_args()
     return args.func(args)
