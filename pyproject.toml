@@ -1,0 +1,13 @@
+[project]
+name = "claude-history"
+version = "0.1.0"
+description = "Headless sync of claude.ai conversation history into a local SQLite/FTS5 DB, exposed to Claude Code over MCP."
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=42",
+    "curl_cffi>=0.7",
+    "mcp>=1.2",
+]
+
+[tool.ruff]
+line-length = 100
