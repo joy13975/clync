@@ -4,12 +4,61 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import types
 
 import pytest
 
 import clync
 
 search = pytest.importorskip("search")
+
+
+def _fake_client(orgs):
+    return types.SimpleNamespace(list_orgs=lambda: orgs)
+
+
+def test_resolve_orgs_defaults_to_all_chat_capable():
+    # the wrong-org bug: syncing only the first org drops the rest. Default now =
+    # every chat-capable org; an api-only org (no 'chat' capability) is excluded.
+    client = _fake_client([
+        {"uuid": "o1", "name": "Work", "capabilities": ["chat"]},
+        {"uuid": "o2", "name": "Org2", "capabilities": ["raven", "chat"]},
+        {"uuid": "o3", "name": "Org3", "capabilities": ["api"]},
+    ])
+    assert [o["name"] for o in clync.resolve_orgs(client, None)] == ["Work", "Org2"]
+
+
+def test_resolve_orgs_includes_orgs_with_unknown_capabilities():
+    # the silent-drop trap: an org whose capabilities field is absent or empty must
+    # NOT be dropped (we can't prove it holds no chats) — only a positively-non-chat
+    # org (api-only) is excluded.
+    client = _fake_client([
+        {"uuid": "o1", "name": "Chatful", "capabilities": ["chat"]},
+        {"uuid": "o2", "name": "NoCapField"},                       # absent -> include
+        {"uuid": "o3", "name": "EmptyCaps", "capabilities": []},     # empty  -> include
+        {"uuid": "o4", "name": "ApiOnly", "capabilities": ["api"]},  # non-chat -> exclude
+    ])
+    assert ([o["name"] for o in clync.resolve_orgs(client, None)]
+            == ["Chatful", "NoCapField", "EmptyCaps"])
+
+
+def test_resolve_orgs_never_syncs_nothing():
+    # if EVERY org positively advertises a non-chat capability set, fall back to all
+    # rather than sync nothing (a wrong token assumption must not silently drop all).
+    client = _fake_client([
+        {"uuid": "o1", "name": "A", "capabilities": ["api"]},
+        {"uuid": "o2", "name": "B", "capabilities": ["raven"]},
+    ])
+    assert [o["name"] for o in clync.resolve_orgs(client, None)] == ["A", "B"]
+
+
+def test_resolve_orgs_explicit_selects_one():
+    client = _fake_client([
+        {"uuid": "o1", "name": "Work", "capabilities": ["chat"]},
+        {"uuid": "o2", "name": "Org2", "capabilities": ["chat"]},
+    ])
+    assert [o["uuid"] for o in clync.resolve_orgs(client, "Org2")] == ["o2"]
+    assert [o["uuid"] for o in clync.resolve_orgs(client, "o1")] == ["o1"]
 
 
 def test_message_text_content_blocks():

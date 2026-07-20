@@ -194,21 +194,54 @@ class ClaudeClient:
             "?tree=True&rendering_mode=messages&render_all_tools=true"
         )
 
+    def list_projects(self, org_uuid: str) -> list[dict]:
+        return self._get(f"/organizations/{org_uuid}/projects")
 
-def resolve_org(client: ClaudeClient, org_ref: str | None) -> dict:
-    """Resolve the target org: an explicit name/uuid, else the first (active) org."""
+    def list_project_docs(self, org_uuid: str, project_uuid: str) -> list[dict]:
+        return self._get(f"/organizations/{org_uuid}/projects/{project_uuid}/docs")
+
+
+CHAT_CAPABILITY = "chat"       # capability token that marks an org as chat-bearing
+
+
+def resolve_orgs(client: ClaudeClient, org_ref: str | None) -> list[dict]:
+    """Which orgs to sync. Explicit --org name/uuid -> just that one. Otherwise ALL
+    chat-bearing orgs on the login (a user's history spans every org they chat in;
+    syncing only the first silently drops the rest).
+
+    An org is EXCLUDED only when it positively advertises capabilities that do NOT
+    include the chat token (e.g. an api-only org, which 403s on chat endpoints). An
+    org with an absent/empty capabilities field is INCLUDED, not silently dropped —
+    we can't prove it holds no chats, and a spurious chat endpoint just yields zero
+    conversations. Every exclusion is printed, so a wrong capability-token
+    assumption fails loud instead of silently swallowing a real chat org."""
     orgs = client.list_orgs()
     if not orgs:
         raise RuntimeError("Account has no organizations.")
-    if not org_ref:
-        return orgs[0]
+    if org_ref:
+        match = [o for o in orgs if org_ref in (o.get("uuid"), o.get("name"))]
+        if not match:
+            raise RuntimeError(
+                f"No org matching {org_ref!r} in this account. "
+                f"Available: {[o.get('name') for o in orgs]}")
+        return match
+    selected, excluded = [], []
     for o in orgs:
-        if org_ref in (o.get("uuid"), o.get("name")):
-            return o
-    raise RuntimeError(
-        f"No org matching {org_ref!r} in this account. "
-        f"Available: {[o.get('name') for o in orgs]}"
-    )
+        caps = o.get("capabilities")
+        # Include when chat is advertised OR when capabilities are unknown (absent/
+        # empty); exclude only a positively-non-chat org.
+        if not caps or CHAT_CAPABILITY in caps:
+            selected.append(o)
+        else:
+            excluded.append(o)
+    if excluded:
+        print(f"[resolve_orgs] excluding {len(excluded)} non-chat org(s) "
+              f"(no {CHAT_CAPABILITY!r} capability): {[o.get('name') for o in excluded]}")
+    if not selected:
+        # Every org positively advertised non-chat capabilities -> don't sync nothing.
+        print("[resolve_orgs] no chat-bearing org found; syncing all orgs")
+        return orgs
+    return selected
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +287,28 @@ CREATE TABLE IF NOT EXISTS files (
     raw                TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_files_conv ON files(conversation_uuid);
+CREATE TABLE IF NOT EXISTS projects (
+    uuid           TEXT PRIMARY KEY,
+    org_uuid       TEXT NOT NULL,
+    name           TEXT,
+    description    TEXT,
+    created_at     TEXT,
+    updated_at     TEXT,
+    raw            TEXT NOT NULL,
+    synced_at      TEXT NOT NULL
+);
+-- Project knowledge documents (project-level files / instructions, distinct from
+-- per-message attachments). These carry substantial searchable content.
+CREATE TABLE IF NOT EXISTS project_docs (
+    uuid           TEXT PRIMARY KEY,
+    project_uuid   TEXT NOT NULL REFERENCES projects(uuid),
+    file_name      TEXT,
+    content        TEXT,
+    created_at     TEXT,
+    raw            TEXT NOT NULL,
+    synced_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_docs_proj ON project_docs(project_uuid);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -371,21 +426,74 @@ def sync_files(con: sqlite3.Connection, client: ClaudeClient, conv: dict,
     return downloaded
 
 
+def upsert_project(con: sqlite3.Connection, org_uuid: str, p: dict) -> None:
+    con.execute(
+        """INSERT INTO projects
+             (uuid, org_uuid, name, description, created_at, updated_at, raw, synced_at)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(uuid) DO UPDATE SET
+             name=excluded.name, description=excluded.description,
+             created_at=excluded.created_at, updated_at=excluded.updated_at,
+             raw=excluded.raw, synced_at=excluded.synced_at""",
+        (p["uuid"], org_uuid, p.get("name"), p.get("description"),
+         p.get("created_at"), p.get("updated_at"),
+         json.dumps(p, ensure_ascii=False), _now()),
+    )
+
+
+def upsert_project_docs(con: sqlite3.Connection, project_uuid: str,
+                        docs: list[dict]) -> None:
+    """Replace a surviving project's knowledge docs wholesale (mirrors the
+    message-replace pattern) so a doc deleted upstream also disappears locally. A
+    whole project deleted upstream is purged separately in _sync_org (it is no
+    longer listed, so this is never called for it)."""
+    con.execute("DELETE FROM project_docs WHERE project_uuid=?", (project_uuid,))
+    for d in docs:
+        con.execute(
+            """INSERT INTO project_docs
+                 (uuid, project_uuid, file_name, content, created_at, raw, synced_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (d["uuid"], project_uuid, d.get("file_name"), d.get("content"),
+             d.get("created_at"), json.dumps(d, ensure_ascii=False), _now()),
+        )
+
+
 def run_sync(profile: str, org_ref: str | None, full: bool,
              download_files: bool = True) -> dict:
-    """Core incremental sync. Returns stats. Raises loudly on any failure."""
+    """Core incremental sync across ALL target orgs (see resolve_orgs). Returns
+    aggregate stats. Raises loudly on any failure."""
     client = ClaudeClient(read_auth_cookies(profile), profile)
-    org = resolve_org(client, org_ref)
-    org_uuid = org["uuid"]
-    print(f"[{_now()}] syncing profile={profile!r} org={org.get('name')!r} ({org_uuid})")
+    orgs = resolve_orgs(client, org_ref)
+    print(f"[{_now()}] syncing profile={profile!r} "
+          f"orgs={[o.get('name') for o in orgs]}")
 
     con = connect()
+    totals = {"fetched": 0, "skipped": 0, "images_downloaded": 0,
+              "projects": 0, "project_docs": 0, "orgs": []}
+    for org in orgs:
+        _sync_org(con, client, org, full, download_files, totals)
+    set_meta(con, "last_success", _now())
+    total_msgs = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    con.commit()
+    con.close()
+    print(f"[done] fetched/updated={totals['fetched']} unchanged={totals['skipped']} "
+          f"images_downloaded={totals['images_downloaded']} "
+          f"projects={totals['projects']} project_docs={totals['project_docs']} "
+          f"total_messages_in_db={total_msgs} db={DB_PATH}")
+    return totals
+
+
+def _sync_org(con: sqlite3.Connection, client: ClaudeClient, org: dict,
+              full: bool, download_files: bool, totals: dict) -> None:
+    """Sync one org: its conversations (incl. project-associated chats, which the
+    chat_conversations listing already returns) and its projects + knowledge docs."""
+    org_uuid = org["uuid"]
+    print(f"  org {org.get('name')!r} ({org_uuid}):")
     stored = dict(con.execute(
         "SELECT uuid, updated_at FROM conversations WHERE org_uuid=?", (org_uuid,)
     ).fetchall())
     remote = client.list_conversations(org_uuid)
-    print(f"  remote conversations: {len(remote)} | already stored: {len(stored)}")
-
+    print(f"    conversations: {len(remote)} remote | {len(stored)} already stored")
     fetched = skipped = files_dl = 0
     for c in remote:
         cid = c["uuid"]
@@ -397,17 +505,32 @@ def run_sync(profile: str, org_ref: str | None, full: bool,
         files_dl += sync_files(con, client, full_conv, download_files)
         con.commit()
         fetched += 1
-        print(f"  [{fetched}] {c.get('name') or '(untitled)'} "
-              f"({len(full_conv.get('chat_messages') or [])} msgs)")
 
-    set_meta(con, "last_success", _now())
-    total_msgs = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    projects = client.list_projects(org_uuid)
+    ndocs = 0
+    for p in projects:
+        upsert_project(con, org_uuid, p)
+        docs = client.list_project_docs(org_uuid, p["uuid"])
+        upsert_project_docs(con, p["uuid"], docs)
+        ndocs += len(docs)
+    # Purge projects (and their docs) deleted upstream: a project no longer listed
+    # for this org is gone, so its rows and knowledge docs must not linger (they'd
+    # stay indexed/served). Mirrors the wholesale-replace intent one level up.
+    live = {p["uuid"] for p in projects}
+    stored_projects = [r[0] for r in con.execute(
+        "SELECT uuid FROM projects WHERE org_uuid=?", (org_uuid,)).fetchall()]
+    purged = [pid for pid in stored_projects if pid not in live]
+    for pid in purged:
+        con.execute("DELETE FROM project_docs WHERE project_uuid=?", (pid,))
+        con.execute("DELETE FROM projects WHERE uuid=?", (pid,))
     con.commit()
-    con.close()
-    print(f"[done] fetched/updated={fetched} unchanged={skipped} "
-          f"images_downloaded={files_dl} total_messages_in_db={total_msgs} db={DB_PATH}")
-    return {"fetched": fetched, "skipped": skipped, "images_downloaded": files_dl,
-            "org": org.get("name")}
+    print(f"    fetched/updated={fetched} unchanged={skipped} images={files_dl} "
+          f"projects={len(projects)} project_docs={ndocs}")
+    for k, v in (("fetched", fetched), ("skipped", skipped),
+                 ("images_downloaded", files_dl), ("projects", len(projects)),
+                 ("project_docs", ndocs)):
+        totals[k] += v
+    totals["orgs"].append(org.get("name"))
 
 
 # --------------------------------------------------------------------------- #
@@ -451,11 +574,12 @@ def _require_profile(args) -> str:
 
 def cmd_whoami(args) -> int:
     profile = _require_profile(args)
-    org = resolve_org(ClaudeClient(read_auth_cookies(profile), profile), args.org)
+    orgs = resolve_orgs(ClaudeClient(read_auth_cookies(profile), profile), args.org)
     print(f"Chrome profile : {profile}")
-    print(f"Org            : {org.get('name')!r}")
-    print(f"Org uuid       : {org['uuid']}")
-    print(f"Billing type   : {org.get('billing_type')}")
+    print(f"Orgs to sync   : {len(orgs)}")
+    for org in orgs:
+        print(f"  - {org.get('name')!r}  uuid={org['uuid']}  "
+              f"billing={org.get('billing_type')}  caps={org.get('capabilities')}")
     return 0
 
 
@@ -798,7 +922,8 @@ def main() -> int:
     cred = argparse.ArgumentParser(add_help=False)
     cred.add_argument("--profile", default=os.environ.get(PROFILE_ENV),
                       help=f"Chrome profile display name (default: ${PROFILE_ENV})")
-    cred.add_argument("--org", help="target org name or uuid (default: first/active org)")
+    cred.add_argument("--org", help="restrict to one org name or uuid "
+                                     "(default: all chat-capable orgs)")
 
     sub.add_parser("whoami", parents=[cred], help="print the resolved account + org"
                    ).set_defaults(func=cmd_whoami)

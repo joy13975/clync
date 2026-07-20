@@ -14,6 +14,7 @@ silent fallback to stale or partial results.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -67,10 +68,17 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_conv ON chunks(conv_uuid);
 CREATE INDEX IF NOT EXISTS idx_chunks_lang ON chunks(lang);
 CREATE INDEX IF NOT EXISTS idx_chunks_updated ON chunks(updated_at);
--- per-conversation index watermark, for incremental re-embedding
+-- Per-unit (conversation OR project-doc) index watermark, for incremental
+-- re-embedding. The watermark is an opaque sha256 over the EXACT bytes embedded for
+-- that unit (message/doc text plus the rendered `[Project] name` prefix), so a
+-- change to any embedded input (doc edit, project rename, message edit) flips it and
+-- the unit re-embeds on the default incremental run. It lives in the `updated_at`
+-- column, which historically held an API timestamp -- keeping the column name means
+-- a live cluster needs no schema migration, since only the watermark's derivation
+-- changed, not its role. Always non-null, so it can never NULL-abort the INSERT.
 CREATE TABLE IF NOT EXISTS indexed_convs (
     conv_uuid   text PRIMARY KEY,
-    updated_at  text NOT NULL,
+    updated_at  text NOT NULL,          -- content signature (see note above)
     indexed_at  text NOT NULL
 );
 """
@@ -202,31 +210,67 @@ def _lang(s: str) -> str:
     return "en"
 
 
-def _load_chunks(sqlite_con, only_convs: set[str] | None = None) -> list[dict]:
-    if only_convs is not None and not only_convs:
-        return []                                  # nothing requested
-    q = ("SELECT m.uuid mid, m.conversation_uuid cid, m.sender, m.text, m.idx, "
-         "m.created_at, c.name cname, c.updated_at cupd "
-         "FROM messages m JOIN conversations c ON c.uuid=m.conversation_uuid "
-         "WHERE m.text IS NOT NULL AND m.text != ''")
-    params: tuple = ()
-    if only_convs is not None:                     # push the filter into SQL
-        q += f" AND m.conversation_uuid IN ({','.join('?' * len(only_convs))})"
-        params = tuple(only_convs)
-    rows = sqlite_con.execute(q, params).fetchall()
+def _pieces(text: str) -> list[str]:
     step = CHUNK_CHARS - CHUNK_OVERLAP
+    # range(0, max(1, len(text)), step) always includes index 0 -> >=1 piece.
+    return [text[i:i + CHUNK_CHARS] for i in range(0, max(1, len(text)), step)]
+
+
+# The chunks-table column shape (all columns except the two embedding vectors).
+# SSOT for BOTH the row dicts the loaders build (_chunk_row) AND the INSERT column
+# list in build_index — add/rename a column in exactly one place.
+CHUNK_COLS = ("chunk_id", "conv_uuid", "conv_name", "sender", "msg_idx",
+              "chunk_idx", "lang", "created_at", "updated_at", "text")
+
+
+def _chunk_row(*, chunk_id: str, conv_uuid: str, conv_name: str, sender: str,
+               msg_idx: int, chunk_idx: int, created_at, updated_at,
+               text: str) -> dict:
+    """Build one chunks-table row dict — the single definition of the row shape,
+    shared by both loaders. `lang` is derived from the embedded `text`."""
+    return {"chunk_id": chunk_id, "conv_uuid": conv_uuid, "conv_name": conv_name,
+            "sender": sender, "msg_idx": msg_idx, "chunk_idx": chunk_idx,
+            "lang": _lang(text), "created_at": created_at, "updated_at": updated_at,
+            "text": text}
+
+
+def _load_chunks(sqlite_con) -> list[dict]:
+    # LEFT JOIN projects so a project-associated chat carries its project name into
+    # both the embedded text and the displayed result (e.g. "[Work] CNX sour guy…").
+    q = ("SELECT m.uuid mid, m.conversation_uuid cid, m.sender, m.text, m.idx, "
+         "m.created_at, c.name cname, c.updated_at cupd, pr.name pname "
+         "FROM messages m JOIN conversations c ON c.uuid=m.conversation_uuid "
+         "LEFT JOIN projects pr ON pr.uuid=c.project_uuid "
+         "WHERE m.text IS NOT NULL AND m.text != ''")
     chunks = []
-    for r in rows:
-        text = r["text"]
-        pieces = [text[i:i + CHUNK_CHARS] for i in range(0, max(1, len(text)), step)] or [text]
-        for j, piece in enumerate(pieces):
-            body = f"[{r['cname'] or 'untitled'}] {r['sender']}: {piece}"
-            chunks.append({
-                "chunk_id": f"{r['mid']}#{j}", "conv_uuid": r["cid"],
-                "conv_name": r["cname"], "sender": r["sender"], "msg_idx": r["idx"],
-                "chunk_idx": j, "lang": _lang(body), "created_at": r["created_at"],
-                "updated_at": r["cupd"], "text": body,
-            })
+    for r in sqlite_con.execute(q).fetchall():
+        prefix = f"[{r['pname']}] " if r["pname"] else ""
+        name = f"{prefix}{r['cname'] or 'untitled'}"
+        for j, piece in enumerate(_pieces(r["text"])):
+            chunks.append(_chunk_row(
+                chunk_id=f"{r['mid']}#{j}", conv_uuid=r["cid"], conv_name=name,
+                sender=r["sender"], msg_idx=r["idx"], chunk_idx=j,
+                created_at=r["created_at"], updated_at=r["cupd"],
+                text=f"{name} | {r['sender']}: {piece}"))
+    return chunks
+
+
+def _load_doc_chunks(sqlite_con) -> list[dict]:
+    """Project knowledge docs as retrievable units — indexed into the same `chunks`
+    table as conversations (conv_uuid = doc uuid), so hybrid_search returns them
+    alongside chats with no query-side change."""
+    q = ("SELECT d.uuid did, d.file_name fname, d.content, d.created_at, pr.name pname "
+         "FROM project_docs d JOIN projects pr ON pr.uuid=d.project_uuid "
+         "WHERE d.content IS NOT NULL AND d.content != ''")
+    chunks = []
+    for r in sqlite_con.execute(q).fetchall():
+        name = f"[{r['pname']}] {r['fname'] or 'document'}"
+        for j, piece in enumerate(_pieces(r["content"])):
+            chunks.append(_chunk_row(
+                chunk_id=f"{r['did']}#{j}", conv_uuid=r["did"], conv_name=name,
+                sender="project_doc", msg_idx=0, chunk_idx=j,
+                created_at=r["created_at"], updated_at=r["created_at"],
+                text=f"{name}: {piece}"))
     return chunks
 
 
@@ -272,51 +316,82 @@ def _sparse_literal(weights: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Indexing
 # --------------------------------------------------------------------------- #
+def _unit_signature(chunks: list[dict]) -> str:
+    """Deterministic content signature for one unit (conversation or project doc):
+    a sha256 over the EXACT bytes embedded for it — each chunk's id plus its `text`,
+    where `text` already carries the rendered `[Project] name` prefix. Any change to
+    the embedded content — an in-place doc edit, a project rename (changes the
+    prefix), a message edit, an added/removed chunk — flips the signature, so the
+    unit re-embeds on the default incremental run. A unit with no chunks hashes to a
+    stable constant. Never NULL, so it can never NULL-abort the indexed_convs INSERT
+    nor collapse the incremental staleness test (a real value always != None)."""
+    h = hashlib.sha256()
+    for c in sorted(chunks, key=lambda c: c["chunk_id"]):
+        h.update(c["chunk_id"].encode("utf-8"))
+        h.update(b"\x00")
+        h.update(c["text"].encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
 def build_index(full: bool = False) -> dict:
-    """Embed new/changed conversations into the contained cluster. Incremental
-    by conversation updated_at unless `full`. Returns stats."""
+    """Embed new/changed conversations AND project knowledge docs into the contained
+    cluster. A unit is (re)embedded whenever the exact bytes folded into its chunks
+    change — tracked by a content signature over those bytes (`_unit_signature`),
+    NOT an API timestamp — so an in-place doc edit, a project rename, or a message
+    edit all mark the unit stale on the default incremental run. `full` re-embeds
+    everything. Both kinds are indexed into the same `chunks` table as retrievable
+    units (indexed_convs.conv_uuid tracks either). Returns stats."""
     ensure_cluster()
     sq = connect()
-    convs = {r["uuid"]: r["updated_at"] for r in
-             sq.execute("SELECT uuid, updated_at FROM conversations").fetchall()}
+    # The universe of units is EVERY conversation + project doc (incl. ones whose
+    # text is now empty -> zero chunks), so an emptied unit still gets purged and its
+    # watermark advanced rather than reindexing forever.
+    universe = {r[0] for r in sq.execute("SELECT uuid FROM conversations").fetchall()}
+    universe |= {r[0] for r in sq.execute("SELECT uuid FROM project_docs").fetchall()}
+    # Load every unit's chunks (local SQLite read — cheap; embedding is the only
+    # expensive step and is confined to the stale units below). The chunk `text` is
+    # the exact byte string that gets embedded, so a signature over it captures every
+    # embedded-content change with no dependence on any API timestamp.
+    chunks = _load_chunks(sq) + _load_doc_chunks(sq)
+    sq.close()
+    by_unit: dict[str, list[dict]] = {}
+    for c in chunks:
+        by_unit.setdefault(c["conv_uuid"], []).append(c)
+    sigs = {u: _unit_signature(by_unit.get(u, [])) for u in universe}
     with connect_pg() as pg:
         indexed = {r[0]: r[1] for r in
                    pg.execute("SELECT conv_uuid, updated_at FROM indexed_convs").fetchall()}
         if full:
-            stale = set(convs)
+            stale = set(universe)
         else:
-            stale = {u for u, upd in convs.items() if indexed.get(u) != upd}
-        # also drop index rows for conversations that vanished from the raw store
-        gone = set(indexed) - set(convs)
-
-        # On a full reindex `stale` == every conversation, so the IN-filter is a
-        # no-op — pass None to skip it and avoid the SQLite bound-variable ceiling
-        # (incremental `stale` sets are small and safely fit the IN-clause).
-        chunks = _load_chunks(sq, only_convs=None if full else stale) if stale else []
-        sq.close()
-        # Gate on stale/gone, NOT on chunks: a stale conv that now yields zero
-        # chunks (all its messages emptied) still needs its old chunks purged and
-        # its watermark advanced below — otherwise stale rows linger and it
-        # reindexes every run.
+            stale = {u for u in universe if indexed.get(u) != sigs[u]}
+        # drop index rows for units that vanished from the raw store entirely
+        gone = set(indexed) - universe
+        # Gate on stale/gone, NOT on chunks: a stale unit that now yields zero
+        # chunks (emptied messages / empty doc) still needs its old chunks purged
+        # and its watermark advanced — otherwise stale rows linger + it reindexes
+        # every run.
         if not stale and not gone:
             return {"reindexed_convs": 0, "chunks": 0, "removed_convs": 0}
 
+        # Embed only the stale units' chunks (the whole corpus is already loaded).
+        stale_chunks = [c for c in chunks if c["conv_uuid"] in stale]
         dense, sparse = ([], [])
-        if chunks:
-            dense, sparse = _embed([c["text"] for c in chunks], max_length=2048)
+        if stale_chunks:
+            dense, sparse = _embed([c["text"] for c in stale_chunks], max_length=2048)
 
+        cols = ", ".join(CHUNK_COLS)
+        placeholders = ",".join(["%s"] * len(CHUNK_COLS)) + ",%s::vector,%s::sparsevec"
         now = datetime.now(timezone.utc).isoformat()
         with pg.cursor() as cur:
             for u in stale | gone:
                 cur.execute("DELETE FROM chunks WHERE conv_uuid=%s", (u,))
-            for c, d, s in zip(chunks, dense, sparse):
+            for c, d, s in zip(stale_chunks, dense, sparse):
                 cur.execute(
-                    "INSERT INTO chunks (chunk_id, conv_uuid, conv_name, sender, "
-                    "msg_idx, chunk_idx, lang, created_at, updated_at, text, dense, sparse) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s::sparsevec)",
-                    (c["chunk_id"], c["conv_uuid"], c["conv_name"], c["sender"],
-                     c["msg_idx"], c["chunk_idx"], c["lang"], c["created_at"],
-                     c["updated_at"], c["text"], _dense_literal(d), _sparse_literal(s)))
+                    f"INSERT INTO chunks ({cols}, dense, sparse) VALUES ({placeholders})",
+                    tuple(c[k] for k in CHUNK_COLS)
+                    + (_dense_literal(d), _sparse_literal(s)))
             for u in gone:
                 cur.execute("DELETE FROM indexed_convs WHERE conv_uuid=%s", (u,))
             for u in stale:
@@ -324,9 +399,10 @@ def build_index(full: bool = False) -> dict:
                     "INSERT INTO indexed_convs (conv_uuid, updated_at, indexed_at) "
                     "VALUES (%s,%s,%s) ON CONFLICT(conv_uuid) DO UPDATE SET "
                     "updated_at=excluded.updated_at, indexed_at=excluded.indexed_at",
-                    (u, convs[u], now))
+                    (u, sigs[u], now))
         pg.commit()
-    return {"reindexed_convs": len(stale), "chunks": len(chunks),
+    # reindexed_convs counts all reindexed UNITS (conversations + project docs).
+    return {"reindexed_convs": len(stale), "chunks": len(stale_chunks),
             "removed_convs": len(gone)}
 
 
