@@ -811,7 +811,8 @@ def cmd_uninstall(args) -> int:
 
 
 BIN_LINK = Path.home() / ".local/bin/clync"
-SKILL_LINK = Path.home() / ".claude/skills/clync"
+SKILL_LINK = Path.home() / ".claude/skills/clync"          # history-search (auto-fires)
+OPS_SKILL_LINK = Path.home() / ".claude/skills/clync-ops"  # operate/troubleshoot (invoked)
 MCP_NAME = "clync"
 
 
@@ -854,6 +855,9 @@ def cmd_setup(args) -> int:
 
     _relink(SKILL_LINK, REPO_DIR / "skill")
     print(f"✓ skill: {SKILL_LINK} -> skill/  (resolves to {SKILL_LINK.resolve()})")
+    _relink(OPS_SKILL_LINK, REPO_DIR / "skill-ops")
+    print(f"✓ ops skill: {OPS_SKILL_LINK} -> skill-ops/  "
+          f"(resolves to {OPS_SKILL_LINK.resolve()})")
 
     import search
     if not search.available():
@@ -878,7 +882,7 @@ def cmd_unsetup(args) -> int:
     cmd_uninstall(args)  # launchd
     subprocess.run(["claude", "mcp", "remove", MCP_NAME], capture_output=True, text=True)
     print(f"✓ MCP server '{MCP_NAME}' unregistered")
-    for link in (BIN_LINK, SKILL_LINK):
+    for link in (BIN_LINK, SKILL_LINK, OPS_SKILL_LINK):
         if link.is_symlink():
             link.unlink()
             print(f"✓ removed {link}")

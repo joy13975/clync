@@ -24,8 +24,9 @@ modal+sound alert on failure.
 ## Setup
 
 One command wires up everything (deps, `clync` CLI on your PATH, MCP
-registration, daily launchd sync, and the Claude Code skill) — all defined in
-this repo, symlinked/registered out:
+registration, daily launchd sync, and both Claude Code skills — `clync`
+history-search + `clync-ops` operations) — all defined in this repo,
+symlinked/registered out:
 
 ```sh
 uv run python clync.py setup --profile "Work"   # or export CLYNC_PROFILE; --at HH:MM for time
@@ -34,7 +35,7 @@ uv run python clync.py doctor                      # verify: DB / deps / launchd
 
 `clync unsetup` removes every external artifact (symlinks, launchd job, MCP
 registration) and leaves the local DB intact. Then open a **new** Claude Code
-session to load the MCP tools + skill.
+session to load the MCP tools + skills.
 
 ## Commands
 
