@@ -9,5 +9,26 @@ dependencies = [
     "mcp>=1.2",
 ]
 
+# Hybrid search + indexing (BGE-M3 embeddings + contained Postgres/pgvector).
+# Heavy; kept out of the core so plain sync/MCP stays lightweight.
+# Install with:  uv sync --extra search
+[project.optional-dependencies]
+search = [
+    "FlagEmbedding>=1.3",
+    "psycopg[binary]>=3.1",
+    # transformers 5.x dropped the slow-tokenizer `prepare_for_model` that
+    # FlagEmbedding 1.x calls (observed crashing during the reranker ablation);
+    # pin to 4.x, which also carries the BGE-M3 embedder used here.
+    "transformers>=4.51,<5",
+]
+# Test suite. The search/index integration + real-model tests need the `search`
+# extra + the contained cluster too:  uv sync --extra search --extra dev
+dev = ["pytest>=8"]
+
 [tool.ruff]
 line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["slow: real-model / heavy integration — run with `pytest --run-slow`"]

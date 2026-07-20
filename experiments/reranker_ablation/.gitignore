@@ -1,0 +1,16 @@
+# Local Python env
+.venv/
+__pycache__/
+
+# Embedding cache — regenerable via `ablation.py embed`; contains verbatim
+# conversation text. Never commit corpus content to a repo with a remote.
+cache/
+
+# Raw-content data artifacts (conversation snippets, digests, titles, grades).
+# Kept LOCAL only. queries.json (the abstracted query set) IS committed as the
+# reproducible deliverable; the report .md carries only aggregate numbers.
+data/candidates.json
+data/allowed_targets.json
+data/judge_targets.json
+data/results.json
+data/judgments.json

@@ -1,0 +1,15 @@
+[project]
+name = "clync-embedder-ablation"
+version = "0.1.0"
+description = "Offline ablation: BGE-M3 (dense + learned-sparse) vs Qwen3-Embedding-0.6B (dense) on the clync corpus — retrieval quality, speed, and top-10 set divergence. Isolated from clync core deps."
+requires-python = ">=3.11"
+dependencies = [
+    "FlagEmbedding>=1.3",
+    "sentence-transformers>=4.1",
+    # Qwen3 model class landed in transformers 4.51; 5.x breaks FlagEmbedding's
+    # tokenizer path (see reranker ablation ADR notes). Pin to the 4.x line.
+    "transformers>=4.51,<5",
+    "numpy>=1.26",
+    # int8 arm: ONNX Runtime int8 BGE-M3 (CPU) via Optimum, for the quantization study.
+    "optimum[onnxruntime]>=1.20",
+]

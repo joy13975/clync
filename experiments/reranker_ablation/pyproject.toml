@@ -1,0 +1,14 @@
+[project]
+name = "clync-reranker-ablation"
+version = "0.1.0"
+description = "Offline ablation: does bge-reranker-v2-m3 beat first-stage hybrid (BGE-M3 dense+sparse+RRF) on the clync corpus? Isolated from clync core deps."
+requires-python = ">=3.11"
+dependencies = [
+    "FlagEmbedding>=1.3",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    # transformers 5.x removed the slow-tokenizer `prepare_for_model`, which
+    # FlagEmbedding 1.4's reranker (encoder_only/base.py) calls unconditionally.
+    # Pin to the 4.x line so the reranker's tokenization path works.
+    "transformers>=4.45,<5",
+]

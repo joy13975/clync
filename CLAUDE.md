@@ -13,6 +13,8 @@ This file is an index — the actual documentation lives in these:
 | [skill/SKILL.md](skill/SKILL.md) | The Claude Code skill — when/how to query the user's history. |
 | `clync.py` (module docstring + `--help`) | Sync engine, cookie/Cloudflare handling, storage, CLI. |
 | `mcp_server.py` (docstring) | The three MCP tools (`search_history`, `get_conversation`, `list_conversations`). |
+| `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, RRF-fused dense+sparse query. |
+| [docs/adr/](docs/adr/) | Architecture decisions behind hybrid search: why no cross-encoder reranker (0001), why BGE-M3 (0002). |
 
 ## One-command setup
 

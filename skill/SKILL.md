@@ -16,9 +16,11 @@ on…". Attachments count too: pasted-file text is indexed.
 
 ## How to answer
 
-1. **Find it** — `mcp__clync__search_history(query, limit)`. `query` is an FTS5
-   MATCH expression: bare words are ANDed, `"quoted"` is a phrase, `OR`/`NEAR`
-   work. Returns conversation name + uuid + a highlighted snippet per hit.
+1. **Find it** — `mcp__clync__search_history(query, limit)`. `query` is a
+   natural-language question, not a keyword expression — the tool runs hybrid
+   semantic + lexical search (BGE-M3 dense + learned-sparse, RRF-fused) over
+   the indexed corpus, so phrase it the way you'd ask a person. Returns the
+   best-matching conversation per hit (name + uuid + a text snippet).
 2. **Read it** — `mcp__clync__get_conversation(uuid)` for the full transcript
    (oldest-first), including a list of attached files and any downloaded image
    paths.
@@ -29,8 +31,9 @@ Cite the conversation name when you use a result. If search returns nothing,
 say so — do not invent history. The data is only as fresh as the last sync.
 
 ## CLI fallback / maintenance (Bash)
-- `clync search "<fts query>"` · `clync list` — same queries from the shell.
-- `clync sync` — pull new/updated conversations now (needs `$CLYNC_PROFILE`).
+- `clync search "<query>" [--lang en|ja|zh]` · `clync list` — same queries from the shell.
+- `clync sync` — pull new/updated conversations now (needs `$CLYNC_PROFILE`); reindexes automatically.
+- `clync index [--full]` — rebuild the hybrid-search index without a sync.
 - `clync status` — last successful sync + scheduled-run log.
 
 If a query returns nothing and the user expects recent chats, suggest

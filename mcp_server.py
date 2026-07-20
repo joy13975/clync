@@ -1,6 +1,8 @@
 """MCP server exposing the local claude.ai history DB to Claude Code (stdio).
 
-Read-only query layer over the SQLite/FTS5 database that `clync sync` populates.
+Read-only query layer over the DB that `clync sync` populates: `search_history`
+runs clync's hybrid BGE-M3 index (contained Postgres/pgvector — see search.py);
+`get_conversation` / `list_conversations` read the SQLite store directly.
 Registered with:
 
     claude mcp add --scope user clync -- \
@@ -12,41 +14,32 @@ import json
 
 from mcp.server.fastmcp import FastMCP
 
-from clync import connect
+from clync import DEFAULT_TOPK, connect
 
 mcp = FastMCP("clync")
 
 
 @mcp.tool()
-def search_history(query: str, limit: int = 10) -> str:
-    """Full-text search across all synced claude.ai conversation messages.
+def search_history(query: str, limit: int = DEFAULT_TOPK) -> str:
+    """Hybrid semantic + lexical search across all synced claude.ai conversations.
 
-    `query` is an SQLite FTS5 MATCH expression (supports AND/OR/NEAR/"phrases").
-    Returns matching conversations with a highlighted snippet and the message uuid.
+    Takes a natural-language query (not an FTS5 expression) and returns the best-
+    matching conversation per hit, ranked by a fused dense + learned-sparse score.
     """
-    con = connect()
-    try:
-        rows = con.execute(
-            """SELECT c.name AS conv, c.uuid AS cuuid, c.updated_at AS updated,
-                      m.sender AS sender,
-                      snippet(messages_fts, 0, '**', '**', ' … ', 18) AS snip
-               FROM messages_fts
-               JOIN conversations c ON c.uuid = messages_fts.conversation_uuid
-               JOIN messages m ON m.uuid = messages_fts.message_uuid
-               WHERE messages_fts MATCH ?
-               ORDER BY rank LIMIT ?""",
-            (query, limit),
-        ).fetchall()
-    finally:
-        con.close()
-    if not rows:
+    import search
+    if not search.available():
+        return ("Hybrid search is not installed. Run `uv sync --extra search` "
+                "in the clync repo, then `clync index`.")
+    results = search.hybrid_search(query, topk=limit)
+    if not results:
         return f"No matches for {query!r}."
-    out = [f"{len(rows)} match(es) for {query!r}:\n"]
-    for r in rows:
+    out = [f"{len(results)} match(es) for {query!r}:\n"]
+    for r in results:
+        snippet = r["text"].replace("\n", " ")[:300]
         out.append(
-            f"- conversation: {r['conv'] or '(untitled)'} "
-            f"(uuid={r['cuuid']}, updated={r['updated']})\n"
-            f"  [{r['sender']}] {r['snip']}"
+            f"- conversation: {r['conv_name'] or '(untitled)'} "
+            f"(uuid={r['conv_uuid']}, lang={r['lang']}, score={r['score']:.4f})\n"
+            f"  {snippet}"
         )
     return "\n".join(out)
 

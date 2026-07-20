@@ -40,14 +40,45 @@ session to load the MCP tools + skill.
 
 | Command | Purpose |
 |---|---|
-| `sync [--full] [--no-files]` | incremental sync (`--full` re-fetches all; `--no-files` skips image downloads) |
+| `sync [--full] [--no-files] [--no-index]` | incremental sync (`--full` re-fetches all; `--no-files` skips image downloads; `--no-index` skips the post-sync hybrid-search index) |
+| `index [--full]` | (re)build the hybrid-search index from the synced DB |
 | `scheduled` | launchd entry point: sync + loud fail/late notification |
-| `search <q> [--limit N]` | FTS5 search over message + attachment text |
+| `search <q> [--limit N] [--lang en\|ja\|zh]` | hybrid semantic + lexical search over message + attachment text |
 | `list [--limit N]` | most recently updated conversations |
 | `whoami` | resolved account + org |
-| `doctor` | health check: DB, deps, launchd job, MCP registration |
+| `doctor` | health check: DB, deps, launchd job, MCP registration, search cluster + index |
 | `status [--tail N]` | last successful sync, launchd state, recent scheduled-run log |
 | `install [--at HH:MM]` / `uninstall` | manage the daily launchd job |
+
+## Hybrid search
+
+clync runs its **own** contained Postgres 17 + pgvector cluster — a private
+`initdb` cluster under `~/.local/share/clync/pg`, listening on `localhost:54329`,
+fully isolated from any system/shared Postgres. It embeds synced messages with
+**BGE-M3** (dense `vector(1024)` + learned-sparse `sparsevec`) and searches with
+dense cosine + sparse dot-product, fused by **RRF** (k=60), plus a small typed-
+metadata boost (recency half-life, query/chunk language agreement). There is no
+cross-encoder reranker — see the design rationale below.
+
+Heavy deps (FlagEmbedding/torch, psycopg) are kept out of core clync in the
+`search` optional extra:
+
+```sh
+uv sync --extra search        # once, to pull in the search deps
+clync setup --profile "..."   # provisions the cluster + builds the initial index
+# — or, if already set up —
+clync index [--full]          # (re)build the index incrementally (or fully)
+clync search "boto3 pagination" [--lang en]
+```
+
+`clync sync` automatically reindexes changed conversations afterward (pass
+`--no-index` to skip). `clync doctor` reports cluster + index health.
+`clync unsetup` stops the cluster but leaves its data on disk, mirroring how it
+leaves the SQLite DB intact.
+
+Design rationale: [docs/adr/0001](docs/adr/0001-drop-cross-encoder-reranker.md)
+(why there's no reranker) and
+[docs/adr/0002](docs/adr/0002-embedder-choice.md) (why BGE-M3 over Qwen3-Embedding).
 
 A `clync` wrapper script sits in the repo; symlink it onto your PATH for global use:
 

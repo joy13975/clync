@@ -43,6 +43,7 @@ IMAGE_EXT = {"image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg",
 # — without it, claude.ai intermittently serves a JS challenge (HTTP 403) under load.
 AUTH_COOKIE_NAMES = ("sessionKey", "cf_clearance")
 REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate-limited
+DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
 
 REPO_DIR = Path(__file__).resolve().parent
 LAUNCHD_LABEL = "io.clync.sync"
@@ -458,9 +459,46 @@ def cmd_whoami(args) -> int:
     return 0
 
 
+def _index_after_sync(full: bool) -> None:
+    """Refresh the hybrid-search index after a sync. The `search` extra is
+    optional: absent -> warn + skip; present but failing -> fail loud.
+    (search imports fine without the extra — its heavy deps are lazy — so we must
+    gate on search.available(), not on catching ImportError.)"""
+    import search
+    if not search.available():
+        print("search extra not installed; skipping index (uv sync --extra search)")
+        return
+    try:
+        stats = search.build_index(full=full)
+    except Exception as e:
+        notify("fail", "clync index failed", str(e))
+        raise
+    print(f"[index] reindexed_convs={stats['reindexed_convs']} "
+          f"chunks={stats['chunks']} removed_convs={stats['removed_convs']}")
+
+
 def cmd_sync(args) -> int:
     run_sync(_require_profile(args), args.org, args.full,
              download_files=not args.no_files)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
+def cmd_index(args) -> int:
+    # Unlike the post-sync auto-index (search extra optional, silent skip),
+    # an explicit `clync index` invocation fails loud on ANY problem —
+    # including a missing extra, since the user asked to index directly.
+    import search
+    if not search.available():
+        raise RuntimeError("search extra not installed — run: uv sync --extra search")
+    try:
+        stats = search.build_index(full=args.full)
+    except Exception as e:
+        notify("fail", "clync index failed", str(e))
+        raise
+    print(f"reindexed_convs={stats['reindexed_convs']} chunks={stats['chunks']} "
+          f"removed_convs={stats['removed_convs']}")
     return 0
 
 
@@ -489,25 +527,22 @@ def cmd_scheduled(args) -> int:
         notify("warn", "clync ran late",
                f"previous scheduled sync was missed (~{late_gap_h:.0f}h gap) — "
                "Mac was likely asleep/off. Synced now.")
+    _index_after_sync(full=False)
     print(f"[scheduled] ok: {stats}")
     return 0
 
 
 def cmd_search(args) -> int:
-    con = connect()
-    rows = con.execute(
-        """SELECT c.name AS conv, c.uuid AS cuuid,
-                  snippet(messages_fts, 0, '[', ']', ' … ', 14) AS snip
-           FROM messages_fts
-           JOIN conversations c ON c.uuid = messages_fts.conversation_uuid
-           WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?""",
-        (args.query, args.limit),
-    ).fetchall()
-    if not rows:
+    import search
+    if not search.available():
+        raise RuntimeError("search extra not installed — run: uv sync --extra search")
+    results = search.hybrid_search(args.query, topk=args.limit, lang=args.lang)
+    if not results:
         print("(no matches)")
-    for r in rows:
-        print(f"\n• {r['conv'] or '(untitled)'}  [{r['cuuid']}]\n  {r['snip']}")
-    con.close()
+    for r in results:
+        snippet = r["text"].replace("\n", " ")[:200]
+        print(f"\n• {r['conv_name'] or '(untitled)'}  [{r['conv_uuid']}]  "
+              f"lang={r['lang']}  score={r['score']:.4f}\n  {snippet}")
     return 0
 
 
@@ -568,6 +603,28 @@ def cmd_doctor(args) -> int:
         print("MCP register: registered with Claude Code")
     else:
         problems.append("MCP server not registered — see README for `claude mcp add`.")
+
+    import search
+    st = search.index_status()          # structured, never raises, no schema leak
+    if not st["available"]:
+        print("search deps : FAIL (search extra not installed — uv sync --extra search)")
+        problems.append("search extra not installed — hybrid search unavailable "
+                        "(uv sync --extra search).")
+    elif not st["pg_bin"]:
+        print("search deps : FAIL (PostgreSQL 17 binaries not found)")
+        problems.append("PG17 not found — brew install postgresql@17 pgvector "
+                        "(or set $CLYNC_PG_BIN).")
+    else:
+        print("search deps : ok (search extra installed)")
+        print(f"search cluster: {'ok (running)' if st['cluster_running'] else 'FAIL (not running)'}")
+        if not st["cluster_running"]:
+            problems.append("search cluster not running — run `clync index` "
+                            "(provisions + builds it).")
+        elif st["error"]:
+            print(f"search index: FAIL ({st['error']})")
+            problems.append(f"search index probe failed: {st['error']}")
+        else:
+            print(f"search index: ok ({st['chunks']} chunks indexed)")
 
     if problems:
         print("\nPROBLEMS:")
@@ -648,7 +705,7 @@ def cmd_setup(args) -> int:
     """One command to wire everything up from the repo: deps, CLI, MCP, scheduler,
     skill. Every artifact is defined in this repo and symlinked/registered out;
     `clync unsetup` reverses it."""
-    profile = _require_profile(args)
+    _require_profile(args)
 
     subprocess.run(["uv", "sync", "--quiet"], cwd=REPO_DIR, check=True)
     print("✓ deps synced (uv)")
@@ -674,6 +731,19 @@ def cmd_setup(args) -> int:
     _relink(SKILL_LINK, REPO_DIR / "skill")
     print(f"✓ skill: {SKILL_LINK} -> skill/  (resolves to {SKILL_LINK.resolve()})")
 
+    import search
+    if not search.available():
+        print("○ hybrid search: `search` extra not installed — skipping cluster + "
+              "index (run `uv sync --extra search` then `clync index`)")
+    else:
+        # Real provisioning/embedding failures fail loud — a broken install must
+        # NOT be reported as a successful setup.
+        search.ensure_cluster()
+        stats = search.build_index(full=True)
+        print(f"✓ hybrid search: contained PG17+pgvector cluster provisioned, "
+              f"indexed reindexed_convs={stats['reindexed_convs']} "
+              f"chunks={stats['chunks']}")
+
     print("\nSetup complete. Open a NEW Claude Code session to load the MCP tools "
           "+ skill. Reverse anytime with `clync unsetup`.")
     return 0
@@ -688,6 +758,11 @@ def cmd_unsetup(args) -> int:
         if link.is_symlink():
             link.unlink()
             print(f"✓ removed {link}")
+    # stop_cluster is defensive (no-op if the cluster/binaries are absent) and
+    # only shells out to pg_ctl — no heavy deps — so call it unconditionally.
+    import search
+    if search.stop_cluster():
+        print("✓ search cluster stopped (its data was left intact)")
     print("Unset complete. The local DB in ~/.local/share/clync was left intact.")
     return 0
 
@@ -731,15 +806,24 @@ def main() -> int:
     sp = sub.add_parser("sync", parents=[cred], help="incremental sync into the local DB")
     sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
+    sp.add_argument("--no-index", action="store_true",
+                     help="skip hybrid-search indexing after sync")
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("index", help="(re)build the hybrid-search index")
+    sp.add_argument("--full", action="store_true", help="reindex every conversation")
+    sp.set_defaults(func=cmd_index)
 
     sub.add_parser("scheduled", parents=[cred],
                    help="launchd entry point (sync + loud fail/late notify)"
                    ).set_defaults(func=cmd_scheduled)
 
-    sp = sub.add_parser("search", help="FTS5 search over message + attachment text")
+    sp = sub.add_parser("search", help="hybrid (dense + sparse) semantic search "
+                                        "over message + attachment text")
     sp.add_argument("query")
-    sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)
+    sp.add_argument("--lang", choices=["en", "ja", "zh"], default=None,
+                     help="restrict to one language (default: all)")
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("list", help="most recently updated conversations")

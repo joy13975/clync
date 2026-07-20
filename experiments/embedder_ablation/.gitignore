@@ -1,0 +1,11 @@
+# Local Python env
+.venv/
+__pycache__/
+
+# Embedding cache — regenerable; holds verbatim conversation text (chunks.json).
+cache/
+
+# All local data artifacts: retrieval output (conv UUIDs) and top-up judge
+# targets (conversation snippets). Regenerable; the shared query set + judgments
+# live under ../reranker_ablation/data/. Never commit corpus content.
+data/
