@@ -1,9 +1,14 @@
-"""clync — headless claude.ai history sync.
+"""clync — headless history sync + hybrid search.
 
-Reads the current auth cookies live from a named Chrome profile, clears
-Cloudflare via curl_cffi TLS impersonation, and upserts conversations + messages
-(including text-attachment content) into a local SQLite/FTS5 database.
-Incremental by `updated_at`.
+Two sources, one contained store (ADR 0003):
+  * claude.ai chats — reads auth cookies live from a named Chrome profile, clears
+    Cloudflare via curl_cffi TLS impersonation, upserts conversations + project
+    docs (incremental by `updated_at`).
+  * local Claude Code sessions — cleaned + metadata-extracted from
+    `~/.claude/projects/**/*.jsonl` (see cc.py); no network / cookies.
+
+Both land in a contained Postgres 17 + pgvector cluster (single source of truth
+AND search index) as unified `units` + `messages`, embedded by search.py.
 
 Fail-loud by contract: any auth/HTTP/schema problem raises and the process exits
 non-zero. The scheduled path additionally surfaces failures as a macOS
@@ -15,8 +20,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
-import sqlite3
+import sqlite3          # Chrome's cookie store is SQLite; clync's own store is Postgres
 import subprocess
 import sys
 import tempfile
@@ -29,9 +35,27 @@ from curl_cffi import requests as creq
 
 PROFILE_ENV = "CLYNC_PROFILE"  # deployment sets this (e.g. in the launchd plist)
 CHROME_DIR = Path.home() / "Library/Application Support/Google/Chrome"
-DB_PATH = Path(os.environ.get("CLYNC_DB",
-                              Path.home() / ".local/share/clync/history.db"))
-FILES_DIR = DB_PATH.parent / "files"
+
+# Runtime state root (DB cluster, downloaded images, scheduled log). Everything
+# lives under one data home; the store itself is the contained Postgres cluster.
+DATA_HOME = Path(os.environ.get("CLYNC_DATA_HOME",
+                                Path.home() / ".local/share/clync"))
+FILES_DIR = DATA_HOME / "files"
+
+# Contained Postgres 17 + pgvector cluster — clync's single source of truth AND
+# search index (ADR 0003). A private initdb cluster on a non-default port, fully
+# isolated from any system Postgres. pgvector is installed against PG17's share
+# dir, so the cluster MUST use those binaries (a PATH `initdb` may lack pgvector).
+PG_DIR = DATA_HOME / "pg"
+PG_DATA = PG_DIR / "data"
+PG_LOG = PG_DIR / "postmaster.log"
+PG_BIN = Path(os.environ.get("CLYNC_PG_BIN", "/opt/homebrew/opt/postgresql@17/bin"))
+PG_PORT = int(os.environ.get("CLYNC_PG_PORT", "54329"))
+PG_DB = os.environ.get("CLYNC_PG_DB", "clync")
+if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_DB):
+    raise SystemExit(f"invalid $CLYNC_PG_DB {PG_DB!r} — must match [A-Za-z_][A-Za-z0-9_]*")
+PG_USER = os.environ.get("USER", "postgres")
+
 HOST = "https://claude.ai"
 BASE = f"{HOST}/api"
 IMPERSONATE = "chrome"
@@ -44,11 +68,13 @@ IMAGE_EXT = {"image/webp": ".webp", "image/png": ".png", "image/jpeg": ".jpg",
 AUTH_COOKIE_NAMES = ("sessionKey", "cf_clearance")
 REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate-limited
 DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
+# SSOT for the `source` facet values (CLI argparse choices + search validation).
+VALID_SOURCES = ("all", "claude_ai", "claude_code")
 
 REPO_DIR = Path(__file__).resolve().parent
 LAUNCHD_LABEL = "io.clync.sync"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
-SCHED_LOG = DB_PATH.parent / "scheduled.log"
+SCHED_LOG = DATA_HOME / "scheduled.log"
 LATE_THRESHOLD_H = 25  # a >25h gap since last success means a daily run was missed
 
 
@@ -245,94 +271,255 @@ def resolve_orgs(client: ClaudeClient, org_ref: str | None) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# SQLite / FTS5 storage (single source of truth)
+# Postgres store — single source of truth AND search index (ADR 0003)
 # --------------------------------------------------------------------------- #
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-    uuid           TEXT PRIMARY KEY,
-    org_uuid       TEXT NOT NULL,
-    name           TEXT,
-    summary        TEXT,
-    model          TEXT,
-    project_uuid   TEXT,
-    created_at     TEXT,
-    updated_at     TEXT,
-    message_count  INTEGER,
-    raw            TEXT NOT NULL,
-    synced_at      TEXT NOT NULL
+# The unified retrieval model: `units` (one row per chat / cc session / project
+# doc) + `messages` (cleaned per-turn content, msg_id = source event uuid) +
+# `chunks` (embeddings — owned by search.py, which pins the vector dims). Facets
+# are typed, indexed columns on `units` (and denormalized onto `chunks` for
+# no-join filtering). The vector `chunks`/`indexed_units` tables are created by
+# search.ensure_index_schema (it owns DENSE_DIM/SPARSE_DIM); this module owns the
+# raw store + cluster lifecycle.
+RAW_SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS units (
+    unit_id      text PRIMARY KEY,
+    kind         text NOT NULL,          -- chat | project_doc | cc_session
+    source       text NOT NULL,          -- claude_ai | claude_code
+    title        text,
+    summary      text,
+    model        text,
+    lang         text,
+    created_at   timestamptz,
+    updated_at   timestamptz,
+    org_uuid     text,                   -- claude.ai facets
+    project_uuid text,
+    project_name text,
+    repo         text,                   -- claude_code facets
+    cwd          text,
+    worktree     text,
+    git_branch   text,
+    cc_version   text,
+    entrypoint   text,
+    msg_count    int,
+    raw          jsonb,
+    synced_at    timestamptz NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_units_source    ON units(source);
+CREATE INDEX IF NOT EXISTS idx_units_project   ON units(project_uuid);
+CREATE INDEX IF NOT EXISTS idx_units_pname     ON units(project_name);
+CREATE INDEX IF NOT EXISTS idx_units_repo      ON units(repo);
+CREATE INDEX IF NOT EXISTS idx_units_worktree  ON units(worktree);
+CREATE INDEX IF NOT EXISTS idx_units_branch    ON units(git_branch);
+CREATE INDEX IF NOT EXISTS idx_units_updated   ON units(updated_at);
+CREATE INDEX IF NOT EXISTS idx_units_title_trgm ON units USING gin (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_units_repo_trgm  ON units USING gin (repo gin_trgm_ops);
+
+-- Message identity is per-unit: (unit_id, msg_id). A cc resume replays the
+-- original session's event uuids into the resumed session's own unit, and each
+-- unit stores its COMPLETE transcript (get_conversation must never start
+-- mid-stream). The PK doubles as the unit_id lookup index.
 CREATE TABLE IF NOT EXISTS messages (
-    uuid               TEXT PRIMARY KEY,
-    conversation_uuid  TEXT NOT NULL REFERENCES conversations(uuid),
-    idx                INTEGER,
-    sender             TEXT,
-    text               TEXT,
-    created_at         TEXT,
-    raw                TEXT NOT NULL
+    unit_id     text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
+    msg_id      text NOT NULL,           -- source event uuid
+    idx         int,
+    sender      text,
+    role_detail text,
+    text        text,
+    embed_text  text,                    -- tighter embed string (NULL => reuse text)
+    created_at  timestamptz,
+    raw         jsonb,
+    PRIMARY KEY (unit_id, msg_id)
 );
-CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_uuid);
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    text, conversation_uuid UNINDEXED, message_uuid UNINDEXED,
-    tokenize='porter unicode61'
-);
-CREATE TABLE IF NOT EXISTS files (
-    file_uuid          TEXT PRIMARY KEY,
-    conversation_uuid  TEXT NOT NULL,
-    message_uuid       TEXT,
-    file_kind          TEXT,
-    file_name          TEXT,
-    size_bytes         INTEGER,
-    local_path         TEXT,          -- set once downloaded (images only)
-    created_at         TEXT,
-    raw                TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_files_conv ON files(conversation_uuid);
+
 CREATE TABLE IF NOT EXISTS projects (
-    uuid           TEXT PRIMARY KEY,
-    org_uuid       TEXT NOT NULL,
-    name           TEXT,
-    description    TEXT,
-    created_at     TEXT,
-    updated_at     TEXT,
-    raw            TEXT NOT NULL,
-    synced_at      TEXT NOT NULL
+    uuid        text PRIMARY KEY,
+    org_uuid    text NOT NULL,
+    name        text,
+    description text,
+    created_at  timestamptz,
+    updated_at  timestamptz,
+    raw         jsonb,
+    synced_at   timestamptz NOT NULL
 );
--- Project knowledge documents (project-level files / instructions, distinct from
--- per-message attachments). These carry substantial searchable content.
-CREATE TABLE IF NOT EXISTS project_docs (
-    uuid           TEXT PRIMARY KEY,
-    project_uuid   TEXT NOT NULL REFERENCES projects(uuid),
-    file_name      TEXT,
-    content        TEXT,
-    created_at     TEXT,
-    raw            TEXT NOT NULL,
-    synced_at      TEXT NOT NULL
+
+CREATE TABLE IF NOT EXISTS files (
+    file_uuid    text PRIMARY KEY,
+    unit_id      text NOT NULL,
+    message_uuid text,
+    file_kind    text,
+    file_name    text,
+    size_bytes   bigint,
+    local_path   text,                   -- set once downloaded (images only)
+    created_at   timestamptz,
+    raw          jsonb
 );
-CREATE INDEX IF NOT EXISTS idx_project_docs_proj ON project_docs(project_uuid);
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS idx_files_unit ON files(unit_id);
+
+-- Per-file incremental watermark for the local Claude Code ingest: a transcript
+-- is re-parsed only when its mtime/size changes.
+CREATE TABLE IF NOT EXISTS cc_sync_state (
+    file_path  text PRIMARY KEY,
+    mtime      double precision,
+    size       bigint,
+    session_id text,
+    synced_at  timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meta (key text PRIMARY KEY, value text);
 """
 
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.executescript(SCHEMA)
+# --- Cluster lifecycle (contained; never touches a system cluster) ---------- #
+def _pg(binary: str) -> str:
+    path = PG_BIN / binary
+    if not path.exists():
+        raise SystemExit(
+            f"Postgres 17 binary not found: {path}\n"
+            f"clync runs its own PG17+pgvector cluster. Install with:\n"
+            f"  brew install postgresql@17 pgvector\n"
+            f"or set $CLYNC_PG_BIN to the PG17 bin dir.")
+    return str(path)
+
+
+def _vector_control_present() -> bool:
+    share = PG_BIN.parent / "share" / "postgresql@17" / "extension" / "vector.control"
+    alt = Path("/opt/homebrew/share/postgresql@17/extension/vector.control")
+    return share.exists() or alt.exists()
+
+
+def cluster_running() -> bool:
+    r = subprocess.run([_pg("pg_ctl"), "-D", str(PG_DATA), "status"],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def start_cluster() -> None:
+    if cluster_running():
+        return
+    PG_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [_pg("pg_ctl"), "-D", str(PG_DATA), "-l", str(PG_LOG),
+         "-o", f"-p {PG_PORT} -c listen_addresses=localhost "
+               f"-c unix_socket_directories={PG_DIR}",
+         "-w", "start"],
+        check=True)
+
+
+def stop_cluster() -> bool:
+    """Stop the contained cluster if running. True iff a running cluster was
+    stopped; False (no-op) if there's no cluster data or the PG17 binary is
+    absent — not an error."""
+    if not (PG_DATA / "PG_VERSION").exists() or not (PG_BIN / "pg_ctl").exists():
+        return False
+    if not cluster_running():
+        return False
+    subprocess.run([_pg("pg_ctl"), "-D", str(PG_DATA), "-m", "fast", "stop"],
+                   check=True)
+    return True
+
+
+def connect_pg():
+    import psycopg
+    from psycopg.rows import dict_row
+    from psycopg.types.string import StrBinaryDumper, StrDumperUnknown
+
+    # Postgres cannot store NUL (0x00) in `text`, and NUL is never meaningful
+    # content (it turns up in raw tool stdout / pasted binary). Registering
+    # NUL-stripping str dumpers on every clync connection makes EVERY text
+    # parameter share one sanitization chokepoint by construction — no call
+    # site can forget. (jsonb has the same rule; `_json` scrubs its payloads.)
+    # The bases mirror psycopg's own defaults for str — StrDumperUnknown keeps
+    # oid 0 so the server still infers param types (timestamptz etc.).
+    class _NulFreeStr(StrDumperUnknown):
+        def dump(self, obj):
+            return super().dump(obj.replace("\x00", ""))
+
+    class _NulFreeStrBinary(StrBinaryDumper):
+        def dump(self, obj):
+            return super().dump(obj.replace("\x00", ""))
+
+    con = psycopg.connect(host="localhost", port=PG_PORT, dbname=PG_DB,
+                          user=PG_USER, row_factory=dict_row)
+    # Binary first, text second: each registration also claims the AUTO slot,
+    # and AUTO must stay on the unknown-oid text dumper (psycopg's default).
+    con.adapters.register_dumper(str, _NulFreeStrBinary)
+    con.adapters.register_dumper(str, _NulFreeStr)
     return con
 
 
-def get_meta(con: sqlite3.Connection, key: str) -> str | None:
-    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return row[0] if row else None
+def ensure_cluster() -> None:
+    """Idempotent: initdb (if absent) -> start -> create db + extensions + raw
+    schema. Also ensures the search index schema so a single call fully provisions
+    the store. Fails loud on a missing PG17/pgvector toolchain."""
+    if not _vector_control_present():
+        raise SystemExit(
+            "pgvector not found for PG17. Install with:  brew install pgvector")
+    if not (PG_DATA / "PG_VERSION").exists():
+        PG_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [_pg("initdb"), "-D", str(PG_DATA), "-U", PG_USER,
+             "--encoding=UTF8", "--locale=en_US.UTF-8", "-A", "trust"],
+            check=True, capture_output=True)
+    start_cluster()
+    exists = subprocess.run(
+        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-d", "postgres",
+         "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    if exists != "1":
+        subprocess.run([_pg("psql"), "-h", "localhost", "-p", str(PG_PORT),
+                        "-d", "postgres", "-c", f'CREATE DATABASE "{PG_DB}"'],
+                       check=True, capture_output=True)
+    with connect_pg() as con:
+        for stmt in (s.strip() for s in RAW_SCHEMA.split(";")):
+            if stmt:
+                con.execute(stmt)       # psycopg runs one statement per execute
+        con.commit()
+    import search
+    search.ensure_index_schema()        # chunks/indexed_units (search owns dims)
 
 
-def set_meta(con: sqlite3.Connection, key: str, value: str) -> None:
-    con.execute("INSERT INTO meta(key,value) VALUES(?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+def connect():
+    """A live connection to the contained store (assumes the cluster is up —
+    callers provision it once via ensure_cluster at command entry)."""
+    return connect_pg()
+
+
+def get_meta(con, key: str) -> str | None:
+    row = con.execute("SELECT value FROM meta WHERE key=%s", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(con, key: str, value: str) -> None:
+    con.execute("INSERT INTO meta(key,value) VALUES(%s,%s) "
+                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, value))
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _scrub_nul(obj):
+    """Recursively strip NUL (0x00) from every string in a JSON-shaped value.
+    Postgres jsonb rejects \\u0000 exactly as `text` rejects 0x00, and claude.ai
+    payloads can carry it (pasted binary, attachment extracted_content)."""
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, list):
+        return [_scrub_nul(v) for v in obj]
+    if isinstance(obj, dict):
+        return {_scrub_nul(k): _scrub_nul(v) for k, v in obj.items()}
+    return obj
+
+
+def _json(obj):
+    """The jsonb parameter chokepoint: every stored jsonb value goes through here,
+    NUL-scrubbed (text parameters are scrubbed by the connection's str dumpers —
+    see connect_pg — so ALL stored strings share the same sanitization rule)."""
+    from psycopg.types.json import Json
+    return Json(_scrub_nul(obj))
 
 
 def _message_text(msg: dict) -> str:
@@ -351,45 +538,52 @@ def _message_text(msg: dict) -> str:
     return "\n".join(parts)
 
 
-def upsert_conversation(con: sqlite3.Connection, org_uuid: str, full: dict) -> None:
+def _replace_unit_messages(con, unit_id: str, rows: list[tuple]) -> None:
+    """Wholesale-replace one unit's messages (handles edits / branch changes).
+    Each row is (msg_id, idx, sender, role_detail, text, embed_text, created_at, raw).
+    Message identity is per-unit — a cc resume replaying another session's event
+    uuids stores them again under its own unit, so every unit's transcript is
+    complete. ON CONFLICT guards only intra-unit duplicate uuids (first kept).
+    Also the sole writer of units.msg_count: set to the rows actually stored, so
+    it always equals what a reader can retrieve."""
+    con.execute("DELETE FROM messages WHERE unit_id=%s", (unit_id,))
+    for r in rows:
+        con.execute(
+            "INSERT INTO messages (msg_id, unit_id, idx, sender, role_detail, text, "
+            "embed_text, created_at, raw) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (unit_id, msg_id) DO NOTHING",
+            (r[0], unit_id, r[1], r[2], r[3], r[4], r[5], r[6], r[7]))
+    con.execute(
+        "UPDATE units SET msg_count = "
+        "(SELECT COUNT(*) FROM messages WHERE unit_id=%s) WHERE unit_id=%s",
+        (unit_id, unit_id))
+
+
+def upsert_conversation(con, org_uuid: str, full: dict) -> None:
+    """A claude.ai chat -> one `units` row (kind=chat) + its `messages`."""
     msgs = full.get("chat_messages") or []
     con.execute(
-        """INSERT INTO conversations
-           (uuid, org_uuid, name, summary, model, project_uuid,
-            created_at, updated_at, message_count, raw, synced_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(uuid) DO UPDATE SET
-             name=excluded.name, summary=excluded.summary, model=excluded.model,
-             project_uuid=excluded.project_uuid, created_at=excluded.created_at,
-             updated_at=excluded.updated_at, message_count=excluded.message_count,
-             raw=excluded.raw, synced_at=excluded.synced_at""",
-        (full["uuid"], org_uuid, full.get("name"), full.get("summary"),
-         full.get("model"), full.get("project_uuid"), full.get("created_at"),
-         full.get("updated_at"), len(msgs),
-         json.dumps(full, ensure_ascii=False), _now()),
+        """INSERT INTO units
+             (unit_id, kind, source, title, summary, model, project_uuid,
+              created_at, updated_at, org_uuid, raw, synced_at)
+           VALUES (%s,'chat','claude_ai',%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT(unit_id) DO UPDATE SET
+             title=EXCLUDED.title, summary=EXCLUDED.summary, model=EXCLUDED.model,
+             project_uuid=EXCLUDED.project_uuid, created_at=EXCLUDED.created_at,
+             updated_at=EXCLUDED.updated_at, org_uuid=EXCLUDED.org_uuid,
+             raw=EXCLUDED.raw, synced_at=EXCLUDED.synced_at""",
+        (full["uuid"], full.get("name"), full.get("summary"), full.get("model"),
+         full.get("project_uuid"), full.get("created_at"), full.get("updated_at"),
+         org_uuid, _json(full), _now()),
     )
-    # Replace this conversation's messages wholesale (handles edits/branch changes).
-    con.execute("DELETE FROM messages WHERE conversation_uuid=?", (full["uuid"],))
-    con.execute("DELETE FROM messages_fts WHERE conversation_uuid=?", (full["uuid"],))
-    for i, m in enumerate(msgs):
-        text = _message_text(m)
-        con.execute(
-            "INSERT INTO messages (uuid, conversation_uuid, idx, sender, text, "
-            "created_at, raw) VALUES (?,?,?,?,?,?,?)",
-            (m["uuid"], full["uuid"], i, m.get("sender"), text,
-             m.get("created_at"), json.dumps(m, ensure_ascii=False)),
-        )
-        if text:
-            con.execute(
-                "INSERT INTO messages_fts (text, conversation_uuid, message_uuid) "
-                "VALUES (?,?,?)", (text, full["uuid"], m["uuid"]),
-            )
+    rows = [(m["uuid"], i, m.get("sender"), None, _message_text(m), None,
+             m.get("created_at"), _json(m)) for i, m in enumerate(msgs)]
+    _replace_unit_messages(con, full["uuid"], rows)
 
 
-def sync_files(con: sqlite3.Connection, client: ClaudeClient, conv: dict,
-               download: bool) -> int:
-    """Record file metadata for a conversation; download image files (not yet
-    local) to FILES_DIR. Returns how many files were newly downloaded.
+def sync_files(con, client: ClaudeClient, conv: dict, download: bool) -> int:
+    """Record file metadata for a conversation's unit; download image files (not
+    yet local) to FILES_DIR. Returns how many files were newly downloaded.
 
     Binary blobs (file_kind='blob') expose only a server sandbox `path`, no
     download URL, so they are recorded as metadata only — not a silent skip.
@@ -400,9 +594,9 @@ def sync_files(con: sqlite3.Connection, client: ClaudeClient, conv: dict,
             fid = f.get("file_uuid") or f.get("uuid")
             if not fid:
                 continue
-            row = con.execute("SELECT local_path FROM files WHERE file_uuid=?",
+            row = con.execute("SELECT local_path FROM files WHERE file_uuid=%s",
                               (fid,)).fetchone()
-            local = row[0] if row else None
+            local = row["local_path"] if row else None
             if (download and not local and f.get("file_kind") == "image"
                     and f.get("preview_url")):
                 ctype, data = client.get_file(f["preview_url"])  # full-res (webp)
@@ -412,56 +606,70 @@ def sync_files(con: sqlite3.Connection, client: ClaudeClient, conv: dict,
                 local = str(path)
                 downloaded += 1
             con.execute(
-                """INSERT INTO files (file_uuid, conversation_uuid, message_uuid,
+                """INSERT INTO files (file_uuid, unit_id, message_uuid,
                      file_kind, file_name, size_bytes, local_path, created_at, raw)
-                   VALUES (?,?,?,?,?,?,?,?,?)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT(file_uuid) DO UPDATE SET
-                     file_kind=excluded.file_kind, file_name=excluded.file_name,
-                     size_bytes=excluded.size_bytes, local_path=excluded.local_path,
-                     raw=excluded.raw""",
+                     file_kind=EXCLUDED.file_kind, file_name=EXCLUDED.file_name,
+                     size_bytes=EXCLUDED.size_bytes, local_path=EXCLUDED.local_path,
+                     raw=EXCLUDED.raw""",
                 (fid, conv["uuid"], m.get("uuid"), f.get("file_kind"),
                  f.get("file_name"), f.get("size_bytes"), local,
-                 f.get("created_at"), json.dumps(f, ensure_ascii=False)),
+                 f.get("created_at"), _json(f)),
             )
     return downloaded
 
 
-def upsert_project(con: sqlite3.Connection, org_uuid: str, p: dict) -> None:
+def upsert_project(con, org_uuid: str, p: dict) -> None:
     con.execute(
         """INSERT INTO projects
              (uuid, org_uuid, name, description, created_at, updated_at, raw, synced_at)
-           VALUES (?,?,?,?,?,?,?,?)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
            ON CONFLICT(uuid) DO UPDATE SET
-             name=excluded.name, description=excluded.description,
-             created_at=excluded.created_at, updated_at=excluded.updated_at,
-             raw=excluded.raw, synced_at=excluded.synced_at""",
+             name=EXCLUDED.name, description=EXCLUDED.description,
+             created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at,
+             raw=EXCLUDED.raw, synced_at=EXCLUDED.synced_at""",
         (p["uuid"], org_uuid, p.get("name"), p.get("description"),
-         p.get("created_at"), p.get("updated_at"),
-         json.dumps(p, ensure_ascii=False), _now()),
+         p.get("created_at"), p.get("updated_at"), _json(p), _now()),
     )
 
 
-def upsert_project_docs(con: sqlite3.Connection, project_uuid: str,
-                        docs: list[dict]) -> None:
-    """Replace a surviving project's knowledge docs wholesale (mirrors the
-    message-replace pattern) so a doc deleted upstream also disappears locally. A
-    whole project deleted upstream is purged separately in _sync_org (it is no
-    longer listed, so this is never called for it)."""
-    con.execute("DELETE FROM project_docs WHERE project_uuid=?", (project_uuid,))
+def upsert_project_docs(con, org_uuid: str, project: dict, docs: list[dict]) -> None:
+    """Replace a surviving project's knowledge docs wholesale, each as a
+    `units` row (kind=project_doc) + one `messages` row holding its content — so
+    docs are retrievable alongside chats with no query-side special-casing. A
+    doc deleted upstream disappears (wholesale replace); a whole deleted project
+    is purged in _sync_org."""
+    pid, pname = project["uuid"], project.get("name")
+    existing = [r["unit_id"] for r in con.execute(
+        "SELECT unit_id FROM units WHERE kind='project_doc' AND project_uuid=%s",
+        (pid,)).fetchall()]
+    live = {d["uuid"] for d in docs}
+    for gone in (u for u in existing if u not in live):
+        con.execute("DELETE FROM units WHERE unit_id=%s", (gone,))   # cascades messages
     for d in docs:
         con.execute(
-            """INSERT INTO project_docs
-                 (uuid, project_uuid, file_name, content, created_at, raw, synced_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (d["uuid"], project_uuid, d.get("file_name"), d.get("content"),
-             d.get("created_at"), json.dumps(d, ensure_ascii=False), _now()),
+            """INSERT INTO units
+                 (unit_id, kind, source, title, created_at, org_uuid,
+                  project_uuid, project_name, raw, synced_at)
+               VALUES (%s,'project_doc','claude_ai',%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT(unit_id) DO UPDATE SET
+                 title=EXCLUDED.title, created_at=EXCLUDED.created_at,
+                 project_name=EXCLUDED.project_name, raw=EXCLUDED.raw,
+                 synced_at=EXCLUDED.synced_at""",
+            (d["uuid"], d.get("file_name"), d.get("created_at"), org_uuid,
+             pid, pname, _json(d), _now()),
         )
+        _replace_unit_messages(con, d["uuid"], [(
+            f"{d['uuid']}#0", 0, "project_doc", "doc",
+            d.get("content") or "", None, d.get("created_at"), _json(d))])
 
 
 def run_sync(profile: str, org_ref: str | None, full: bool,
              download_files: bool = True) -> dict:
-    """Core incremental sync across ALL target orgs (see resolve_orgs). Returns
-    aggregate stats. Raises loudly on any failure."""
+    """Core incremental claude.ai sync across ALL target orgs (see resolve_orgs).
+    Returns aggregate stats. Raises loudly on any failure. (Local Claude Code
+    ingest is a separate, cookie-independent step — see ingest_cc.)"""
     client = ClaudeClient(read_auth_cookies(profile), profile)
     orgs = resolve_orgs(client, org_ref)
     print(f"[{_now()}] syncing profile={profile!r} "
@@ -470,34 +678,39 @@ def run_sync(profile: str, org_ref: str | None, full: bool,
     con = connect()
     totals = {"fetched": 0, "skipped": 0, "images_downloaded": 0,
               "projects": 0, "project_docs": 0, "orgs": []}
-    for org in orgs:
-        _sync_org(con, client, org, full, download_files, totals)
-    set_meta(con, "last_success", _now())
-    total_msgs = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    con.commit()
-    con.close()
+    try:
+        for org in orgs:
+            _sync_org(con, client, org, full, download_files, totals)
+        set_meta(con, "last_success", _now())
+        con.commit()
+        total_msgs = con.execute(
+            "SELECT COUNT(*) FROM messages m JOIN units u ON u.unit_id=m.unit_id "
+            "WHERE u.source='claude_ai'").fetchone()["count"]
+    finally:
+        con.close()
     print(f"[done] fetched/updated={totals['fetched']} unchanged={totals['skipped']} "
           f"images_downloaded={totals['images_downloaded']} "
           f"projects={totals['projects']} project_docs={totals['project_docs']} "
-          f"total_messages_in_db={total_msgs} db={DB_PATH}")
+          f"claude_ai_messages_in_db={total_msgs} db={PG_DB}@localhost:{PG_PORT}")
     return totals
 
 
-def _sync_org(con: sqlite3.Connection, client: ClaudeClient, org: dict,
+def _sync_org(con, client: ClaudeClient, org: dict,
               full: bool, download_files: bool, totals: dict) -> None:
     """Sync one org: its conversations (incl. project-associated chats, which the
     chat_conversations listing already returns) and its projects + knowledge docs."""
     org_uuid = org["uuid"]
     print(f"  org {org.get('name')!r} ({org_uuid}):")
-    stored = dict(con.execute(
-        "SELECT uuid, updated_at FROM conversations WHERE org_uuid=?", (org_uuid,)
-    ).fetchall())
+    stored = {r["unit_id"]: r["updated_at"] for r in con.execute(
+        "SELECT unit_id, updated_at FROM units "
+        "WHERE kind='chat' AND org_uuid=%s", (org_uuid,)).fetchall()}
     remote = client.list_conversations(org_uuid)
     print(f"    conversations: {len(remote)} remote | {len(stored)} already stored")
     fetched = skipped = files_dl = 0
     for c in remote:
         cid = c["uuid"]
-        if not full and stored.get(cid) == c.get("updated_at"):
+        # stored updated_at is a timestamptz; compare on the instant, not the string.
+        if not full and cid in stored and _same_instant(stored[cid], c.get("updated_at")):
             skipped += 1
             continue
         full_conv = client.get_conversation(org_uuid, cid)
@@ -511,18 +724,22 @@ def _sync_org(con: sqlite3.Connection, client: ClaudeClient, org: dict,
     for p in projects:
         upsert_project(con, org_uuid, p)
         docs = client.list_project_docs(org_uuid, p["uuid"])
-        upsert_project_docs(con, p["uuid"], docs)
+        upsert_project_docs(con, org_uuid, p, docs)
         ndocs += len(docs)
-    # Purge projects (and their docs) deleted upstream: a project no longer listed
-    # for this org is gone, so its rows and knowledge docs must not linger (they'd
-    # stay indexed/served). Mirrors the wholesale-replace intent one level up.
+    # Backfill project_name onto this org's chat units (a chat's project may have
+    # been synced only just now), so the "in project X" facet is queryable.
+    con.execute(
+        "UPDATE units u SET project_name = p.name FROM projects p "
+        "WHERE u.project_uuid = p.uuid AND u.org_uuid = %s AND u.kind='chat'",
+        (org_uuid,))
+    # Purge projects (and their doc units) deleted upstream.
     live = {p["uuid"] for p in projects}
-    stored_projects = [r[0] for r in con.execute(
-        "SELECT uuid FROM projects WHERE org_uuid=?", (org_uuid,)).fetchall()]
-    purged = [pid for pid in stored_projects if pid not in live]
-    for pid in purged:
-        con.execute("DELETE FROM project_docs WHERE project_uuid=?", (pid,))
-        con.execute("DELETE FROM projects WHERE uuid=?", (pid,))
+    stored_projects = [r["uuid"] for r in con.execute(
+        "SELECT uuid FROM projects WHERE org_uuid=%s", (org_uuid,)).fetchall()]
+    for pid in (x for x in stored_projects if x not in live):
+        con.execute("DELETE FROM units WHERE kind='project_doc' AND project_uuid=%s",
+                    (pid,))    # cascades their messages
+        con.execute("DELETE FROM projects WHERE uuid=%s", (pid,))
     con.commit()
     print(f"    fetched/updated={fetched} unchanged={skipped} images={files_dl} "
           f"projects={len(projects)} project_docs={ndocs}")
@@ -531,6 +748,109 @@ def _sync_org(con: sqlite3.Connection, client: ClaudeClient, org: dict,
                  ("project_docs", ndocs)):
         totals[k] += v
     totals["orgs"].append(org.get("name"))
+
+
+def _same_instant(stored, remote_iso: str | None) -> bool:
+    """True iff a stored timestamptz equals a remote ISO timestamp (same instant).
+    `stored` is a datetime from Postgres; comparing instants avoids string-format
+    drift that would make every conversation look changed."""
+    if not remote_iso or stored is None:
+        return False
+    try:
+        return stored == datetime.fromisoformat(remote_iso)
+    except ValueError:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Local Claude Code session ingest (cookie-independent; see cc.py + ADR 0003)
+# --------------------------------------------------------------------------- #
+def _upsert_cc_session(con, s) -> None:
+    """Write one parsed CCSession -> a `units` row (kind=cc_session) + its
+    cleaned `messages` (wholesale-replaced; per-unit identity)."""
+    con.execute(
+        """INSERT INTO units
+             (unit_id, kind, source, title, summary, model, created_at, updated_at,
+              repo, cwd, worktree, git_branch, cc_version, entrypoint,
+              raw, synced_at)
+           VALUES (%s,'cc_session','claude_code',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT(unit_id) DO UPDATE SET
+             title=EXCLUDED.title, summary=EXCLUDED.summary, model=EXCLUDED.model,
+             created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at,
+             repo=EXCLUDED.repo, cwd=EXCLUDED.cwd, worktree=EXCLUDED.worktree,
+             git_branch=EXCLUDED.git_branch, cc_version=EXCLUDED.cc_version,
+             entrypoint=EXCLUDED.entrypoint,
+             raw=EXCLUDED.raw, synced_at=EXCLUDED.synced_at""",
+        (s.session_id, s.title, s.summary, s.model,
+         s.created_at, s.updated_at, s.repo, s.cwd, s.worktree, s.git_branch,
+         s.cc_version, s.entrypoint,
+         _json({"session_id": s.session_id, "cwd": s.cwd, "repo": s.repo,
+                "worktree": s.worktree, "git_branch": s.git_branch,
+                "cc_version": s.cc_version, "entrypoint": s.entrypoint}), _now()),
+    )
+    rows = [(m.msg_id, m.idx, m.sender, m.role_detail, m.text, m.embed_text,
+             m.created_at, None) for m in s.messages]
+    _replace_unit_messages(con, s.session_id, rows)
+
+
+def ingest_cc(full: bool = False) -> dict:
+    """Ingest local Claude Code transcripts into the store. Incremental by file
+    mtime/size (a `cc_sync_state` watermark); `full` re-parses every file. Also
+    reconciles deletions: a transcript removed from disk loses its unit/messages
+    and its watermark row (the mirror of the claude.ai upstream-deletion purge —
+    never degrade silently to stale data). An unavailable transcript root raises
+    (in `cc.iter_session_files`, before any store mutation) — a missing source
+    is an error, never evidence of deletion. No network / cookies. Returns
+    stats. Fails loud on a store error."""
+    import cc
+    files = list(cc.iter_session_files())  # raises on a missing root, before the store is touched
+    con = connect()
+    state = {r["file_path"]: (r["mtime"], r["size"]) for r in con.execute(
+        "SELECT file_path, mtime, size FROM cc_sync_state").fetchall()}
+    ingested = skipped = sessions = 0
+    try:
+        for path in files:
+            st = path.stat()
+            key = str(path)
+            if not full and state.get(key) == (st.st_mtime, st.st_size):
+                skipped += 1
+                continue
+            parsed = cc.parse_session(path)
+            if parsed is not None:
+                _upsert_cc_session(con, parsed)
+                sessions += 1
+            con.execute(
+                "INSERT INTO cc_sync_state (file_path, mtime, size, session_id, synced_at) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT(file_path) DO UPDATE SET "
+                "mtime=EXCLUDED.mtime, size=EXCLUDED.size, "
+                "session_id=EXCLUDED.session_id, synced_at=EXCLUDED.synced_at",
+                (key, st.st_mtime, st.st_size,
+                 parsed.session_id if parsed else None, _now()))
+            con.commit()
+            ingested += 1
+        # Reconcile deletions: drop watermark rows for files no longer on disk,
+        # then every cc unit left without ANY backing file (FK cascades its
+        # messages; build_index drops its chunks via the `gone` path).
+        on_disk = {str(p) for p in files}
+        dead_paths = [fp for fp in state if fp not in on_disk]
+        if dead_paths:
+            con.execute("DELETE FROM cc_sync_state WHERE file_path = ANY(%s)",
+                        (dead_paths,))
+        removed = len(con.execute(
+            "DELETE FROM units u WHERE u.kind='cc_session' AND NOT EXISTS "
+            "(SELECT 1 FROM cc_sync_state s WHERE s.session_id = u.unit_id) "
+            "RETURNING u.unit_id").fetchall())
+        con.commit()
+        total = con.execute(
+            "SELECT COUNT(*) FROM units WHERE source='claude_code'").fetchone()["count"]
+    finally:
+        con.close()
+    print(f"[cc] files_parsed={ingested} unchanged={skipped} "
+          f"cli_sessions_ingested={sessions} sessions_removed={removed} "
+          f"cc_sessions_in_db={total}")
+    return {"files_parsed": ingested, "unchanged": skipped,
+            "sessions_ingested": sessions, "sessions_removed": removed,
+            "cc_sessions_in_db": total}
 
 
 # --------------------------------------------------------------------------- #
@@ -584,24 +904,60 @@ def cmd_whoami(args) -> int:
 
 
 def _index_after_sync(full: bool) -> None:
-    """Refresh the hybrid-search index after a sync. The `search` extra is
-    optional: absent -> warn + skip; present but failing -> fail loud.
-    (search imports fine without the extra — its heavy deps are lazy — so we must
-    gate on search.available(), not on catching ImportError.)"""
+    """Refresh the hybrid-search index after a sync. Search is core (ADR 0003):
+    a broken index fails loud (never a silent skip)."""
     import search
-    if not search.available():
-        print("search extra not installed; skipping index (uv sync --extra search)")
-        return
     try:
         stats = search.build_index(full=full)
     except Exception as e:
         notify("fail", "clync index failed", str(e))
         raise
-    print(f"[index] reindexed_convs={stats['reindexed_convs']} "
-          f"chunks={stats['chunks']} removed_convs={stats['removed_convs']}")
+    print(f"[index] reindexed_units={stats['reindexed_units']} "
+          f"chunks={stats['chunks']} removed_units={stats['removed_units']}")
+
+
+def _sync_all(profile: str, org_ref: str | None, full: bool, download_files: bool,
+              do_index: bool, notify_fail: bool) -> Exception | None:
+    """Run claude.ai sync (cookie/network — may fail) then ALWAYS the local
+    Claude Code ingest (no network), then index. claude.ai failure is captured and
+    RETURNED for the caller to re-raise (fail-loud) — but only after cc + index run,
+    so a stale/expired cookie never blocks local-session capture. A cc-ingest or
+    index failure is not captured — it raises immediately (notifying first on the
+    scheduled path, so an unattended failure is never silent)."""
+    ensure_cluster()
+    err: Exception | None = None
+    try:
+        run_sync(profile, org_ref, full, download_files=download_files)
+    except Exception as e:                    # captured, re-raised by caller (loud)
+        if notify_fail:
+            notify("fail", "clync sync failed", str(e))
+        print(f"claude.ai sync FAILED: {e}\n  -> continuing with local Claude Code "
+              f"ingest (cookie-independent)", file=sys.stderr)
+        err = e
+    try:
+        ingest_cc(full=full)
+    except Exception as e:
+        if notify_fail:
+            notify("fail", "clync cc ingest failed", str(e))
+        raise
+    if do_index:
+        _index_after_sync(full)
+    return err
 
 
 def cmd_sync(args) -> int:
+    err = _sync_all(_require_profile(args), args.org, args.full,
+                    download_files=not args.no_files, do_index=not args.no_index,
+                    notify_fail=False)
+    if err:
+        raise err
+    return 0
+
+
+def cmd_sync_app(args) -> int:
+    """Sync claude.ai (the app) ONLY — network/cookies, fails loud — then index.
+    No local Claude Code ingest."""
+    ensure_cluster()
     run_sync(_require_profile(args), args.org, args.full,
              download_files=not args.no_files)
     if not args.no_index:
@@ -609,20 +965,24 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_sync_cc(args) -> int:
+    """Ingest local Claude Code sessions ONLY (no network/cookies), then index."""
+    ensure_cluster()
+    ingest_cc(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
 def cmd_index(args) -> int:
-    # Unlike the post-sync auto-index (search extra optional, silent skip),
-    # an explicit `clync index` invocation fails loud on ANY problem —
-    # including a missing extra, since the user asked to index directly.
     import search
-    if not search.available():
-        raise RuntimeError("search extra not installed — run: uv sync --extra search")
     try:
         stats = search.build_index(full=args.full)
     except Exception as e:
         notify("fail", "clync index failed", str(e))
         raise
-    print(f"reindexed_convs={stats['reindexed_convs']} chunks={stats['chunks']} "
-          f"removed_convs={stats['removed_convs']}")
+    print(f"reindexed_units={stats['reindexed_units']} chunks={stats['chunks']} "
+          f"removed_units={stats['removed_units']}")
     return 0
 
 
@@ -633,79 +993,104 @@ def cmd_scheduled(args) -> int:
     if not profile:
         notify("fail", "clync sync failed", f"${PROFILE_ENV} is not set")
         raise RuntimeError(f"${PROFILE_ENV} is not set")
+    ensure_cluster()
     # Detect a missed prior run before this one updates last_success.
     con = connect()
-    last = get_meta(con, "last_success")
-    con.close()
+    try:
+        last = get_meta(con, "last_success")
+    finally:
+        con.close()
     late_gap_h = None
     if last:
         gap = datetime.now(timezone.utc) - datetime.fromisoformat(last)
         if gap > timedelta(hours=LATE_THRESHOLD_H):
             late_gap_h = gap.total_seconds() / 3600
-    try:
-        stats = run_sync(profile, args.org, full=False)
-    except Exception as e:
-        notify("fail", "clync sync failed", str(e))
-        raise
+    err = _sync_all(profile, args.org, full=False, download_files=True,
+                    do_index=True, notify_fail=True)
     if late_gap_h is not None:
         notify("warn", "clync ran late",
                f"previous scheduled sync was missed (~{late_gap_h:.0f}h gap) — "
                "Mac was likely asleep/off. Synced now.")
-    _index_after_sync(full=False)
-    print(f"[scheduled] ok: {stats}")
+    if err:
+        raise err
+    print("[scheduled] ok")
     return 0
 
 
 def cmd_search(args) -> int:
     import search
-    if not search.available():
-        raise RuntimeError("search extra not installed — run: uv sync --extra search")
-    results = search.hybrid_search(args.query, topk=args.limit, lang=args.lang)
+    results = search.hybrid_search(
+        args.query, topk=args.limit, source=args.source, project=args.project,
+        model=args.model, repo=args.repo, worktree=args.worktree, branch=args.branch,
+        session=args.session, since=args.since, until=args.until, sort=args.sort,
+        lang=args.lang)
     if not results:
         print("(no matches)")
     for r in results:
         snippet = r["text"].replace("\n", " ")[:200]
-        print(f"\n• {r['conv_name'] or '(untitled)'}  [{r['conv_uuid']}]  "
-              f"lang={r['lang']}  score={r['score']:.4f}\n  {snippet}")
+        print(f"\n• [{r['source']}] {r['unit_name'] or '(untitled)'}  "
+              f"[{r['unit_id']}]  score={r['score']:.4f}\n  {snippet}")
     return 0
 
 
 def cmd_list(args) -> int:
+    ensure_cluster()
     con = connect()
-    rows = con.execute(
-        "SELECT name, uuid, updated_at, message_count FROM conversations "
-        "ORDER BY updated_at DESC LIMIT ?", (args.limit,)
-    ).fetchall()
+    try:
+        rows = con.execute(
+            "SELECT title, unit_id, source, updated_at, msg_count FROM units "
+            "WHERE (%s = 'all' OR source = %s) "
+            "ORDER BY updated_at DESC NULLS LAST LIMIT %s",
+            (args.source, args.source, args.limit)).fetchall()
+    finally:
+        con.close()
     for r in rows:
-        print(f"{r['updated_at']}  {r['message_count']:>3}msg  "
-              f"{r['name'] or '(untitled)'}  [{r['uuid']}]")
-    con.close()
+        n = r["msg_count"] or 0
+        print(f"{r['updated_at']}  {n:>3}msg  [{r['source']}]  "
+              f"{r['title'] or '(untitled)'}  [{r['unit_id']}]")
     return 0
 
 
 def cmd_doctor(args) -> int:
-    """Health check: DB, deps/MCP-server import, launchd job, MCP registration."""
+    """Health check: store cluster + counts, search index, MCP, launchd."""
     problems: list[str] = []
 
-    if not DB_PATH.exists():
-        problems.append(f"DB missing at {DB_PATH} — run `clync sync`.")
+    import search
+    st = search.index_status()          # structured, never raises, no schema leak
+    if not st["available"]:
+        print("store       : FAIL (PG17 + pgvector toolchain missing)")
+        problems.append("PG17/pgvector not found — brew install postgresql@17 "
+                        "pgvector (or set $CLYNC_PG_BIN).")
+    elif not st["cluster_running"]:
+        print(f"store       : FAIL (Postgres cluster not running at {PG_DATA})")
+        problems.append("store cluster not running — run `clync sync` or "
+                        "`clync index` (provisions + starts it).")
+    elif st["error"]:
+        print(f"store       : FAIL ({st['error']})")
+        problems.append(f"store probe failed: {st['error']}")
     else:
         con = connect()
-        nconv = con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        nmsg = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        nfile = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        ndl = con.execute("SELECT COUNT(*) FROM files WHERE local_path IS NOT NULL"
-                          ).fetchone()[0]
-        last = get_meta(con, "last_success")
-        con.close()
-        print(f"DB          : {DB_PATH}\n              {nconv} conversations, "
-              f"{nmsg} messages, {nfile} files ({ndl} images downloaded), "
-              f"last_success={last}")
+        try:
+            def _n(sql, *a):
+                return con.execute(sql, a).fetchone()["n"]
+            nchat = _n("SELECT COUNT(*) n FROM units WHERE kind='chat'")
+            ndoc = _n("SELECT COUNT(*) n FROM units WHERE kind='project_doc'")
+            ncc = _n("SELECT COUNT(*) n FROM units WHERE kind='cc_session'")
+            nmsg = _n("SELECT COUNT(*) n FROM messages")
+            nfile = _n("SELECT COUNT(*) n FROM files")
+            ndl = _n("SELECT COUNT(*) n FROM files WHERE local_path IS NOT NULL")
+            last = get_meta(con, "last_success")
+        finally:
+            con.close()
+        print(f"store       : {PG_DB}@localhost:{PG_PORT}\n"
+              f"              {nchat} chats, {ndoc} project docs, {ncc} cc sessions, "
+              f"{nmsg} messages, {nfile} files ({ndl} images), last_success={last}")
+        print(f"search index: ok ({st['chunks']} chunks indexed)")
         if last:
             gap = datetime.now(timezone.utc) - datetime.fromisoformat(last)
             if gap > timedelta(hours=LATE_THRESHOLD_H):
-                problems.append(f"last sync was {gap.total_seconds()/3600:.0f}h ago "
-                                f"(> {LATE_THRESHOLD_H}h) — scheduler may not be running.")
+                problems.append(f"last claude.ai sync was {gap.total_seconds()/3600:.0f}h "
+                                f"ago (> {LATE_THRESHOLD_H}h) — scheduler may not be running.")
 
     try:
         import mcp_server  # noqa: F401 — self-test that deps resolve + server builds
@@ -727,28 +1112,6 @@ def cmd_doctor(args) -> int:
         print("MCP register: registered with Claude Code")
     else:
         problems.append("MCP server not registered — see README for `claude mcp add`.")
-
-    import search
-    st = search.index_status()          # structured, never raises, no schema leak
-    if not st["available"]:
-        print("search deps : FAIL (search extra not installed — uv sync --extra search)")
-        problems.append("search extra not installed — hybrid search unavailable "
-                        "(uv sync --extra search).")
-    elif not st["pg_bin"]:
-        print("search deps : FAIL (PostgreSQL 17 binaries not found)")
-        problems.append("PG17 not found — brew install postgresql@17 pgvector "
-                        "(or set $CLYNC_PG_BIN).")
-    else:
-        print("search deps : ok (search extra installed)")
-        print(f"search cluster: {'ok (running)' if st['cluster_running'] else 'FAIL (not running)'}")
-        if not st["cluster_running"]:
-            problems.append("search cluster not running — run `clync index` "
-                            "(provisions + builds it).")
-        elif st["error"]:
-            print(f"search index: FAIL ({st['error']})")
-            problems.append(f"search index probe failed: {st['error']}")
-        else:
-            print(f"search index: ok ({st['chunks']} chunks indexed)")
 
     if problems:
         print("\nPROBLEMS:")
@@ -859,18 +1222,15 @@ def cmd_setup(args) -> int:
     print(f"✓ ops skill: {OPS_SKILL_LINK} -> skill-ops/  "
           f"(resolves to {OPS_SKILL_LINK.resolve()})")
 
+    # Search is core (ADR 0003): provision the contained cluster + build the initial
+    # index unconditionally. Real provisioning/embedding failures fail loud — a
+    # broken install must NOT be reported as a successful setup.
     import search
-    if not search.available():
-        print("○ hybrid search: `search` extra not installed — skipping cluster + "
-              "index (run `uv sync --extra search` then `clync index`)")
-    else:
-        # Real provisioning/embedding failures fail loud — a broken install must
-        # NOT be reported as a successful setup.
-        search.ensure_cluster()
-        stats = search.build_index(full=True)
-        print(f"✓ hybrid search: contained PG17+pgvector cluster provisioned, "
-              f"indexed reindexed_convs={stats['reindexed_convs']} "
-              f"chunks={stats['chunks']}")
+    ensure_cluster()
+    stats = search.build_index(full=True)
+    print(f"✓ store + search: contained PG17+pgvector cluster provisioned, "
+          f"indexed reindexed_units={stats['reindexed_units']} "
+          f"chunks={stats['chunks']}")
 
     print("\nSetup complete. Open a NEW Claude Code session to load the MCP tools "
           "+ skill. Reverse anytime with `clync unsetup`.")
@@ -887,20 +1247,25 @@ def cmd_unsetup(args) -> int:
             link.unlink()
             print(f"✓ removed {link}")
     # stop_cluster is defensive (no-op if the cluster/binaries are absent) and
-    # only shells out to pg_ctl — no heavy deps — so call it unconditionally.
-    import search
-    if search.stop_cluster():
-        print("✓ search cluster stopped (its data was left intact)")
-    print("Unset complete. The local DB in ~/.local/share/clync was left intact.")
+    # only shells out to pg_ctl, so call it unconditionally.
+    if stop_cluster():
+        print("✓ store cluster stopped (its data was left intact)")
+    print("Unset complete. The store in ~/.local/share/clync was left intact.")
     return 0
 
 
 def cmd_status(args) -> int:
     """Scheduled-sync status: last success, launchd state, recent run log."""
-    con = connect()
-    last = get_meta(con, "last_success")
-    con.close()
-    print(f"last successful sync : {last or '(never)'}")
+    import search
+    if search.index_status()["cluster_running"]:
+        con = connect()
+        try:
+            last = get_meta(con, "last_success")
+        finally:
+            con.close()
+    else:
+        last = None
+    print(f"last successful sync : {last or '(never / store not running)'}")
     loaded = subprocess.run(
         ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
         capture_output=True, text=True,
@@ -932,34 +1297,63 @@ def main() -> int:
     sub.add_parser("whoami", parents=[cred], help="print the resolved account + org"
                    ).set_defaults(func=cmd_whoami)
 
-    sp = sub.add_parser("sync", parents=[cred], help="incremental sync into the local DB")
-    sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
+    sp = sub.add_parser("sync", parents=[cred],
+                        help="sync BOTH sources (claude.ai + local Claude Code) + index")
+    sp.add_argument("--full", action="store_true", help="re-fetch/re-parse everything")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
     sp.add_argument("--no-index", action="store_true",
                      help="skip hybrid-search indexing after sync")
     sp.set_defaults(func=cmd_sync)
 
+    sp = sub.add_parser("sync-app", parents=[cred],
+                        help="sync claude.ai chats ONLY (network/cookies) + index")
+    sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
+    sp.add_argument("--no-files", action="store_true", help="skip image downloads")
+    sp.add_argument("--no-index", action="store_true", help="skip indexing after sync")
+    sp.set_defaults(func=cmd_sync_app)
+
+    sp = sub.add_parser("sync-cc", help="ingest local Claude Code sessions ONLY "
+                                        "(no network / cookies) + index")
+    sp.add_argument("--full", action="store_true", help="re-parse every transcript")
+    sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
+    sp.set_defaults(func=cmd_sync_cc)
+
     sp = sub.add_parser("index", help="(re)build the hybrid-search index")
-    sp.add_argument("--full", action="store_true", help="reindex every conversation")
+    sp.add_argument("--full", action="store_true", help="reindex every unit")
     sp.set_defaults(func=cmd_index)
 
     sub.add_parser("scheduled", parents=[cred],
                    help="launchd entry point (sync + loud fail/late notify)"
                    ).set_defaults(func=cmd_scheduled)
 
-    sp = sub.add_parser("search", help="hybrid (dense + sparse) semantic search "
-                                        "over message + attachment text")
-    sp.add_argument("query")
+    sp = sub.add_parser("search", help="faceted hybrid (dense + sparse) semantic "
+                                       "search across claude.ai + Claude Code")
+    sp.add_argument("query", nargs="?", default="",
+                    help="natural-language query (empty => recency browse)")
     sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)
+    sp.add_argument("--source", choices=VALID_SOURCES,
+                    default="all", help="restrict to one source (default: all)")
+    sp.add_argument("--project", help="claude.ai project name/uuid; "
+                    "'any' = in some project, 'none' = not in a project")
+    sp.add_argument("--model", help="claude.ai model facet")
+    sp.add_argument("--repo", help="Claude Code repo name")
+    sp.add_argument("--worktree", help="Claude Code worktree name")
+    sp.add_argument("--branch", help="Claude Code git branch")
+    sp.add_argument("--session", help="Claude Code session name or id")
+    sp.add_argument("--since", help="only units updated on/after this ISO date")
+    sp.add_argument("--until", help="only units updated on/before this ISO date")
+    sp.add_argument("--sort", choices=["relevance", "recency"], default="relevance")
     sp.add_argument("--lang", choices=["en", "ja", "zh"], default=None,
                      help="restrict to one language (default: all)")
     sp.set_defaults(func=cmd_search)
 
-    sp = sub.add_parser("list", help="most recently updated conversations")
+    sp = sub.add_parser("list", help="most recently updated units")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--source", choices=VALID_SOURCES, default="all")
     sp.set_defaults(func=cmd_list)
 
-    sub.add_parser("doctor", help="health check DB / deps / launchd / MCP").set_defaults(func=cmd_doctor)
+    sub.add_parser("doctor", help="health check store / index / launchd / MCP"
+                   ).set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser("setup", parents=[cred],
                         help="one-shot install: deps, CLI, MCP, scheduler, skill")

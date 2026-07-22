@@ -1,6 +1,6 @@
-"""Shared fixtures. Tests never touch the user's real DB or the real `clync`
-Postgres database: SQLite is redirected to a tmp file, and Postgres work runs in
-a throwaway database inside the (already-running) contained cluster."""
+"""Shared fixtures. Tests never touch the user's real store: Postgres work runs in
+a throwaway database (`clync_pytest`) inside the already-running contained cluster,
+and the Claude Code root is redirected to a tmp dir."""
 from __future__ import annotations
 
 import pytest
@@ -22,37 +22,34 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
-@pytest.fixture
-def sqlite_db(tmp_path, monkeypatch):
-    """Redirect clync's SQLite store to a fresh temp file (schema auto-created)."""
-    db = tmp_path / "history.db"
-    monkeypatch.setattr(clync, "DB_PATH", db)
-    return db
+def _drop_pytest_db():
+    import psycopg
+    with psycopg.connect(host="localhost", port=clync.PG_PORT,
+                         dbname="postgres", user=clync.PG_USER, autocommit=True) as c:
+        c.execute("DROP DATABASE IF EXISTS clync_pytest WITH (FORCE)")
 
 
 @pytest.fixture
 def pg_test_db(monkeypatch):
-    """A throwaway Postgres database in the contained cluster. Skips if the search
-    extra / cluster isn't available. Reuses the running cluster; drops the db after."""
-    search = pytest.importorskip("search")
+    """A throwaway Postgres database in the contained cluster. Skips if the PG17 +
+    pgvector toolchain isn't present. Fresh per test; dropped after. Yields the
+    `search` module (its heavy deps load lazily on first embed)."""
+    import search
     if not search.available():
-        pytest.skip("search extra not installed")
-    monkeypatch.setattr(search, "PG_DB", "clync_pytest")
-    search.ensure_cluster()          # creates clync_pytest + schema in the live cluster
+        pytest.skip("PG17 + pgvector toolchain not available")
+    monkeypatch.setattr(clync, "PG_DB", "clync_pytest")
+    _drop_pytest_db()                # fresh slate even if a prior run left one behind
+    clync.ensure_cluster()           # creates clync_pytest + full schema in the cluster
     yield search
-    # teardown: drop the temp db (FORCE terminates any lingering backends, PG13+)
-    import psycopg
-    with psycopg.connect(host="localhost", port=search.PG_PORT,
-                         dbname="postgres", user=search.PG_USER, autocommit=True) as c:
-        c.execute("DROP DATABASE IF EXISTS clync_pytest WITH (FORCE)")
+    _drop_pytest_db()
 
 
 @pytest.fixture
 def mock_embed(monkeypatch):
     """Replace BGE-M3 with a deterministic stub: one fixed dense vector + one
-    positive sparse weight per text. Enough to exercise the SQL/fusion/watermark
-    logic without loading the real model. Returns nothing; just patches search._embed."""
-    search = pytest.importorskip("search")
+    positive sparse weight per text. Exercises the SQL/fusion/watermark logic
+    without loading the real model."""
+    import search
 
     def _fake(texts, max_length):
         dense = [[1.0] + [0.0] * (search.DENSE_DIM - 1) for _ in texts]

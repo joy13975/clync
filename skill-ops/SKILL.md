@@ -4,53 +4,59 @@ description: Operate and troubleshoot the clync sync + hybrid-search tool — ru
 allowed-tools: Bash
 ---
 
-clync syncs the user's claude.ai history into a local SQLite DB and serves a
-hybrid semantic+lexical search over a **contained** Postgres/pgvector cluster.
-This skill runs and troubleshoots those operations from the shell.
+clync syncs the user's claude.ai chats **and** local Claude Code sessions into
+one contained Postgres/pgvector cluster — the single source of truth *and* the
+hybrid semantic+lexical search index. This skill runs and troubleshoots those
+operations from the shell.
 
-## The one gotcha that breaks everything
+## Two sources, one sync
 
-Search + indexing live in the optional **`search` extra** (BGE-M3, psycopg).
-**Every index/search command MUST run through it:**
+`clync sync` runs claude.ai (network/cookies — fails loud if the profile's
+cookies are stale) **then** local Claude Code ingest (`~/.claude/projects/**/*.jsonl`,
+no network — runs even if the claude.ai leg failed), **then** indexes once. To
+ingest Claude Code sessions only, without touching claude.ai/network at all,
+use `clync sync-cc [--full]`; to sync claude.ai only, use `clync sync-app`.
 
-```sh
-uv run --extra search --project ~/code/clync python ~/code/clync/clync.py <cmd>
-```
-
-If the installed `clync` CLI wrapper (from `clync setup`) is on PATH, `clync <cmd>`
-works too — it already targets the project. Plain `python clync.py search` WITHOUT
-`--extra search` will fail loud with "search extra not installed". That is correct
-behavior, not a bug — add the extra.
+Search is **core** — the BGE-M3 embedder + Postgres client ship with the base
+install (`uv sync`, no extras). There is no `--extra search` step anymore; a
+plain `clync <cmd>` or `uv run --project ~/code/clync python ~/code/clync/clync.py <cmd>`
+just works.
 
 The search backend is clync's own PG17 cluster on port **54329** (data under
-`~/.local/share/clync/pg`), isolated from any system Postgres. It is provisioned
-by `clync setup` / first `clync index`. It uses the PG17 binaries at
-`/opt/homebrew/opt/postgresql@17/bin` (override with `$CLYNC_PG_BIN`).
+`~/.local/share/clync/pg`, overridable via `$CLYNC_DATA_HOME`), isolated from
+any system Postgres. It is provisioned by `clync setup` / first `clync index`.
+It uses the PG17 binaries at `/opt/homebrew/opt/postgresql@17/bin` (override
+with `$CLYNC_PG_BIN`).
 
 ## Operations
 
 | Goal | Command | Notes |
 |---|---|---|
-| Sync new/updated conversations | `clync sync --profile <ChromeProfile>` | Auto-reindexes after. Needs the Chrome profile (or `$CLYNC_PROFILE`). `--no-index` to skip, `--full` to refetch all. |
-| Rebuild the index only | `uv run --extra search … clync.py index [--full]` | No network. `--full` re-embeds everything; default is incremental by per-unit content signature. |
-| Search from the shell | `uv run --extra search … clync.py search "<natural query>" [--limit N] [--lang en\|ja\|zh]` | Natural language, not FTS. Returns best chunk per conversation with a fused score. |
-| Health check | `uv run --extra search … clync.py doctor` | Reports DB, search deps, cluster running, indexed chunk count. Exit 1 + a PROBLEMS list if anything's off. |
+| Sync both sources | `clync sync --profile <ChromeProfile>` | claude.ai then local Claude Code ingest then index. Needs the Chrome profile (or `$CLYNC_PROFILE`) for the claude.ai leg only. `--no-index` to skip indexing, `--full` to refetch/re-parse all. |
+| Sync claude.ai chats only | `clync sync-app --profile <ChromeProfile> [--full] [--no-index]` | claude.ai leg + index; no local Claude Code ingest. Fails loud on stale cookies. |
+| Ingest local Claude Code sessions only | `clync sync-cc [--full] [--no-index]` | No network/cookies needed. Only `entrypoint=="cli"` (interactive) sessions are ingested; subagent transcripts are never read. |
+| Rebuild the index only | `clync index [--full]` | No network. `--full` re-embeds everything; default is incremental by per-unit content signature. |
+| Search from the shell | `clync search ["<natural query>"] [--source all\|claude_ai\|claude_code] [--repo R] [--worktree W] [--branch B] [--project P] [--model M] [--since/--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | Natural language, not FTS; empty query browses by recency. Returns best chunk per unit with a fused score. A facet that doesn't apply to `--source` fails loud. |
+| List recent units | `clync list [--limit N] [--source all\|claude_ai\|claude_code]` | Most recently updated units, either source. |
+| Health check | `clync doctor` | Reports store (chat/doc/cc counts), search deps, cluster running, indexed chunk count. Exit 1 + a PROBLEMS list if anything's off. |
 | Scheduler status / last sync | `clync status` | Shows last successful sync + launchd state + recent scheduled-run log. |
-| First-time setup / teardown | `clync setup --profile <P>` · `clync unsetup` | setup wires CLI+MCP+scheduler+both skills+cluster; unsetup reverses it, keeping the DB + cluster data. |
+| First-time setup / teardown | `clync setup --profile <P>` · `clync unsetup` | setup wires CLI+MCP+scheduler+both skills+cluster; unsetup reverses it, keeping the store + cluster data. |
 
 ## Troubleshooting (diagnose before acting)
 
 1. **Always start with `clync doctor`** — it distinguishes the failure modes below as data.
-2. **"search extra not installed"** → run with `uv run --extra search` (see gotcha), or `uv sync --extra search` in the repo.
-3. **Cluster not running / "PG17 not found"** → `clync index` provisions+starts it; if PG17 is missing, `brew install postgresql@17 pgvector`.
-4. **Search returns nothing for a topic the user knows they discussed** → it may be a **hollow conversation**: some old (pre-2024) threads have message rows but empty bodies because claude.ai's API no longer returns their text. clync mirrors the API faithfully; there is nothing to index, so content search cannot reach them. Confirm with:
+2. **Cluster not running / "PG17/pgvector not found"** → `clync sync` or `clync index` provisions+starts it; if PG17 is missing, `brew install postgresql@17 pgvector`.
+3. **Search returns nothing for a topic the user knows they discussed** → for claude.ai, it may be a **hollow conversation**: some old (pre-2024) threads have message rows but empty bodies because claude.ai's API no longer returns their text. clync mirrors the API faithfully; there is nothing to index, so content search cannot reach them. Confirm with:
    ```sh
-   sqlite3 ~/.local/share/clync/history.db \
-     "SELECT c.name, COALESCE(SUM(LENGTH(m.text)),0) chars FROM conversations c \
-      LEFT JOIN messages m ON m.conversation_uuid=c.uuid GROUP BY c.uuid HAVING chars=0;"
+   psql -h localhost -p 54329 -U "$USER" -d clync -c \
+     "SELECT title, msg_count FROM units WHERE source='claude_ai' AND msg_count > 0 \
+      AND unit_id NOT IN (SELECT DISTINCT unit_id FROM messages WHERE length(text) > 0);"
    ```
    Rows returned = unsearchable-by-content conversations. This is expected, not a defect.
-5. **MCP `search_history` in Claude Code returns old FTS-style results / stale tool description** → the MCP server is a long-lived subprocess that loaded the code at session start. **Restart the Claude Code session** to pick up the current code (this also reaps stale `mcp_server.py` processes). The CLI always runs current code.
-6. **Stale results after new chats** → the daily scheduled sync may not have run (Mac asleep). `clync sync --profile <P>` now, or check `clync status`.
+   For Claude Code, check `entrypoint` — only `"cli"` sessions are ingested; a
+   session run via `sdk-cli`/`sdk-py`, or a subagent transcript, is out of
+   scope by design (ADR 0003), not a bug.
+4. **MCP `search_history` in Claude Code returns stale results / stale tool description** → the MCP server is a long-lived subprocess that loaded the code at session start. **Restart the Claude Code session** to pick up the current code (this also reaps stale `mcp_server.py` processes). The CLI always runs current code.
+5. **Stale results after new chats or coding sessions** → the daily scheduled sync may not have run (Mac asleep). `clync sync --profile <P>` now, or check `clync status`.
 
-Fail-loud everywhere: auth/HTTP/cluster/schema errors raise and exit non-zero — never assume a silent success. Cite the conversation name when reporting a search hit; if search is empty, say so rather than inventing history.
+Fail-loud everywhere: auth/HTTP/cluster/schema errors raise and exit non-zero — never assume a silent success. Cite the conversation/session name when reporting a search hit; if search is empty, say so rather than inventing history.

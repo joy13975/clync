@@ -1,4 +1,4 @@
-"""Smoke: the entry points import and the CLI runs without the search extra."""
+"""Smoke: the entry points import (with heavy deps staying lazy) and the CLI runs."""
 from __future__ import annotations
 
 import os
@@ -9,10 +9,10 @@ _REPO = os.path.dirname(os.path.dirname(__file__))
 
 
 def test_entry_points_import_without_pulling_heavy_deps():
-    # Core-only safety: the entry points must import WITHOUT eagerly loading the
-    # search extra's heavy deps — that laziness is what lets a core-only install
-    # run sync/MCP. Checked in a subprocess so it holds regardless of whether the
-    # extra is installed here or what other tests loaded into this process.
+    # The entry points must import WITHOUT eagerly loading the ML / DB heavy deps —
+    # that laziness is what keeps MCP-server startup fast (it only pays for the
+    # embedder on the first search). Checked in a subprocess so it holds regardless
+    # of what other tests loaded into this process.
     probe = (
         "import clync, mcp_server, search, sys;"
         "heavy = [m for m in ('FlagEmbedding', 'torch', 'psycopg') if m in sys.modules];"
@@ -27,4 +27,4 @@ def test_cli_help_runs():
     r = subprocess.run([sys.executable, "clync.py", "--help"],
                        cwd=_REPO, capture_output=True, text=True)
     assert r.returncode == 0
-    assert "search" in r.stdout and "sync" in r.stdout
+    assert all(s in r.stdout for s in ("search", "sync", "sync-app", "sync-cc"))

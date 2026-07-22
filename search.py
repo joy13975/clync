@@ -1,44 +1,24 @@
-"""Contained hybrid search + indexing for clync.
+"""Hybrid search + indexing over clync's contained Postgres store.
 
-clync runs its OWN Postgres 17 + pgvector cluster — a private `initdb` cluster
-under ~/.local/share/clync/pg, on a non-default port, fully isolated from any
-system Postgres. Synced messages (from the SQLite raw store) are chunked and
-embedded with BGE-M3 (dense + learned sparse; ADR 0002) and served via a hybrid
-dense + sparse + typed-metadata search with RRF fusion — no reranker (ADR 0001).
+The store (cluster lifecycle, connection, raw `units`/`messages` schema) is owned
+by clync.py; this module owns the *index*: it creates the vector `chunks` /
+`indexed_units` tables (it pins the embedding dims), embeds `messages` with BGE-M3
+(dense + learned sparse; ADR 0002), and serves a **faceted** hybrid dense + sparse
++ typed-metadata search with RRF fusion — no reranker (ADR 0001).
 
-Heavy deps (FlagEmbedding/torch, psycopg) live in the `search` extra:
-    uv sync --extra search
-
-Fail-loud: missing binaries / pgvector / model / cluster problems raise. No
+Fail-loud: a missing PG17/pgvector toolchain, model, or cluster problem raises. No
 silent fallback to stale or partial results.
 """
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
-# Reuse the SQLite raw store + shared config from the core module (SSOT).
-from clync import DB_PATH, DEFAULT_TOPK, connect
-
-# --------------------------------------------------------------------------- #
-# Config (all overridable; nothing personal hardcoded)
-# --------------------------------------------------------------------------- #
-DATA_HOME = DB_PATH.parent                         # ~/.local/share/clync
-PG_DIR = DATA_HOME / "pg"
-PG_DATA = PG_DIR / "data"
-PG_LOG = PG_DIR / "postmaster.log"
-# pgvector is installed against PG17's share dir; the cluster MUST use those
-# binaries (the PATH `initdb` may be a different major without pgvector).
-PG_BIN = Path(os.environ.get("CLYNC_PG_BIN", "/opt/homebrew/opt/postgresql@17/bin"))
-PG_PORT = int(os.environ.get("CLYNC_PG_PORT", "54329"))
-PG_DB = os.environ.get("CLYNC_PG_DB", "clync")
-if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_DB):
-    raise SystemExit(f"invalid $CLYNC_PG_DB {PG_DB!r} — must match [A-Za-z_][A-Za-z0-9_]*")
-PG_USER = os.environ.get("USER", "postgres")
+# The store + shared config live in the core module (SSOT). Search is core now
+# (ADR 0003): its deps are no longer an optional extra.
+from clync import (DEFAULT_TOPK, PG_BIN, VALID_SOURCES, connect_pg,
+                   ensure_cluster, _vector_control_present)
 
 EMBED_MODEL = "BAAI/bge-m3"
 DENSE_DIM = 1024
@@ -49,228 +29,169 @@ RRF_K = 60
 PRE_TOPK = 50                # per-signal shortlist before fusion
 TOPK = DEFAULT_TOPK          # default result count (SSOT: clync.DEFAULT_TOPK)
 
-SCHEMA = f"""
-CREATE EXTENSION IF NOT EXISTS vector;
+INDEX_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id    text PRIMARY KEY,
-    conv_uuid   text NOT NULL,
-    conv_name   text,
-    sender      text,
-    msg_idx     int,
-    chunk_idx   int,
-    lang        text,                       -- typed metadata (en/ja/zh)
-    created_at  timestamptz,
-    updated_at  timestamptz,                -- conversation recency (metadata)
-    text        text NOT NULL,
-    dense       vector({DENSE_DIM}) NOT NULL,
-    sparse      sparsevec({SPARSE_DIM}) NOT NULL
+    chunk_id     text PRIMARY KEY,
+    unit_id      text NOT NULL,
+    kind         text,
+    source       text,
+    unit_name    text,
+    title        text,
+    sender       text,
+    msg_idx      int,
+    chunk_idx    int,
+    lang         text,
+    created_at   timestamptz,
+    updated_at   timestamptz,                 -- unit recency (metadata boost)
+    model        text,
+    project_uuid text,
+    project_name text,
+    repo         text,
+    worktree     text,
+    git_branch   text,
+    entrypoint   text,
+    text         text NOT NULL,
+    dense        vector({DENSE_DIM}) NOT NULL,
+    sparse       sparsevec({SPARSE_DIM}) NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_chunks_conv ON chunks(conv_uuid);
-CREATE INDEX IF NOT EXISTS idx_chunks_lang ON chunks(lang);
+CREATE INDEX IF NOT EXISTS idx_chunks_unit    ON chunks(unit_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_source  ON chunks(source);
+CREATE INDEX IF NOT EXISTS idx_chunks_lang    ON chunks(lang);
 CREATE INDEX IF NOT EXISTS idx_chunks_updated ON chunks(updated_at);
--- Per-unit (conversation OR project-doc) index watermark, for incremental
--- re-embedding. The watermark is an opaque sha256 over the EXACT bytes embedded for
--- that unit (message/doc text plus the rendered `[Project] name` prefix), so a
--- change to any embedded input (doc edit, project rename, message edit) flips it and
--- the unit re-embeds on the default incremental run. It lives in the `updated_at`
--- column, which historically held an API timestamp -- keeping the column name means
--- a live cluster needs no schema migration, since only the watermark's derivation
--- changed, not its role. Always non-null, so it can never NULL-abort the INSERT.
-CREATE TABLE IF NOT EXISTS indexed_convs (
-    conv_uuid   text PRIMARY KEY,
-    updated_at  text NOT NULL,          -- content signature (see note above)
-    indexed_at  text NOT NULL
+CREATE INDEX IF NOT EXISTS idx_chunks_repo    ON chunks(repo);
+CREATE INDEX IF NOT EXISTS idx_chunks_pname   ON chunks(project_name);
+-- Per-unit content-signature watermark for incremental re-embedding: a sha256
+-- over the EXACT bytes embedded for the unit. Any change to embedded content (a
+-- message edit, a rename that changes the display prefix, an added/removed chunk)
+-- flips it and the unit re-embeds on the default incremental run.
+CREATE TABLE IF NOT EXISTS indexed_units (
+    unit_id    text PRIMARY KEY,
+    signature  text NOT NULL,
+    indexed_at text NOT NULL
 );
 """
 
 
-# --------------------------------------------------------------------------- #
-# Cluster lifecycle (contained; never touches a system cluster)
-# --------------------------------------------------------------------------- #
-def _pg(binary: str) -> str:
-    path = PG_BIN / binary
-    if not path.exists():
-        raise SystemExit(
-            f"Postgres 17 binary not found: {path}\n"
-            f"clync runs its own PG17+pgvector cluster. Install with:\n"
-            f"  brew install postgresql@17 pgvector\n"
-            f"or set $CLYNC_PG_BIN to the PG17 bin dir.")
-    return str(path)
+def ensure_index_schema() -> None:
+    """Create the vector index tables (idempotent). Assumes the cluster + `vector`
+    extension exist (clync.ensure_cluster provisions them).
 
-
-def _vector_control_present() -> bool:
-    # pgvector ships vector.control into PG17's extension share dir.
-    share = PG_BIN.parent / "share" / "postgresql@17" / "extension" / "vector.control"
-    alt = Path("/opt/homebrew/share/postgresql@17/extension/vector.control")
-    return share.exists() or alt.exists()
-
-
-def cluster_running() -> bool:
-    r = subprocess.run([_pg("pg_ctl"), "-D", str(PG_DATA), "status"],
-                       capture_output=True, text=True)
-    return r.returncode == 0
-
-
-def start_cluster() -> None:
-    if cluster_running():
-        return
-    PG_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [_pg("pg_ctl"), "-D", str(PG_DATA), "-l", str(PG_LOG),
-         "-o", f"-p {PG_PORT} -c listen_addresses=localhost "
-               f"-c unix_socket_directories={PG_DIR}",
-         "-w", "start"],
-        check=True)
-
-
-def stop_cluster() -> bool:
-    """Stop the contained cluster if it's running. Returns True iff a running
-    cluster was actually stopped; False (no-op) if there's no cluster data or the
-    PG17 binary is absent — that's not an error."""
-    if not (PG_DATA / "PG_VERSION").exists() or not (PG_BIN / "pg_ctl").exists():
-        return False
-    if not cluster_running():
-        return False
-    subprocess.run([_pg("pg_ctl"), "-D", str(PG_DATA), "-m", "fast", "stop"],
-                   check=True)
-    return True
-
-
-def ensure_cluster() -> None:
-    """Idempotent: initdb (if absent) → start → create db + extension + schema."""
-    if not _vector_control_present():
-        raise SystemExit(
-            "pgvector not found for PG17. Install with:  brew install pgvector")
-    if not (PG_DATA / "PG_VERSION").exists():
-        PG_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [_pg("initdb"), "-D", str(PG_DATA), "-U", PG_USER,
-             "--encoding=UTF8", "--locale=en_US.UTF-8", "-A", "trust"],
-            check=True, capture_output=True)
-    start_cluster()
-    # create db if missing (connect to the always-present `postgres` db first)
-    exists = subprocess.run(
-        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-d", "postgres",
-         "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'"],
-        capture_output=True, text=True, check=True).stdout.strip()
-    if exists != "1":
-        subprocess.run([_pg("psql"), "-h", "localhost", "-p", str(PG_PORT),
-                        "-d", "postgres", "-c", f'CREATE DATABASE "{PG_DB}"'],
-                       check=True, capture_output=True)
+    The index tables are DERIVED and rebuildable, so ANY stale layout — the
+    pre-ADR-0003 conversation-keyed index (`indexed_convs`), or a `chunks`
+    column set that no longer matches INDEX_SCHEMA — is dropped and recreated
+    (watermarks included, so everything re-embeds). CREATE IF NOT EXISTS alone
+    would silently keep the old shape and the first insert would fail."""
     with connect_pg() as con:
-        with con.cursor() as cur:
-            for stmt in (s.strip() for s in SCHEMA.split(";")):
-                if stmt:
-                    cur.execute(stmt)     # psycopg3 runs one statement per execute
+        have = {r["column_name"] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='chunks'").fetchall()}
+        legacy = con.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name='indexed_convs'").fetchone()
+        if legacy or (have and have != set(CHUNK_COLS) | {"dense", "sparse"}):
+            con.execute("DROP TABLE IF EXISTS chunks")
+            con.execute("DROP TABLE IF EXISTS indexed_convs")
+            con.execute("DROP TABLE IF EXISTS indexed_units")
+        for stmt in (s.strip() for s in INDEX_SCHEMA.split(";")):
+            if stmt:
+                con.execute(stmt)
         con.commit()
 
 
-def connect_pg():
-    import psycopg
-    return psycopg.connect(host="localhost", port=PG_PORT, dbname=PG_DB, user=PG_USER)
-
-
 def available() -> bool:
-    """SSOT for 'is the `search` extra installed'. `import search` is NOT a valid
-    check — this module imports fine without the extra (its heavy deps are lazy),
-    so callers must gate on this, not on catching ImportError from `import search`."""
+    """Can hybrid search actually run on this machine? Deps are core now, so this
+    is the PG17 + pgvector toolchain check (the thing that can genuinely be absent),
+    not an import gate."""
     import importlib.util
-    return all(importlib.util.find_spec(m) is not None
+    deps = all(importlib.util.find_spec(m) is not None
                for m in ("psycopg", "FlagEmbedding", "numpy"))
+    return deps and (PG_BIN / "pg_ctl").exists() and _vector_control_present()
 
 
 def index_status() -> dict:
-    """Structured health for `clync doctor` — REPORTS problems as data, never
-    raises and never leaks the schema to the caller. Keys: available, pg_bin,
-    cluster_running, chunks (int|None), error (str|None)."""
-    st = {"available": available(), "pg_bin": (PG_BIN / "pg_ctl").exists(),
+    """Structured health for `clync doctor` — reports problems as data, never
+    raises. Keys: available, cluster_running, chunks (int|None), error."""
+    import clync
+    st = {"available": available(),
           "cluster_running": False, "chunks": None, "error": None}
-    if not st["available"] or not st["pg_bin"]:
+    if not st["available"]:
         return st
     import psycopg
     try:
-        st["cluster_running"] = cluster_running()
+        st["cluster_running"] = clync.cluster_running()
         if st["cluster_running"]:
             with connect_pg() as pg:
-                st["chunks"] = pg.execute("SELECT count(*) FROM chunks").fetchone()[0]
-    except (psycopg.Error, OSError) as e:   # cluster down / schema absent / pg_ctl unrunnable — report, don't crash doctor
+                st["chunks"] = pg.execute("SELECT count(*) AS n FROM chunks"
+                                          ).fetchone()["n"]
+    except (psycopg.Error, OSError) as e:   # cluster down / schema absent — report
         st["error"] = str(e)
     return st
 
 
 # --------------------------------------------------------------------------- #
-# Corpus + chunking (mirrors the ablation harness — identical chunking)
+# Corpus + chunking
 # --------------------------------------------------------------------------- #
 def _lang(s: str) -> str:
     s = s or ""
-    if re.search(r"[぀-ヿ]", s):   # kana → Japanese
+    if re.search(r"[぀-ヿ]", s):   # kana -> Japanese
         return "ja"
-    if re.search(r"[一-鿿]", s):   # Han without kana → Chinese
+    if re.search(r"[一-鿿]", s):   # Han without kana -> Chinese
         return "zh"
     return "en"
 
 
 def _pieces(text: str) -> list[str]:
     step = CHUNK_CHARS - CHUNK_OVERLAP
-    # range(0, max(1, len(text)), step) always includes index 0 -> >=1 piece.
     return [text[i:i + CHUNK_CHARS] for i in range(0, max(1, len(text)), step)]
 
 
-# The chunks-table column shape (all columns except the two embedding vectors).
-# SSOT for BOTH the row dicts the loaders build (_chunk_row) AND the INSERT column
-# list in build_index — add/rename a column in exactly one place.
-CHUNK_COLS = ("chunk_id", "conv_uuid", "conv_name", "sender", "msg_idx",
-              "chunk_idx", "lang", "created_at", "updated_at", "text")
+def _display_name(kind, title, project_name, repo) -> str:
+    """The human-facing unit label shown in results and folded into embed text."""
+    if kind == "cc_session":
+        base = title or "session"
+        return f"[{repo}] {base}" if repo else base
+    base = title or ("document" if kind == "project_doc" else "untitled")
+    return f"[{project_name}] {base}" if project_name else base
 
 
-def _chunk_row(*, chunk_id: str, conv_uuid: str, conv_name: str, sender: str,
-               msg_idx: int, chunk_idx: int, created_at, updated_at,
-               text: str) -> dict:
-    """Build one chunks-table row dict — the single definition of the row shape,
-    shared by both loaders. `lang` is derived from the embedded `text`."""
-    return {"chunk_id": chunk_id, "conv_uuid": conv_uuid, "conv_name": conv_name,
-            "sender": sender, "msg_idx": msg_idx, "chunk_idx": chunk_idx,
-            "lang": _lang(text), "created_at": created_at, "updated_at": updated_at,
-            "text": text}
+# All chunk columns except the two embedding vectors — SSOT for both the row dicts
+# the loader builds and the INSERT column list in build_index.
+CHUNK_COLS = ("chunk_id", "unit_id", "kind", "source", "unit_name", "title",
+              "sender", "msg_idx", "chunk_idx", "lang", "created_at", "updated_at",
+              "model", "project_uuid", "project_name", "repo", "worktree",
+              "git_branch", "entrypoint", "text")
 
 
-def _load_chunks(sqlite_con) -> list[dict]:
-    # LEFT JOIN projects so a project-associated chat carries its project name into
-    # both the embedded text and the displayed result (e.g. "[Work] CNX sour guy…").
-    q = ("SELECT m.uuid mid, m.conversation_uuid cid, m.sender, m.text, m.idx, "
-         "m.created_at, c.name cname, c.updated_at cupd, pr.name pname "
-         "FROM messages m JOIN conversations c ON c.uuid=m.conversation_uuid "
-         "LEFT JOIN projects pr ON pr.uuid=c.project_uuid "
-         "WHERE m.text IS NOT NULL AND m.text != ''")
-    chunks = []
-    for r in sqlite_con.execute(q).fetchall():
-        prefix = f"[{r['pname']}] " if r["pname"] else ""
-        name = f"{prefix}{r['cname'] or 'untitled'}"
-        for j, piece in enumerate(_pieces(r["text"])):
-            chunks.append(_chunk_row(
-                chunk_id=f"{r['mid']}#{j}", conv_uuid=r["cid"], conv_name=name,
-                sender=r["sender"], msg_idx=r["idx"], chunk_idx=j,
-                created_at=r["created_at"], updated_at=r["cupd"],
-                text=f"{name} | {r['sender']}: {piece}"))
-    return chunks
-
-
-def _load_doc_chunks(sqlite_con) -> list[dict]:
-    """Project knowledge docs as retrievable units — indexed into the same `chunks`
-    table as conversations (conv_uuid = doc uuid), so hybrid_search returns them
-    alongside chats with no query-side change."""
-    q = ("SELECT d.uuid did, d.file_name fname, d.content, d.created_at, pr.name pname "
-         "FROM project_docs d JOIN projects pr ON pr.uuid=d.project_uuid "
-         "WHERE d.content IS NOT NULL AND d.content != ''")
-    chunks = []
-    for r in sqlite_con.execute(q).fetchall():
-        name = f"[{r['pname']}] {r['fname'] or 'document'}"
-        for j, piece in enumerate(_pieces(r["content"])):
-            chunks.append(_chunk_row(
-                chunk_id=f"{r['did']}#{j}", conv_uuid=r["did"], conv_name=name,
-                sender="project_doc", msg_idx=0, chunk_idx=j,
-                created_at=r["created_at"], updated_at=r["created_at"],
-                text=f"{name}: {piece}"))
+def _load_chunks(con) -> list[dict]:
+    """Every retrievable unit's messages -> chunk rows. The `text` field is the
+    exact string embedded: `<display name> | <sender>: <piece>` (project docs use
+    `<display name>: <piece>`). A message's tighter `embed_text` overrides `text`;
+    an empty `embed_text` (pure tool output) contributes no chunk."""
+    q = ("SELECT m.msg_id, m.unit_id, m.sender, m.idx, "
+         "COALESCE(m.embed_text, m.text) AS etext, m.created_at, "
+         "u.kind, u.source, u.title, u.updated_at, u.model, u.project_uuid, "
+         "u.project_name, u.repo, u.worktree, u.git_branch, u.entrypoint "
+         "FROM messages m JOIN units u ON u.unit_id = m.unit_id "
+         "WHERE COALESCE(m.embed_text, m.text) IS NOT NULL "
+         "AND COALESCE(m.embed_text, m.text) != ''")
+    chunks: list[dict] = []
+    for r in con.execute(q).fetchall():
+        name = _display_name(r["kind"], r["title"], r["project_name"], r["repo"])
+        prefix = f"{name}: " if r["kind"] == "project_doc" else f"{name} | {r['sender']}: "
+        for j, piece in enumerate(_pieces(r["etext"])):
+            text = f"{prefix}{piece}"
+            # Message identity is (unit_id, msg_id) — a cc resume stores the same
+            # event uuid under both sessions — so the chunk id must be unit-scoped.
+            chunks.append({
+                "chunk_id": f"{r['unit_id']}:{r['msg_id']}#{j}", "unit_id": r["unit_id"],
+                "kind": r["kind"], "source": r["source"], "unit_name": name,
+                "title": r["title"], "sender": r["sender"], "msg_idx": r["idx"],
+                "chunk_idx": j, "lang": _lang(text), "created_at": r["created_at"],
+                "updated_at": r["updated_at"], "model": r["model"],
+                "project_uuid": r["project_uuid"], "project_name": r["project_name"],
+                "repo": r["repo"], "worktree": r["worktree"],
+                "git_branch": r["git_branch"], "entrypoint": r["entrypoint"],
+                "text": text})
     return chunks
 
 
@@ -305,9 +226,8 @@ def _dense_literal(vec) -> str:
 
 
 def _sparse_literal(weights: dict) -> str:
-    # pgvector sparsevec: 1-based indices. BGE token ids are 0-based → +1.
-    items = sorted((int(t) + 1, w) for t, w in weights.items() if w > 0)
-    if not items:                       # a chunk with no positive weights is a bug
+    items = sorted((int(t) + 1, w) for t, w in weights.items() if w > 0)  # 0- -> 1-based
+    if not items:
         raise ValueError("empty sparse vector")
     body = ",".join(f"{i}:{w:.7g}" for i, w in items)
     return f"{{{body}}}/{SPARSE_DIM}"
@@ -317,14 +237,7 @@ def _sparse_literal(weights: dict) -> str:
 # Indexing
 # --------------------------------------------------------------------------- #
 def _unit_signature(chunks: list[dict]) -> str:
-    """Deterministic content signature for one unit (conversation or project doc):
-    a sha256 over the EXACT bytes embedded for it — each chunk's id plus its `text`,
-    where `text` already carries the rendered `[Project] name` prefix. Any change to
-    the embedded content — an in-place doc edit, a project rename (changes the
-    prefix), a message edit, an added/removed chunk — flips the signature, so the
-    unit re-embeds on the default incremental run. A unit with no chunks hashes to a
-    stable constant. Never NULL, so it can never NULL-abort the indexed_convs INSERT
-    nor collapse the incremental staleness test (a real value always != None)."""
+    """Deterministic content signature over the exact bytes embedded for a unit."""
     h = hashlib.sha256()
     for c in sorted(chunks, key=lambda c: c["chunk_id"]):
         h.update(c["chunk_id"].encode("utf-8"))
@@ -335,129 +248,202 @@ def _unit_signature(chunks: list[dict]) -> str:
 
 
 def build_index(full: bool = False) -> dict:
-    """Embed new/changed conversations AND project knowledge docs into the contained
-    cluster. A unit is (re)embedded whenever the exact bytes folded into its chunks
-    change — tracked by a content signature over those bytes (`_unit_signature`),
-    NOT an API timestamp — so an in-place doc edit, a project rename, or a message
-    edit all mark the unit stale on the default incremental run. `full` re-embeds
-    everything. Both kinds are indexed into the same `chunks` table as retrievable
-    units (indexed_convs.conv_uuid tracks either). Returns stats."""
+    """Embed new/changed units into the contained cluster. A unit re-embeds
+    whenever the exact bytes folded into its chunks change (a content signature,
+    not a timestamp). `full` re-embeds everything. Returns stats."""
     ensure_cluster()
-    sq = connect()
-    # The universe of units is EVERY conversation + project doc (incl. ones whose
-    # text is now empty -> zero chunks), so an emptied unit still gets purged and its
-    # watermark advanced rather than reindexing forever.
-    universe = {r[0] for r in sq.execute("SELECT uuid FROM conversations").fetchall()}
-    universe |= {r[0] for r in sq.execute("SELECT uuid FROM project_docs").fetchall()}
-    # Load every unit's chunks (local SQLite read — cheap; embedding is the only
-    # expensive step and is confined to the stale units below). The chunk `text` is
-    # the exact byte string that gets embedded, so a signature over it captures every
-    # embedded-content change with no dependence on any API timestamp.
-    chunks = _load_chunks(sq) + _load_doc_chunks(sq)
-    sq.close()
-    by_unit: dict[str, list[dict]] = {}
-    for c in chunks:
-        by_unit.setdefault(c["conv_uuid"], []).append(c)
-    sigs = {u: _unit_signature(by_unit.get(u, [])) for u in universe}
-    with connect_pg() as pg:
-        indexed = {r[0]: r[1] for r in
-                   pg.execute("SELECT conv_uuid, updated_at FROM indexed_convs").fetchall()}
-        if full:
-            stale = set(universe)
-        else:
-            stale = {u for u in universe if indexed.get(u) != sigs[u]}
-        # drop index rows for units that vanished from the raw store entirely
+    with connect_pg() as con:
+        universe = {r["unit_id"] for r in
+                    con.execute("SELECT unit_id FROM units").fetchall()}
+        chunks = _load_chunks(con)
+        by_unit: dict[str, list[dict]] = {}
+        for c in chunks:
+            by_unit.setdefault(c["unit_id"], []).append(c)
+        sigs = {u: _unit_signature(by_unit.get(u, [])) for u in universe}
+        indexed = {r["unit_id"]: r["signature"] for r in
+                   con.execute("SELECT unit_id, signature FROM indexed_units").fetchall()}
+        stale = set(universe) if full else {u for u in universe
+                                            if indexed.get(u) != sigs[u]}
         gone = set(indexed) - universe
-        # Gate on stale/gone, NOT on chunks: a stale unit that now yields zero
-        # chunks (emptied messages / empty doc) still needs its old chunks purged
-        # and its watermark advanced — otherwise stale rows linger + it reindexes
-        # every run.
         if not stale and not gone:
-            return {"reindexed_convs": 0, "chunks": 0, "removed_convs": 0}
+            return {"reindexed_units": 0, "chunks": 0, "removed_units": 0}
 
-        # Embed only the stale units' chunks (the whole corpus is already loaded).
-        stale_chunks = [c for c in chunks if c["conv_uuid"] in stale]
+        stale_chunks = [c for c in chunks if c["unit_id"] in stale]
         dense, sparse = ([], [])
         if stale_chunks:
             dense, sparse = _embed([c["text"] for c in stale_chunks], max_length=2048)
 
         cols = ", ".join(CHUNK_COLS)
         placeholders = ",".join(["%s"] * len(CHUNK_COLS)) + ",%s::vector,%s::sparsevec"
-        now = datetime.now(timezone.utc).isoformat()
-        with pg.cursor() as cur:
-            for u in stale | gone:
-                cur.execute("DELETE FROM chunks WHERE conv_uuid=%s", (u,))
-            for c, d, s in zip(stale_chunks, dense, sparse):
-                cur.execute(
-                    f"INSERT INTO chunks ({cols}, dense, sparse) VALUES ({placeholders})",
-                    tuple(c[k] for k in CHUNK_COLS)
-                    + (_dense_literal(d), _sparse_literal(s)))
-            for u in gone:
-                cur.execute("DELETE FROM indexed_convs WHERE conv_uuid=%s", (u,))
-            for u in stale:
-                cur.execute(
-                    "INSERT INTO indexed_convs (conv_uuid, updated_at, indexed_at) "
-                    "VALUES (%s,%s,%s) ON CONFLICT(conv_uuid) DO UPDATE SET "
-                    "updated_at=excluded.updated_at, indexed_at=excluded.indexed_at",
-                    (u, sigs[u], now))
-        pg.commit()
-    # reindexed_convs counts all reindexed UNITS (conversations + project docs).
-    return {"reindexed_convs": len(stale), "chunks": len(stale_chunks),
-            "removed_convs": len(gone)}
+        now = datetime.now().astimezone().isoformat()
+        for u in stale | gone:
+            con.execute("DELETE FROM chunks WHERE unit_id=%s", (u,))
+        for c, d, s in zip(stale_chunks, dense, sparse):
+            con.execute(
+                f"INSERT INTO chunks ({cols}, dense, sparse) VALUES ({placeholders})",
+                tuple(c[k] for k in CHUNK_COLS)
+                + (_dense_literal(d), _sparse_literal(s)))
+        for u in gone:
+            con.execute("DELETE FROM indexed_units WHERE unit_id=%s", (u,))
+        for u in stale:
+            con.execute(
+                "INSERT INTO indexed_units (unit_id, signature, indexed_at) "
+                "VALUES (%s,%s,%s) ON CONFLICT(unit_id) DO UPDATE SET "
+                "signature=EXCLUDED.signature, indexed_at=EXCLUDED.indexed_at",
+                (u, sigs[u], now))
+        con.commit()
+    return {"reindexed_units": len(stale), "chunks": len(stale_chunks),
+            "removed_units": len(gone)}
 
 
 # --------------------------------------------------------------------------- #
-# Hybrid search — dense + sparse RRF, typed-metadata boost, collapse to convs
+# Faceted hybrid search
 # --------------------------------------------------------------------------- #
-def hybrid_search(query: str, topk: int = TOPK, lang: str | None = None) -> list[dict]:
-    """Return up to `topk` conversations ranked by hybrid relevance. Each result
-    is the best-matching chunk of a distinct conversation. An empty/degenerate
-    query returns [] rather than raising."""
-    if not query.strip():
-        return []
+def _validate_facets(source: str, *, project, model, repo, worktree, branch) -> None:
+    """Fail loud on a facet that contradicts the chosen source (ADR 0003)."""
+    if source not in VALID_SOURCES:
+        raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
+    cc_facets = {"repo": repo, "worktree": worktree, "branch": branch}
+    ai_facets = {"project": project, "model": model}
+    if source == "claude_ai":
+        bad = [k for k, v in cc_facets.items() if v]
+        if bad:
+            raise ValueError(f"facet(s) {bad} apply only to Claude Code sessions, "
+                             f"not source='claude_ai'")
+    if source == "claude_code":
+        bad = [k for k, v in ai_facets.items() if v]
+        if bad:
+            raise ValueError(f"facet(s) {bad} apply only to claude.ai chats, "
+                             f"not source='claude_code'")
+
+
+def _facet_where(source, project, model, repo, worktree, branch, session,
+                 since, until, params: dict) -> str:
+    """Build the shared WHERE fragment (on `chunks`) from the given facets, filling
+    `params`. Returns '' or 'WHERE ...'."""
+    conds = []
+
+    def add(cond: str, **kw):
+        conds.append(cond)
+        params.update(kw)
+
+    if source and source != "all":
+        add("source = %(source)s", source=source)
+    if project == "any":
+        add("project_uuid IS NOT NULL")
+    elif project == "none":
+        add("project_uuid IS NULL AND kind = 'chat'")
+    elif project:
+        add("(project_name = %(project)s OR project_uuid = %(project)s)", project=project)
+    if model:
+        add("model = %(model)s", model=model)
+    if repo:
+        add("repo = %(repo)s", repo=repo)
+    if worktree:
+        add("worktree = %(worktree)s", worktree=worktree)
+    if branch:
+        add("git_branch = %(branch)s", branch=branch)
+    if session:
+        add("(unit_id = %(session)s OR title ILIKE %(session_like)s)",
+            session=session, session_like=f"%{session}%")
+    if since:
+        add("updated_at >= %(since)s", since=since)
+    if until:
+        add("updated_at <= %(until)s", until=until)
+    return ("WHERE " + " AND ".join(conds)) if conds else ""
+
+
+def _row_to_result(r: dict) -> dict:
+    return {"unit_id": r["unit_id"], "unit_name": r["unit_name"],
+            "source": r["source"], "lang": r["lang"], "text": r["text"],
+            "score": float(r["score"])}
+
+
+def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
+                  project: str | None = None, model: str | None = None,
+                  repo: str | None = None, worktree: str | None = None,
+                  branch: str | None = None, session: str | None = None,
+                  since: str | None = None, until: str | None = None,
+                  sort: str = "relevance", lang: str | None = None) -> list[dict]:
+    """Faceted hybrid search. With a `query`, ranks by fused dense+sparse RRF +
+    typed-metadata boost, collapsed to one best chunk per unit. With an EMPTY
+    query, degrades to a metadata browse (units matching the facets, newest first).
+    A facet contradicting `source` fails loud."""
+    _validate_facets(source, project=project, model=model, repo=repo,
+                     worktree=worktree, branch=branch)
     ensure_cluster()
+
+    if not query.strip() or sort == "recency":
+        return _browse(topk, source, project, model, repo, worktree, branch,
+                       session, since, until, query=query)
+
     (qd,), (qs,) = _embed([query], max_length=512)
     qlang = _lang(query)
-    # A query with no positive sparse weights (rare — punctuation/stopword-only)
-    # still has a dense vector: fall back to dense-only rather than crash.
     try:
         qs_lit = _sparse_literal(qs)
     except ValueError:
         qs_lit = None
-    lang_filter = "WHERE lang = %(lang)s" if lang else ""
-    params: dict = {"qd": _dense_literal(qd), "qlang": qlang, "lang": lang}
+    params: dict = {"qd": _dense_literal(qd), "qlang": qlang}
+    if lang:
+        params["lang"] = lang
+    where = _facet_where(source, project, model, repo, worktree, branch, session,
+                         since, until, params)
+    if lang:
+        where = (where + (" AND " if where else "WHERE ") + "lang = %(lang)s")
 
-    # RRF over the per-signal shortlists, then a small typed-metadata boost
-    # (recency + query/chunk language agreement), then collapse to conversations.
     ctes = [f"""d AS (
         SELECT chunk_id, row_number() OVER (ORDER BY dense <=> %(qd)s::vector) rnk
-        FROM chunks {lang_filter} ORDER BY dense <=> %(qd)s::vector LIMIT {PRE_TOPK})"""]
+        FROM chunks {where} ORDER BY dense <=> %(qd)s::vector LIMIT {PRE_TOPK})"""]
     unions = ["SELECT * FROM d"]
     if qs_lit is not None:
         params["qs"] = qs_lit
         ctes.append(f"""s AS (
         SELECT chunk_id, row_number() OVER (ORDER BY sparse <#> %(qs)s::sparsevec) rnk
-        FROM chunks {lang_filter} ORDER BY sparse <#> %(qs)s::sparsevec LIMIT {PRE_TOPK})""")
+        FROM chunks {where} ORDER BY sparse <#> %(qs)s::sparsevec LIMIT {PRE_TOPK})""")
         unions.append("SELECT * FROM s")
     ctes.append(f"""fused AS (
         SELECT chunk_id, SUM(1.0/({RRF_K}+rnk)) AS rrf
         FROM ({' UNION ALL '.join(unions)}) u GROUP BY chunk_id)""")
     ctes.append("""scored AS (
-        SELECT c.conv_uuid, c.conv_name, c.lang, c.text,
+        SELECT c.unit_id, c.unit_name, c.source, c.lang, c.text,
                f.rrf * (1.0
-                   -- recency: 6-month 1/e time-constant (~4-month half-life);
-                   -- a missing updated_at contributes 0, not a max boost.
                    + CASE WHEN c.updated_at IS NULL THEN 0
                           ELSE 0.10 * exp(-GREATEST(0, EXTRACT(EPOCH FROM (now() - c.updated_at)))
                                           / (86400.0*180)) END
                    + CASE WHEN c.lang = %(qlang)s THEN 0.05 ELSE 0 END) AS score
         FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)""")
     sql = ("WITH " + ",\n".join(ctes)
-           + "\nSELECT DISTINCT ON (conv_uuid) conv_uuid, conv_name, lang, text, score"
-             "\nFROM scored ORDER BY conv_uuid, score DESC")
+           + "\nSELECT DISTINCT ON (unit_id) unit_id, unit_name, source, lang, text, score"
+             "\nFROM scored ORDER BY unit_id, score DESC")
     with connect_pg() as pg:
         rows = pg.execute(sql, params).fetchall()
-    cols = ["conv_uuid", "conv_name", "lang", "text", "score"]
-    results = [dict(zip(cols, r)) for r in rows]
+    results = [_row_to_result(r) for r in rows]
     results.sort(key=lambda r: -r["score"])
     return results[:topk]
+
+
+def _browse(topk, source, project, model, repo, worktree, branch, session,
+            since, until, *, query: str) -> list[dict]:
+    """Metadata browse: units matching the facets, newest first (no content
+    vector). Backs the empty-query and sort='recency' modes."""
+    params: dict = {}
+    where = _facet_where(source, project, model, repo, worktree, branch, session,
+                         since, until, params)
+    # For recency-sorted content queries we still narrow by lexical title match if a
+    # query was given, but ranking is purely recency here.
+    if query.strip():
+        where = (where + (" AND " if where else "WHERE ")
+                 + "(title ILIKE %(q_like)s)")
+        params["q_like"] = f"%{query.strip()}%"
+    sql = (f"SELECT unit_id, kind, source, title, project_name, repo, summary, "
+           f"COALESCE(updated_at, created_at) AS ts "
+           f"FROM units {where} ORDER BY ts DESC NULLS LAST LIMIT {int(topk)}")
+    with connect_pg() as pg:
+        rows = pg.execute(sql, params).fetchall()
+    out = []
+    for r in rows:
+        name = _display_name(r["kind"], r["title"], r["project_name"], r["repo"])
+        out.append({"unit_id": r["unit_id"], "unit_name": name,
+                    "source": r["source"], "lang": None,
+                    "text": r["summary"] or r["title"] or "", "score": 0.0})
+    return out
