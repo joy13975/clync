@@ -370,8 +370,13 @@ def _row_to_result(r: dict) -> dict:
     # vector — an ABSOLUTE relevance signal. The RRF `score` is rank-only (topk
     # rows always come back), so it cannot express "nothing here matches";
     # dream.recall's relevance floor needs dense_sim for exactly that.
+    # `msg_idx` is WHERE in the unit the match actually is. Retrieval is the only
+    # layer that knows it, so dropping it here forces every consumer to guess a
+    # window — measured consequence: 98% of matches fell outside the window the
+    # dream layer rendered (it started at idx 0), median match at idx 1039.
     return {"unit_id": r["unit_id"], "unit_name": r["unit_name"],
             "source": r["source"], "lang": r["lang"], "text": r["text"],
+            "msg_idx": r["msg_idx"], "chunk_idx": r["chunk_idx"],
             "score": float(r["score"]), "dense_sim": float(r["dense_sim"])}
 
 
@@ -425,6 +430,7 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
         FROM ({' UNION ALL '.join(unions)}) u GROUP BY chunk_id)""")
     ctes.append("""scored AS (
         SELECT c.unit_id, c.unit_name, c.source, c.lang, c.text,
+               c.msg_idx, c.chunk_idx,
                1 - (c.dense <=> %(qd)s::vector) AS dense_sim,
                f.rrf * (1.0
                    + CASE WHEN c.updated_at IS NULL THEN 0
@@ -434,7 +440,7 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
         FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)""")
     sql = ("WITH " + ",\n".join(ctes)
            + "\nSELECT DISTINCT ON (unit_id) unit_id, unit_name, source, lang, text,"
-             " score, dense_sim"
+             " msg_idx, chunk_idx, score, dense_sim"
              "\nFROM scored ORDER BY unit_id, score DESC")
     with connect_pg() as pg:
         rows = pg.execute(sql, params).fetchall()
@@ -467,5 +473,8 @@ def _browse(topk, source, project, model, repo, worktree, branch, session,
         out.append({"unit_id": r["unit_id"], "unit_name": name,
                     "source": r["source"], "lang": None,
                     "text": r["summary"] or r["title"] or "", "score": 0.0,
+                    # browse mode ranks by recency, so there is no matched chunk and
+                    # thus no position: None, never a 0 that would read as "idx 0".
+                    "msg_idx": None, "chunk_idx": None,
                     "dense_sim": None})   # browse mode has no content vector
     return out

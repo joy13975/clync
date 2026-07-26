@@ -46,14 +46,36 @@ def pg_test_db(monkeypatch):
 
 @pytest.fixture
 def mock_embed(monkeypatch):
-    """Replace BGE-M3 with a deterministic stub: one fixed dense vector + one
-    positive sparse weight per text. Exercises the SQL/fusion/watermark logic
-    without loading the real model."""
+    """Replace BGE-M3 with a deterministic hashed bag-of-words embedder.
+
+    It must DISCRIMINATE, or every relevance assertion built on it is vacuous. The
+    previous stub returned one fixed dense vector and one fixed sparse weight for
+    every text, so all similarities were equal and result *order* was whatever the
+    plan happened to produce — a test asserting "the right unit ranked first" proved
+    nothing. Here each word contributes to a hashed dimension, so texts sharing
+    words are genuinely nearer each other and a query ranks matching chunks first,
+    while staying model-free and fast (no BGE-M3 load)."""
+    import hashlib
+    import math
+    import re
+
     import search
 
     def _fake(texts, max_length):
-        dense = [[1.0] + [0.0] * (search.DENSE_DIM - 1) for _ in texts]
-        sparse = [{0: 1.0} for _ in texts]   # token 0 -> sparsevec index 1
+        dense, sparse = [], []
+        for t in texts:
+            vec = [0.0] * search.DENSE_DIM
+            weights: dict[int, float] = {}
+            for tok in re.findall(r"\w+", (t or "").lower()):
+                h = int(hashlib.sha1(tok.encode()).hexdigest(), 16)
+                vec[h % search.DENSE_DIM] += 1.0
+                key = h % search.SPARSE_DIM
+                weights[key] = weights.get(key, 0.0) + 1.0
+            norm = math.sqrt(sum(x * x for x in vec))
+            if not norm:            # wordless text: a fixed non-zero unit vector,
+                vec[0], norm = 1.0, 1.0   # never the zero vector (cosine is undefined)
+            dense.append([x / norm for x in vec])
+            sparse.append(weights or {0: 1.0})
         return dense, sparse
 
     monkeypatch.setattr(search, "_embed", _fake)

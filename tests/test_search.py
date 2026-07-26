@@ -244,6 +244,37 @@ def test_legacy_conversation_keyed_index_is_replaced(pg_test_db, mock_embed):
     assert _pg_units(search) == {"A"}
 
 
+def test_retrieval_carries_the_matched_position_out(pg_test_db, mock_embed):
+    """`msg_idx` is WHERE the match is, and only retrieval knows it. A consumer that
+    has to guess instead renders the wrong part of the unit: measured on the real
+    corpus, 98% of matches fell outside the window the dream layer showed, because it
+    started at idx 0 while the median match sat at idx 1039. So the position must
+    come OUT of hybrid_search, and be the position of the actually-matched chunk."""
+    search = pg_test_db
+    # one long unit; the distinctive phrase sits deep inside it, never near idx 0
+    bodies = [f"filler turn number {i} about unrelated scheduling chatter"
+              for i in range(30)]
+    bodies[23] = "the marmoset calibration procedure requires a torque wrench"
+    _seed("long", "Long conversation", T1, bodies)
+    search.build_index(full=False)
+
+    hits = search.hybrid_search("marmoset calibration torque", topk=3)
+    assert hits[0]["unit_id"] == "long"
+    assert hits[0]["msg_idx"] == 23, (
+        f"matched position is wrong: got {hits[0]['msg_idx']}, want 23")
+    assert hits[0]["chunk_idx"] is not None
+
+
+def test_browse_reports_no_matched_position_rather_than_zero(pg_test_db, mock_embed):
+    # A recency browse has no matched chunk. Reporting 0 would read as "the match is
+    # at the start of the unit" and silently re-create the render-the-opening bug.
+    search = pg_test_db
+    _seed("A", "Alpha", T1, ["alpha body"])
+    search.build_index(full=False)
+    assert search.hybrid_search("", topk=3)[0]["msg_idx"] is None
+    assert search.hybrid_search("alpha", topk=3, sort="recency")[0]["msg_idx"] is None
+
+
 def test_read_path_never_provisions_so_it_cannot_ddl(pg_test_db, mock_embed):
     """A read must not provision the store. Provisioning takes DDL locks, and a
     read that takes DDL locks (a) deadlocks against its own caller's still-open
