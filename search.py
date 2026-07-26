@@ -17,8 +17,8 @@ from datetime import datetime
 
 # The store + shared config live in the core module (SSOT). Search is core now
 # (ADR 0003): its deps are no longer an optional extra.
-from clync import (DEFAULT_TOPK, PG_BIN, RAW_SOURCES, VALID_SOURCES, connect_pg,
-                   ensure_cluster, sql_statements, _vector_control_present)
+from clync import (DEFAULT_TOPK, PG_BIN, connect_pg, ensure_cluster,
+                   resolve_sources, sql_statements, _vector_control_present)
 
 EMBED_MODEL = "BAAI/bge-m3"
 DENSE_DIM = 1024
@@ -300,8 +300,7 @@ def build_index(full: bool = False) -> dict:
 # --------------------------------------------------------------------------- #
 def _validate_facets(source: str, *, project, model, repo, worktree, branch) -> None:
     """Fail loud on a facet that contradicts the chosen source (ADR 0003)."""
-    if source not in VALID_SOURCES:
-        raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
+    resolve_sources(source)   # raises on an unknown source (the value-set SSOT)
     cc_facets = {"repo": repo, "worktree": worktree, "branch": branch}
     ai_facets = {"project": project, "model": model}
     if source == "dream":
@@ -333,12 +332,10 @@ def _facet_where(source, project, model, repo, worktree, branch, session,
         conds.append(cond)
         params.update(kw)
 
-    if source and source != "all":
-        add("source = %(source)s", source=source)
-    else:
-        # 'all' == raw only (clync.VALID_SOURCES): derived dream units never leak
-        # into an unqualified search, so the dig can't read its own output.
-        add("source = ANY(%(raw_sources)s)", raw_sources=list(RAW_SOURCES))
+    # 'all' == raw only, resolved by clync.resolve_sources — the ONE owner of that
+    # policy (cmd_list shares it): derived dream units never leak into an
+    # unqualified search, so the dig can't read its own output.
+    add("source = ANY(%(sources)s)", sources=resolve_sources(source))
     if project == "any":
         add("project_uuid IS NOT NULL")
     elif project == "none":
@@ -364,9 +361,13 @@ def _facet_where(source, project, model, repo, worktree, branch, session,
 
 
 def _row_to_result(r: dict) -> dict:
+    # `dense_sim` is the raw cosine similarity of the query to the chunk's dense
+    # vector — an ABSOLUTE relevance signal. The RRF `score` is rank-only (topk
+    # rows always come back), so it cannot express "nothing here matches";
+    # dream.recall's relevance floor needs dense_sim for exactly that.
     return {"unit_id": r["unit_id"], "unit_name": r["unit_name"],
             "source": r["source"], "lang": r["lang"], "text": r["text"],
-            "score": float(r["score"])}
+            "score": float(r["score"]), "dense_sim": float(r["dense_sim"])}
 
 
 def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
@@ -416,6 +417,7 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
         FROM ({' UNION ALL '.join(unions)}) u GROUP BY chunk_id)""")
     ctes.append("""scored AS (
         SELECT c.unit_id, c.unit_name, c.source, c.lang, c.text,
+               1 - (c.dense <=> %(qd)s::vector) AS dense_sim,
                f.rrf * (1.0
                    + CASE WHEN c.updated_at IS NULL THEN 0
                           ELSE 0.10 * exp(-GREATEST(0, EXTRACT(EPOCH FROM (now() - c.updated_at)))
@@ -423,7 +425,8 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
                    + CASE WHEN c.lang = %(qlang)s THEN 0.05 ELSE 0 END) AS score
         FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)""")
     sql = ("WITH " + ",\n".join(ctes)
-           + "\nSELECT DISTINCT ON (unit_id) unit_id, unit_name, source, lang, text, score"
+           + "\nSELECT DISTINCT ON (unit_id) unit_id, unit_name, source, lang, text,"
+             " score, dense_sim"
              "\nFROM scored ORDER BY unit_id, score DESC")
     with connect_pg() as pg:
         rows = pg.execute(sql, params).fetchall()
@@ -455,5 +458,6 @@ def _browse(topk, source, project, model, repo, worktree, branch, session,
         name = _display_name(r["kind"], r["title"], r["project_name"], r["repo"])
         out.append({"unit_id": r["unit_id"], "unit_name": name,
                     "source": r["source"], "lang": None,
-                    "text": r["summary"] or r["title"] or "", "score": 0.0})
+                    "text": r["summary"] or r["title"] or "", "score": 0.0,
+                    "dense_sim": None})   # browse mode has no content vector
     return out

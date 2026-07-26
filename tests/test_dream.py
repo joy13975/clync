@@ -225,6 +225,28 @@ def test_ground_dedupes_two_quotes_from_one_message(store):
     assert len(dream.ground(store, c, REFMAP)) == 1
 
 
+def test_a_user_stance_must_cite_a_user_authored_turn(store):
+    """The mechanical half of attribution: without it, the only things between an
+    assistant turn and a 'user_asserted' insight are two LLM opinions — and
+    passes_substance waives the two-source bar on exactly that stance."""
+    c = _candidate(evidence=[{"ref": "e2", "quote": "root-cause rule"}])
+    with pytest.raises(dream.DreamError, match="no user-authored turn"):
+        dream.ground(store, c, REFMAP)                # e2 -> m2, an assistant turn
+    ok = _candidate(stance="claude_proposed",
+                    evidence=[{"ref": "e2", "quote": "root-cause rule"}])
+    assert len(dream.ground(store, ok, REFMAP)) == 1  # non-user stance: fine
+
+
+def test_a_falsify_corrected_stance_is_rechecked_mechanically():
+    """falsify may UPGRADE a stance to user_asserted; the authorship gate must
+    re-run on the corrected value, not only on the distiller's original."""
+    with pytest.raises(dream.DreamError, match="no user-authored turn"):
+        dream._require_user_evidence(
+            "user_endorsed", [{"sender": "assistant"}], "some claim")
+    assert dream._require_user_evidence(
+        "user_endorsed", [{"sender": "human"}], "some claim") is None
+
+
 # --------------------------------------------------------------------------- #
 # Gate 3 — substance
 # --------------------------------------------------------------------------- #
@@ -315,6 +337,16 @@ def test_triage_rejects_an_unknown_unit(store, stub_worker):
         dream.triage(store, ["u1"])
 
 
+def test_triage_fails_loud_on_an_omitted_unit(store, stub_worker):
+    """A low-effort call that drops a list item must not look like 'assigned no
+    topics' — the watermark would advance past the omission permanently."""
+    _add_units(store, 1)                                   # u2
+    stub_worker.append({"assignments": [
+        {"unit_id": "u1", "topic_ids": [], "reason": "r"}]})
+    with pytest.raises(dream.DreamError, match="no verdict for offered"):
+        dream.triage(store, ["u1", "u2"])
+
+
 # --------------------------------------------------------------------------- #
 # Gate 2 — an unjudged candidate must never be promoted by default
 # --------------------------------------------------------------------------- #
@@ -370,15 +402,27 @@ def test_persist_writes_an_indexable_unit_and_its_citations(store):
                          (row["unit_id"],)).fetchone()["n"] == 1
 
 
-def test_reinforce_bumps_support_without_creating_a_row(store):
+def test_reinforce_support_count_is_derived_from_distinct_cited_units(store):
+    """'N source(s)' must be true by construction: re-mining the SAME unit (a
+    re-touched conversation re-dug nightly) reinforces without inflating the
+    counter; only evidence from a genuinely new source unit raises it."""
     first = _persist_one(store)
     t = dream.get_topic(store, "t1")
     c = _candidate()
     c["_evidence"] = dream.ground(store, c, REFMAP)
     c.update({"action": "reinforce", "target_id": first["unit_id"]})
     dream.persist(store, t, [c])
+    dream.persist(store, t, [c])              # third night, byte-identical evidence
     rows = store.execute("SELECT * FROM dream_insights").fetchall()
-    assert len(rows) == 1 and rows[0]["support_count"] == 2
+    assert len(rows) == 1 and rows[0]["support_count"] == 1   # ONE distinct source
+
+    _add_units(store, 1, start=90)            # u90 — a genuinely new source unit
+    c2 = _candidate(evidence=[{"ref": "e9", "quote": "Fix bugs at the layer"}])
+    c2["_evidence"] = dream.ground(store, c2, {**REFMAP, "e9": ("u90", "m1")})
+    c2.update({"action": "reinforce", "target_id": first["unit_id"]})
+    dream.persist(store, t, [c2])
+    assert store.execute("SELECT support_count FROM dream_insights"
+                         ).fetchone()["support_count"] == 2
 
 
 def test_contradict_closes_the_old_window_and_keeps_history(store):
@@ -394,10 +438,15 @@ def test_contradict_closes_the_old_window_and_keeps_history(store):
     assert prev["status"] == dream.STATUS_SUPERSEDED   # kept, not deleted
     assert prev["valid_until"] is not None             # window CLOSED
     assert prev["superseded_by"] is not None
+    assert prev["superseded_kind"] == "contradict"     # WHY is recorded, not inferred
     assert store.execute("SELECT count(*) n FROM dream_insights").fetchone()["n"] == 2
 
 
-def test_refine_supersedes_without_dating_a_change_of_mind(store):
+def test_refine_closes_the_window_and_records_the_kind(store):
+    """Every supersession closes the window — a NULL valid_until would satisfy
+    every as_of read forever, returning the retired wording beside its
+    replacement. `refine` is distinguished by the RECORDED kind, never by a
+    NULL timestamp."""
     old = _persist_one(store)
     t = dream.get_topic(store, "t1")
     c = _candidate(statement="Fix bugs at the preventing layer (sharper wording).")
@@ -407,7 +456,46 @@ def test_refine_supersedes_without_dating_a_change_of_mind(store):
     prev = store.execute("SELECT * FROM dream_insights WHERE unit_id=%s",
                          (old["unit_id"],)).fetchone()
     assert prev["status"] == dream.STATUS_SUPERSEDED
-    assert prev["valid_until"] is None     # same position, better words - no change date
+    assert prev["valid_until"] is not None             # window ALWAYS closed
+    assert prev["superseded_kind"] == "refine"
+
+
+def test_as_of_after_a_refine_returns_exactly_one_row(store):
+    """A historical read must never fabricate a second simultaneous position out
+    of a rewording."""
+    old = _persist_one(store)
+    t = dream.get_topic(store, "t1")
+    c = _candidate(statement="Sharper wording of the same position.")
+    c["_evidence"] = dream.ground(store, c, REFMAP)
+    c.update({"action": "refine", "target_id": old["unit_id"]})
+    dream.persist(store, t, [c])
+    got = dream.recall(store, "", topic_id="t1", as_of="2026-06-01")["insights"]
+    assert [i["statement"] for i in got] == ["Sharper wording of the same position."]
+
+
+def test_older_contradicting_evidence_never_inverts_the_timeline(store):
+    """Backfill retrieval is relevance-ranked, so mining a 2024 chat after a 2026
+    one is routine. Superseding backwards would give the current position an
+    EMPTY validity window and report the stale claim as current — instead the
+    old claim lands as a contested NEW row and the target stays untouched."""
+    cur = _persist_one(store)                          # valid_from = 2026-01-01
+    _add_units(store, 1, start=80)                     # u80
+    store.execute("UPDATE messages SET created_at='2024-01-01' WHERE unit_id='u80'")
+    store.commit()
+    t = dream.get_topic(store, "t1")
+    c = _candidate(statement="The opposite, argued back in 2024.")
+    c["_evidence"] = dream.ground(
+        store, c, {"e1": ("u80", "m1")})
+    c.update({"action": "contradict", "target_id": cur["unit_id"]})
+    stats = dream.persist(store, t, [c])
+    assert stats == {"new": 1, "reinforce": 0, "refine": 0, "contradict": 0,
+                     "out_of_order": 1}
+    kept = store.execute("SELECT * FROM dream_insights WHERE unit_id=%s",
+                         (cur["unit_id"],)).fetchone()
+    assert kept["status"] == dream.STATUS_ACTIVE and kept["valid_until"] is None
+    added = store.execute("SELECT * FROM dream_insights WHERE unit_id<>%s",
+                          (cur["unit_id"],)).fetchone()
+    assert added["contested"] is True and added["superseded_by"] is None
 
 
 # --------------------------------------------------------------------------- #
@@ -459,6 +547,48 @@ def test_recall_as_of_reads_the_historical_position(store):
     assert len(dream.recall(store, "", topic_id="t1", as_of="2026-06-01")["insights"]) == 1
 
 
+@pytest.fixture
+def keyword_embed(monkeypatch):
+    """A DISCRIMINATING embedding stub: the dense direction depends on which
+    keywords the text contains, so an off-topic query gets a low cosine to every
+    indexed chunk. The uniform mock_embed stub cannot express irrelevance, which
+    is exactly what the recall relevance floor needs to be tested against."""
+    import search
+    words = ["bugs", "layer", "zucchini", "sourdough"]
+
+    def _fake(texts, max_length):
+        dense, sparse = [], []
+        for t in texts:
+            v = [0.0] * search.DENSE_DIM
+            for i, w in enumerate(words):
+                if w in t.lower():
+                    v[i] = 1.0
+            if not any(v):
+                v[len(words)] = 1.0
+            norm = sum(x * x for x in v) ** 0.5
+            dense.append([x / norm for x in v])
+            sparse.append({i: 1.0 for i, w in enumerate(words)
+                           if w in t.lower()} or {9: 1.0})
+        return dense, sparse
+
+    monkeypatch.setattr(search, "_embed", _fake)
+
+
+def test_recall_returns_an_empty_tier_for_an_off_topic_query(store, pg_test_db,
+                                                             keyword_embed):
+    """RRF always returns topk rows, so without a floor an off-topic query gets a
+    full confident insight list and 'no gaps' — attribution pollution asserted
+    as complete. Below the dense-similarity floor the tier must be EMPTY, the
+    gap stated, and the query must never fall through to an unfiltered scan."""
+    _persist_one(store)
+    pg_test_db.build_index()
+    r = dream.recall(store, "zucchini sourdough hydration")
+    assert r["insights"] == [] and r["topic"] is None
+    assert any("no distilled insight matches" in c for c in r["coverage"])
+    on_topic = dream.recall(store, "bugs layer")
+    assert len(on_topic["insights"]) == 1     # the floor does not eat real matches
+
+
 def test_recall_ranks_trusted_stances_above_unadjudicated(store):
     _persist_one(store, statement="asserted one", stance="user_asserted")
     _persist_one(store, statement="proposed one", stance="claude_proposed")
@@ -477,6 +607,30 @@ def test_digest_buckets_route_by_stance_and_contest(store):
     assert [r["statement"] for r in b["settled"]] == ["settled one"]
     assert [r["statement"] for r in b["rejected"]] == ["rejected one"]
     assert [r["statement"] for r in b["open"]] == ["unadjudicated one"]
+
+
+def test_digest_changed_bucket_keys_on_contradict_never_refine(store):
+    """A refine is the SAME position in better words — reporting it under
+    'Changed positions' with a date asserts a change of mind that never
+    happened. Only a recorded contradict-supersession lands there."""
+    t = dream.get_topic(store, "t1")
+    old = _persist_one(store)
+
+    refined = _candidate(statement="Same position, sharper wording.")
+    refined["_evidence"] = dream.ground(store, refined, REFMAP)
+    refined.update({"action": "refine", "target_id": old["unit_id"]})
+    dream.persist(store, t, [refined])
+    assert dream._digest_buckets(store, "t1")["changed"] == []
+
+    mid = store.execute("SELECT unit_id FROM dream_insights WHERE status=%s",
+                        (dream.STATUS_ACTIVE,)).fetchone()
+    flipped = _candidate(statement="Actually, the opposite position.")
+    flipped["_evidence"] = dream.ground(store, flipped, REFMAP)
+    flipped.update({"action": "contradict", "target_id": mid["unit_id"]})
+    dream.persist(store, t, [flipped])
+    changed = dream._digest_buckets(store, "t1")["changed"]
+    assert [r["statement"] for r in changed] == ["Actually, the opposite position."]
+    assert changed[0]["superseded_statement"] == "Same position, sharper wording."
 
 
 def test_digest_prints_only_db_statements_even_if_the_model_rambles(store, stub_worker):
@@ -617,6 +771,61 @@ def test_a_capped_run_does_not_advance_the_watermark(store, stub_worker):
     r = dream.run_incremental(store, max_calls=0)
     assert r["stopped_early"] and clync.get_meta(store, dream.WATERMARK_KEY) == \
         "2020-01-01T00:00:00+00:00"
+
+
+def test_an_empty_unit_is_skipped_visibly_never_wedging_the_run(store, stub_worker):
+    """One abandoned claude.ai chat (a unit with no non-empty user turn) must not
+    abort triage every night forever: emptiness is decided at SELECTION, the
+    skip is REPORTED, and skeleton()'s raise stays reserved for a systemic
+    mis-render of units that passed the predicate."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,"
+                  "msg_count,synced_at) VALUES ('eu','chat','claude_ai',"
+                  "'abandoned',now(),1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text) "
+                  "VALUES ('eu','m1',0,'human','   ')")
+    clync.set_meta(store, dream.WATERMARK_KEY, "2020-01-01T00:00:00+00:00")
+    store.commit()
+    stub_worker.append({"assignments": [{"unit_id": "u1", "topic_ids": [],
+                                         "reason": "mechanical"}]})
+    r = dream.run_incremental(store)          # raises if 'eu' had been offered
+    assert r["skipped_empty"] == ["eu"]
+    assert r["changed"] == 1                  # only u1 was eligible
+    assert clync.get_meta(store, dream.WATERMARK_KEY) != "2020-01-01T00:00:00+00:00"
+
+
+def test_selection_keys_on_when_clync_learned_of_a_unit(store):
+    """`updated_at` is SOURCE-authored: NULL for project docs, months old for
+    late-ingested material. Both are new TO CLYNC (synced_at=now) and must be
+    eligible — comparing updated_at alone to the watermark hides them forever."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,msg_count,synced_at)"
+                  " VALUES ('doc1','project_doc','claude_ai','doc',1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text) "
+                  "VALUES ('doc1','m1',0,'project_doc','the document body')")
+    store.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,"
+                  "msg_count,synced_at) VALUES ('old1','chat','claude_ai',"
+                  "'late ingest','2019-06-01',1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text) "
+                  "VALUES ('old1','m1',0,'human','an old but newly synced turn')")
+    store.commit()
+    eligible, skipped = dream._changed_units(store, "2020-01-01T00:00:00+00:00")
+    assert {"doc1", "old1", "u1"} <= set(eligible)
+    assert skipped == []
+
+
+def test_watermark_advances_to_the_pre_selection_snapshot(store, stub_worker,
+                                                          monkeypatch):
+    """The pass takes minutes of model calls; a unit synced in between was not
+    selected, so the watermark must be the snapshot taken BEFORE selection —
+    never end-of-run now() — or that unit is skipped silently forever."""
+    clync.set_meta(store, dream.WATERMARK_KEY, "2020-01-01T00:00:00+00:00")
+    store.commit()
+    ticks = iter(f"2026-07-01T00:00:{i:02d}+00:00" for i in range(60))
+    monkeypatch.setattr(dream, "_now", lambda: next(ticks))
+    stub_worker.append({"assignments": [{"unit_id": "u1", "topic_ids": [],
+                                         "reason": "mechanical"}]})
+    dream.run_incremental(store)
+    assert clync.get_meta(store, dream.WATERMARK_KEY) == \
+        "2026-07-01T00:00:00+00:00"           # the FIRST tick, not a later one
 
 
 def test_a_run_indexes_what_it_wrote(store, pg_test_db, mock_embed):

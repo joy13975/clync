@@ -38,7 +38,9 @@ def search_history(
 
     query: natural-language query (NOT an FTS expression). Empty => a recency
       browse of the units matching the facets.
-    source: "all" (default) | "claude_ai" | "claude_code".
+    source: "all" (default) | "claude_ai" | "claude_code" | "dream". "all" means
+      the two RAW sources only; distilled dream units are returned only when
+      asked for by name (prefer recall_knowledge for those).
     claude.ai facets: project (a project name/uuid, or "any" = in some project,
       "none" = not in a project), model.
     Claude Code facets: repo (e.g. "clync"), worktree, branch, session (name or id).

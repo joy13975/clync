@@ -136,6 +136,18 @@ def test_faceted_source_repo_and_project(pg_test_db, mock_embed):
     assert ids(source="claude_code", branch="main") == {"ccs2"}
 
 
+def test_resolve_sources_owns_the_all_means_raw_rule():
+    """ONE resolution of the --source facet: 'all' is RAW only, at every surface
+    (`search`'s WHERE builder AND `clync list` resolve through this) — dream
+    units must never leak into an unqualified listing or search."""
+    import pytest
+    assert clync.resolve_sources("all") == list(clync.RAW_SOURCES)
+    assert clync.resolve_sources("dream") == ["dream"]
+    assert clync.resolve_sources("claude_ai") == ["claude_ai"]
+    with pytest.raises(ValueError, match="source must be one of"):
+        clync.resolve_sources("bogus")
+
+
 def test_faceted_source_mismatch_fails_loud(pg_test_db, mock_embed):
     import pytest
     search = pg_test_db

@@ -76,6 +76,16 @@ DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, sear
 VALID_SOURCES = ("all", "claude_ai", "claude_code", "dream")
 RAW_SOURCES = ("claude_ai", "claude_code")
 
+
+def resolve_sources(source: str) -> list[str]:
+    """The ONE resolution of a `--source` value to concrete source names.
+    `all` means RAW ONLY (see VALID_SOURCES above) — every consumer of the facet
+    (`search.py`'s WHERE builder, `cmd_list`) resolves through here, so the
+    raw-only rule cannot be true at one surface and false at another."""
+    if source not in VALID_SOURCES:
+        raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
+    return list(RAW_SOURCES) if source == "all" else [source]
+
 REPO_DIR = Path(__file__).resolve().parent
 LAUNCHD_LABEL = "io.clync.sync"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
@@ -1079,9 +1089,9 @@ def cmd_list(args) -> int:
     try:
         rows = con.execute(
             "SELECT title, unit_id, source, updated_at, msg_count FROM units "
-            "WHERE (%s = 'all' OR source = %s) "
+            "WHERE source = ANY(%s) "
             "ORDER BY updated_at DESC NULLS LAST LIMIT %s",
-            (args.source, args.source, args.limit)).fetchall()
+            (resolve_sources(args.source), args.limit)).fetchall()
     finally:
         con.close()
     for r in rows:
@@ -1142,6 +1152,11 @@ def _print_dream_report(report: dict) -> int:
     print(f"mode        : {report['mode']}")
     if "changed" in report:
         print(f"changed     : {report['changed']} unit(s) since watermark")
+    if report.get("skipped_empty"):
+        # Skipped-as-empty is a decision, not an error — but it must be VISIBLE,
+        # or an abandoned chat is indistinguishable from a triaged one.
+        print(f"skipped     : {len(report['skipped_empty'])} empty unit(s) "
+              f"(nothing renderable): {', '.join(report['skipped_empty'])}")
     if report.get("topics_touched"):
         print(f"topics      : {', '.join(report['topics_touched'])}")
     if "queued" in report:

@@ -63,8 +63,8 @@ session to load the MCP tools + skills.
 | `sync-cc [--full] [--no-index]` | ingest **only** local Claude Code sessions (no network/cookies), then index |
 | `index [--full]` | (re)build the hybrid-search index from the store |
 | `scheduled` | launchd entry point: sync (both sources) + loud fail/late notification |
-| `search [<q>] [--source all\|claude_ai\|claude_code] [--project P] [--model M] [--repo R] [--worktree W] [--branch B] [--session S] [--since DATE] [--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | faceted hybrid semantic + lexical search over both sources; empty query browses by recency |
-| `list [--limit N] [--source all\|claude_ai\|claude_code]` | most recently updated units |
+| `search [<q>] [--source all\|claude_ai\|claude_code\|dream] [--project P] [--model M] [--repo R] [--worktree W] [--branch B] [--session S] [--since DATE] [--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | faceted hybrid semantic + lexical search; `all` means the two RAW sources only — distilled dream units are reachable only via `--source dream` |
+| `list [--limit N] [--source all\|claude_ai\|claude_code\|dream]` | most recently updated units (`all` = raw sources only, same rule as `search`) |
 | `whoami` | resolved claude.ai account + org |
 | `doctor` | health check: store, deps, launchd job, MCP registration, search index, dream layer |
 | `status [--tail N]` | last successful sync, launchd state, recent scheduled-run log |

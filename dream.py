@@ -82,6 +82,14 @@ WATERMARK_KEY = "dream_last_run_at"   # meta key: high-water mark of the nightly
 DIG_MIN_UNITS = 3                # dig a topic once this many units are pending...
 DIG_MAX_DEFER_DAYS = 7           # ...or this long since its oldest pending unit
 QUOTE_MATCH_CHARS = 60           # prefix of a quote that must appear verbatim
+# Relevance floor for the recall insight tier, on BGE-M3 dense cosine similarity
+# (RRF scores are rank-only and always return topk rows, so they cannot express
+# "nothing matches"). Calibrated 2026-07-26 on the live store's dream units:
+# on-topic queries put their best hits at 0.51-0.63; off-topic probes top out at
+# 0.41 ("best way to knit a sweater") and 0.31 ("zucchini sourdough hydration").
+# Below the floor the tier is EMPTY and coverage says so — never a confident
+# list of unrelated claims.
+RECALL_MIN_SIM = 0.45
 
 
 class DreamError(RuntimeError):
@@ -113,6 +121,7 @@ CREATE TABLE IF NOT EXISTS dream_insights (
     stance        text NOT NULL,
     status        text NOT NULL,
     superseded_by text REFERENCES units(unit_id) ON DELETE SET NULL,
+    superseded_kind text,
     support_count int NOT NULL,
     contested     boolean NOT NULL,
     valid_from    timestamptz NOT NULL,
@@ -167,8 +176,8 @@ CREATE TABLE IF NOT EXISTS dream_pending (
 # until the first INSERT/SELECT blew up somewhere unrelated.
 _INSIGHT_COLS = {
     "unit_id", "topic_id", "statement", "stance", "status", "superseded_by",
-    "support_count", "contested", "valid_from", "valid_until", "first_seen_at",
-    "last_seen_at", "distilled_at", "model", "evidence_sig",
+    "superseded_kind", "support_count", "contested", "valid_from", "valid_until",
+    "first_seen_at", "last_seen_at", "distilled_at", "model", "evidence_sig",
 }
 
 
@@ -576,6 +585,14 @@ def triage(con, unit_ids: list[str]) -> dict[str, list[str]]:
             raise DreamError(f"triage invented topic_id(s) {bad} for {a['unit_id']!r}")
         if a["topic_ids"]:
             result[a["unit_id"]] = a["topic_ids"]
+    # Every OFFERED unit needs a verdict, exactly as falsify/reconcile demand one
+    # per candidate: an omitted unit is indistinguishable from "assigned nothing",
+    # and the watermark then moves past it permanently.
+    missing = valid_units - {a["unit_id"] for a in out["assignments"]}
+    if missing:
+        raise DreamError(f"triage returned no verdict for offered unit(s) "
+                         f"{sorted(missing)} — an untriaged unit must never be "
+                         f"treated as an unassigned one")
     return result
 
 
@@ -676,6 +693,25 @@ def _norm(s: str) -> str:
     return " ".join((s or "").split()).casefold()
 
 
+# Stances that CLAIM something about what the user said or did. Each one must be
+# backed by at least one user-authored turn — mechanically, below.
+USER_STANCES = ("user_asserted", "user_endorsed", "user_rejected")
+
+
+def _require_user_evidence(stance: str, evidence: list[dict], statement: str) -> None:
+    """Mechanical attribution gate: a user_* stance must cite at least one turn the
+    user actually wrote (`sender` rides on each verified evidence row from
+    `ground`). Without this check the only things between an assistant turn and a
+    'user_asserted' insight are two LLM opinions — and `passes_substance` waives
+    the two-source bar on exactly that stance."""
+    if stance in USER_STANCES and not any(
+            e.get("sender") in USER_SENDERS for e in evidence):
+        senders = sorted({str(e.get("sender")) for e in evidence})
+        raise DreamError(
+            f"stance {stance!r} cites no user-authored turn "
+            f"(cited senders: {senders}) for {statement[:60]!r}")
+
+
 def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dict]:
     """Resolve a candidate's citations against `messages`. Returns the verified
     evidence rows, or raises `DreamError` naming exactly what failed.
@@ -703,10 +739,9 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
                 f"fabricated citation: ref {ref!r} was never shown to the distiller "
                 f"for {candidate['statement'][:60]!r}")
         src_unit_id, src_msg_id = refmap[ref]
-        e = {"src_unit_id": src_unit_id, "src_msg_id": src_msg_id,
-             "quote": raw["quote"]}
         row = con.execute(
-            f"SELECT {_TEXT} AS t, u.source FROM messages m JOIN units u USING(unit_id) "
+            f"SELECT {_TEXT} AS t, m.sender, u.source "
+            "FROM messages m JOIN units u USING(unit_id) "
             "WHERE m.unit_id=%s AND m.msg_id=%s",
             (src_unit_id, src_msg_id)).fetchone()
         if not row:
@@ -717,6 +752,8 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
             raise DreamError(
                 f"citation points at a non-raw unit (source={row['source']}) — the "
                 f"dig must never read derived text")
+        e = {"src_unit_id": src_unit_id, "src_msg_id": src_msg_id,
+             "quote": raw["quote"], "sender": row["sender"]}
         needle = _norm(e["quote"])[:QUOTE_MATCH_CHARS]
         if not needle or needle not in _norm(row["t"]):
             raise DreamError(
@@ -726,6 +763,10 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
         if key not in seen:
             seen.add(key)
             verified.append(e)
+    # The stance-vs-authorship gate runs on the DISTILLER's stance here, and again
+    # in `dig` after falsify (which may rewrite the stance) — both directions of
+    # the LLM opinion are checked against the same mechanical fact.
+    _require_user_evidence(candidate["stance"], verified, candidate["statement"])
     return verified
 
 
@@ -883,8 +924,13 @@ def reconcile(con, topic: dict, survivors: list[dict]) -> list[dict]:
     if not existing:                     # nothing to reconcile against — all new
         return [{**c, "action": "new", "target_id": ""} for c in survivors]
 
-    held = "\n".join(f"  [{r['unit_id']}] ({r['stance']}) {r['statement']}"
-                     for r in existing)
+    # The held-since date is shown so the model is not judging recency blind —
+    # `contradict` asserts "this one is the current view", which is a temporal
+    # claim (persist still gates chronology mechanically; this improves the input).
+    held = "\n".join(
+        f"  [{r['unit_id']}] ({r['stance']}, held since "
+        f"{r['valid_from'].date().isoformat()}) {r['statement']}"
+        for r in existing)
     listing = "\n".join(f"  [{i}] ({c['stance']}) {c['statement']}"
                         for i, c in enumerate(survivors))
     prompt = (f"TOPIC: {topic['name']}\n\nALREADY HELD\n{held}\n\n=====\n\n"
@@ -961,33 +1007,72 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
 
     Reads each candidate's verified evidence from `_evidence` (attached by the
     grounding gate) — never from a caller-supplied parallel structure."""
-    stats = {"new": 0, "reinforce": 0, "refine": 0, "contradict": 0}
+    stats = {"new": 0, "reinforce": 0, "refine": 0, "contradict": 0,
+             "out_of_order": 0}
     now = datetime.now(timezone.utc)
     for c in decided:
         ev = c["_evidence"]
         lo, hi = _evidence_span(con, ev)
-        if c["action"] == "reinforce":
-            con.execute(
-                "UPDATE dream_insights SET support_count=support_count+1, "
-                "last_seen_at=greatest(last_seen_at,%s), evidence_sig=%s "
-                "WHERE unit_id=%s", (hi, _evidence_sig(ev), c["target_id"]))
+        action = c["action"]
+        if action == "reinforce":
             for e in ev:
                 con.execute(
                     "INSERT INTO dream_evidence (unit_id,src_unit_id,src_msg_id,quote) "
                     "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                     (c["target_id"], e["src_unit_id"], e["src_msg_id"], e["quote"]))
+            # support_count is DERIVED from the evidence, never incremented: it is
+            # surfaced as "N source(s)", and re-mining the same unit (a re-touched
+            # conversation, a re-run after stopped_early) must not inflate it —
+            # counting distinct cited units makes the label true by construction.
+            con.execute(
+                "UPDATE dream_insights SET support_count="
+                "(SELECT count(DISTINCT src_unit_id) FROM dream_evidence "
+                " WHERE unit_id=%s), "
+                "last_seen_at=greatest(last_seen_at,%s), evidence_sig=%s "
+                "WHERE unit_id=%s",
+                (c["target_id"], hi, _evidence_sig(ev), c["target_id"]))
             stats["reinforce"] += 1
             continue
 
+        if action in ("refine", "contradict"):
+            # Chronology gate: superseding demands the NEW evidence not predate the
+            # target's window start. Reconcile decides the kind semantically —
+            # "this one is the current view" is a temporal claim it cannot verify —
+            # so mining an OLD conversation after a newer one would otherwise
+            # retire the current position and leave the target an INVERTED window
+            # (valid_until < valid_from), invisible at every as_of date. Strictly
+            # older contradicting evidence is still information: it lands as a
+            # contested NEW row (the digest's Open section), never as a timeline
+            # inversion. Equal timestamps (re-mining the same material into a
+            # sharper wording) supersede normally — the window stays well-formed.
+            target = con.execute(
+                "SELECT valid_from FROM dream_insights WHERE unit_id=%s",
+                (c["target_id"],)).fetchone()
+            if not target:
+                raise DreamError(f"persist: {action} names a missing target "
+                                 f"{c['target_id']!r}")
+            if hi < target["valid_from"]:
+                action = "new"
+                c = {**c, "verdict": "contested"}
+                stats["out_of_order"] += 1
+
         new_id = f"dream-{uuid.uuid4().hex[:16]}"
+        # Stance rides IN the persisted text (title and body), because every
+        # surface that reaches an insight through units/messages — search_history
+        # snippets, `clync search/list`, get_conversation — would otherwise show
+        # the bare claim with nothing saying who held it: a user_rejected approach
+        # would read as the user's own. Stance is immutable after persist, so the
+        # text cannot go stale (support_count, which changes, stays out of it).
         _write_unit(con, new_id, KIND_INSIGHT,
-                    f"[{topic['topic_id']}] {c['statement']}", c["elaboration"], lo, hi)
+                    f"[{topic['topic_id']}] ({c['stance']}) {c['statement']}",
+                    f"({c['stance']}) {c['elaboration']}", lo, hi)
         con.execute(
             "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
             "support_count,contested,valid_from,valid_until,first_seen_at,last_seen_at,"
             "distilled_at,model,evidence_sig) "
-            "VALUES (%s,%s,%s,%s,%s,1,%s,%s,NULL,%s,%s,%s,%s,%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s)",
             (new_id, topic["topic_id"], c["statement"], c["stance"], STATUS_ACTIVE,
+             len({e["src_unit_id"] for e in ev}),
              c.get("verdict") == "contested", hi, lo, hi, now, WORKER_MODEL,
              _evidence_sig(ev)))
         for e in ev:
@@ -995,15 +1080,19 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
                 "INSERT INTO dream_evidence (unit_id,src_unit_id,src_msg_id,quote) "
                 "VALUES (%s,%s,%s,%s)",
                 (new_id, e["src_unit_id"], e["src_msg_id"], e["quote"]))
-        if c["action"] in ("refine", "contradict"):
-            # Close the old window; never delete. `contradict` dates the change from
-            # the new evidence, `refine` is only better wording of the same position.
+        if action in ("refine", "contradict"):
+            # Supersession ALWAYS closes the window and records WHY in
+            # `superseded_kind`. A NULL valid_until would satisfy every as_of
+            # window forever (the retired wording returned beside its replacement),
+            # and consumers must read the recorded kind — never infer it from a
+            # NULL timestamp. `refine` is better wording of the SAME position, so
+            # only `contradict` is a dated change of mind (the digest's `changed`
+            # bucket keys on the kind, not on supersession itself).
             con.execute(
                 "UPDATE dream_insights SET status=%s, superseded_by=%s, "
-                "valid_until=%s WHERE unit_id=%s",
-                (STATUS_SUPERSEDED, new_id,
-                 hi if c["action"] == "contradict" else None, c["target_id"]))
-        stats[c["action"]] += 1
+                "superseded_kind=%s, valid_until=%s WHERE unit_id=%s",
+                (STATUS_SUPERSEDED, new_id, action, hi, c["target_id"]))
+        stats[action] += 1
     con.commit()
     return stats
 
@@ -1071,6 +1160,15 @@ def dig(con, topic: dict, unit_ids: list[str]) -> dict:
 
     final = []
     for s in survivors:
+        try:
+            # falsify may have REWRITTEN the stance (corrected_stance) — re-run the
+            # mechanical authorship gate on the corrected value, or an upgrade to
+            # user_asserted would slip past the check `ground` ran on the original.
+            _require_user_evidence(s["stance"], s["_evidence"], s["statement"])
+        except DreamError as e:
+            report["rejected_grounding"] += 1
+            report["rejections"].append(f"grounding: {e}")
+            continue
         if passes_substance(s, s["_evidence"]):
             final.append(s)
         else:
@@ -1116,9 +1214,14 @@ _CONSOLIDATE_SCHEMA = {
 
 def _digest_buckets(con, topic_id: str) -> dict[str, list[dict]]:
     """Group a topic's insights into the four fixed sections. Purely mechanical."""
+    # "Changed positions" is keyed on the RECORDED supersession kind: only a
+    # `contradict` supersession is a change of mind. A `refine` also points here
+    # via superseded_by, but it is by contract the SAME position in better words —
+    # bucketing it as changed would assert a dated change that never happened.
     rows = con.execute(
         "SELECT i.*, s.statement AS superseded_statement FROM dream_insights i "
-        "LEFT JOIN dream_insights s ON s.superseded_by = i.unit_id "
+        "LEFT JOIN dream_insights s "
+        "  ON s.superseded_by = i.unit_id AND s.superseded_kind = 'contradict' "
         "WHERE i.topic_id=%s AND i.status=%s ORDER BY i.support_count DESC, i.valid_from",
         (topic_id, STATUS_ACTIVE)).fetchall()
     b: dict[str, list[dict]] = {s: [] for s in DIGEST_SECTIONS}
@@ -1140,6 +1243,13 @@ _SECTION_TITLES = {"settled": "Settled", "rejected": "Rejected approaches",
                    "changed": "Changed positions", "open": "Open / unadjudicated"}
 
 
+def _stance_label(stance: str, support_count: int) -> str:
+    """The one rendering of an insight's attribution+support suffix (digest
+    bullets AND recall lines) — two copies would drift the moment either gained
+    a field, and this label is what keeps `support_count` honest to the reader."""
+    return f"[{stance}, {support_count} source(s)]"
+
+
 def consolidate(con, topic: dict) -> str | None:
     """Regenerate a topic's digest from its ACTIVE insight rows. Returns the digest
     text, or None when the topic has no insights yet.
@@ -1158,8 +1268,9 @@ def consolidate(con, topic: dict) -> str | None:
                 out.append(f"- was: {r['superseded_statement']}\n  now: {r['statement']} "
                            f"(changed {r['valid_from'].date().isoformat()})")
             else:
-                out.append(f"- {r['statement']} [{r['stance']}, {r['support_count']} "
-                           f"source(s), last seen {r['last_seen_at'].date().isoformat()}]")
+                out.append(f"- {r['statement']} "
+                           f"{_stance_label(r['stance'], r['support_count'])} "
+                           f"(last seen {r['last_seen_at'].date().isoformat()})")
         return "\n".join(out)
 
     listing = "\n\n".join(
@@ -1220,17 +1331,32 @@ def recall(con, query: str = "", *, topic_id: str | None = None, limit: int = 8,
     # by trust (stance + support), because an unadjudicated proposal and a
     # five-times-asserted position must not rank as if they were the same object.
     ids: list[str] = []
+    no_match = False
     if query.strip():
+        # RRF scores are rank-only (they cannot say "nothing here is relevant"),
+        # so the floor is on the dense cosine similarity hybrid_search now
+        # reports. Below the floor a hit is retrieval filler, and returning it
+        # as the user's position on the query is attribution pollution — the
+        # exact failure the stance machinery exists to prevent.
         ids = [r["unit_id"] for r in
-               search.hybrid_search(query, topk=limit * 4, source=DREAM_SOURCE)]
+               search.hybrid_search(query, topk=limit * 4, source=DREAM_SOURCE)
+               if (r.get("dense_sim") or 0.0) >= RECALL_MIN_SIM]
+        no_match = not ids
     where = ["i.status = %(status)s"] if not as_of else [
+        # Window-only PLUS not-retracted: supersession always closes the window
+        # (persist's contract), and a retracted claim was withdrawn, not held.
+        "i.status <> %(retracted)s",
         "i.valid_from <= %(as_of)s",
         "(i.valid_until IS NULL OR i.valid_until > %(as_of)s)"]
-    params: dict = {"status": STATUS_ACTIVE, "as_of": as_of}
+    params: dict = {"status": STATUS_ACTIVE, "retracted": STATUS_RETRACTED,
+                    "as_of": as_of}
     if topic:
         where.append("i.topic_id = %(topic)s")
         params["topic"] = topic["topic_id"]
-    if ids:
+    if query.strip():
+        # The id filter applies WHENEVER a query was given — an empty retrieval
+        # must yield an EMPTY insight tier, never fall through to the
+        # trust-ranked top of the whole table dressed up as an answer.
         where.append("i.unit_id = ANY(%(ids)s)")
         params["ids"] = ids
     insights = con.execute(
@@ -1267,14 +1393,22 @@ def recall(con, query: str = "", *, topic_id: str | None = None, limit: int = 8,
     if topic and not digest:
         cov.append(f"topic '{topic['topic_id']}' has no digest yet — nothing distilled")
     if topic and topic["last_dig_at"]:
+        # Same eligibility predicate as the nightly selection (_changed_units):
+        # counting by raw `updated_at` would hide exactly the units that
+        # expression exists to catch (NULL updated_at, late-ingested material).
         newer = con.execute(
-            "SELECT count(*) AS n FROM units WHERE source = ANY(%s) AND updated_at > %s",
-            (list(RAW_SOURCES), topic["last_dig_at"])).fetchone()["n"]
+            "SELECT count(*) AS n FROM units WHERE source = ANY(%(sources)s) "
+            f"AND {_LEARNED_AT_SQL} > %(since)s AND {_RENDERABLE_SQL}",
+            {"sources": list(RAW_SOURCES), "senders": list(USER_SENDERS),
+             "since": topic["last_dig_at"]}).fetchone()["n"]
         if newer:
             cov.append(f"{newer} raw unit(s) changed since this topic was last dug "
                        f"({topic['last_dig_at'].date().isoformat()}) — not yet distilled")
     elif topic:
         cov.append(f"topic '{topic['topic_id']}' has never been dug")
+    if no_match:
+        cov.append("no distilled insight matches this query — the knowledge base "
+                   "does not cover it (raw transcript hits below are NOT distilled)")
     if not topic:
         cov.append("no topic matched this query — showing raw transcript results only")
     return {"topic": topic, "digest": digest, "insights": insights, "raw": raw,
@@ -1308,7 +1442,8 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
     if not result["insights"]:
         out.append("  (none)")
     for i in result["insights"]:
-        out.append(f"  {i['statement']}  [{i['stance']}, {i['support_count']} source(s)]")
+        out.append(f"  {i['statement']}  "
+                   f"{_stance_label(i['stance'], i['support_count'])}")
         if include_evidence:
             for e in i.get("evidence", []):
                 out.append(f"      {e['src_unit_id']}:{e['src_msg_id']}  "
@@ -1372,15 +1507,43 @@ def _calls_made(con) -> int:
     return con.execute("SELECT count(*) AS n FROM dream_queue").fetchone()["n"]
 
 
-def _changed_units(con, since: str | None) -> list[str]:
-    q = ("SELECT unit_id FROM units WHERE source = ANY(%s) "
-         "AND (msg_count IS NULL OR msg_count > 0)")
-    params: list = [list(RAW_SOURCES)]
-    if since:
-        q += " AND updated_at > %s"
-        params.append(since)
-    return [r["unit_id"] for r in
-            con.execute(q + " ORDER BY updated_at", params).fetchall()]
+# A unit is a triage CANDIDATE only if skeleton() can render it: at least one
+# non-empty user turn (any turn for a project_doc, which has no user turns).
+# Deciding emptiness at SELECTION is what keeps the nightly pass un-wedgeable:
+# a genuinely-empty unit (an abandoned claude.ai chat) is skipped VISIBLY here,
+# while skeleton()'s fail-loud raise stays reserved for the systemic case — a
+# unit that passed this predicate yet renders empty means the render itself broke.
+_RENDERABLE_SQL = (
+    "EXISTS (SELECT 1 FROM messages m WHERE m.unit_id = units.unit_id "
+    "AND (units.kind = 'project_doc' OR m.sender = ANY(%(senders)s)) "
+    "AND btrim(coalesce(m.embed_text, m.text, '')) <> '')")
+
+# The watermark compares against when clync LEARNED of a unit, never only when
+# the SOURCE last touched it: `updated_at` is source-authored (NULL for project
+# docs, months old for late-ingested material), so `updated_at > watermark`
+# silently excludes anything that arrives behind the mark. `synced_at` is
+# written as _now() on every upsert (both sources, every kind), so this
+# expression is total and monotone with ingestion.
+_LEARNED_AT_SQL = "greatest(coalesce(updated_at, 'epoch'::timestamptz), synced_at)"
+
+
+def _changed_units(con, since: str) -> tuple[list[str], list[str]]:
+    """Units eligible for triage since the watermark -> (eligible, skipped_empty).
+
+    `skipped_empty` is the changed units excluded because nothing in them is
+    renderable — returned so the run REPORT shows the skip instead of hiding it."""
+    params = {"sources": list(RAW_SOURCES), "senders": list(USER_SENDERS),
+              "since": since}
+    base = ("SELECT unit_id FROM units WHERE source = ANY(%(sources)s) "
+            "AND (msg_count IS NULL OR msg_count > 0) "
+            f"AND {_LEARNED_AT_SQL} > %(since)s")
+    eligible = [r["unit_id"] for r in con.execute(
+        base + f" AND {_RENDERABLE_SQL} ORDER BY {_LEARNED_AT_SQL}",
+        params).fetchall()]
+    skipped = [r["unit_id"] for r in con.execute(
+        base + f" AND NOT {_RENDERABLE_SQL} ORDER BY {_LEARNED_AT_SQL}",
+        params).fetchall()]
+    return eligible, skipped
 
 
 def _queue_pending(con, assignments: dict[str, list[str]]) -> int:
@@ -1460,23 +1623,30 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     run reports that `dream backfill` is what mines history."""
     budget = _Budget(max_calls)
     calls_before = _calls_made(con)
-    report: dict = {"mode": "incremental", "changed": 0, "topics_touched": [],
-                    "queued": 0, "digs": {}, "consolidated": [], "calls": 0,
-                    "deferred": [], "stopped_early": None}
+    # The new watermark is snapshotted BEFORE selection, and it is what every
+    # success path writes. Writing end-of-run _now() instead would open a window
+    # the length of the pass (minutes of Opus calls): a unit synced in between
+    # was not selected, yet the watermark would move past it — skipped silently,
+    # forever. With t0 the window is closed by construction.
+    t0 = _now()
+    report: dict = {"mode": "incremental", "changed": 0, "skipped_empty": [],
+                    "topics_touched": [], "queued": 0, "digs": {},
+                    "consolidated": [], "calls": 0, "deferred": [],
+                    "stopped_early": None}
     watermark = get_meta(con, WATERMARK_KEY)
     if not watermark:
-        set_meta(con, WATERMARK_KEY, _now())
+        set_meta(con, WATERMARK_KEY, t0)
         con.commit()
         report["note"] = ("watermark initialised — nothing distilled. History is "
                           "mined by `clync dream backfill`, not by the nightly run.")
         return report
 
-    units = _changed_units(con, watermark)
+    units, report["skipped_empty"] = _changed_units(con, watermark)
     # Units ELIGIBLE for triage. Not "triaged": a budget-capped run leaves
     # some of them unread, and reporting them as processed would be a lie.
     report["changed"] = len(units)
     if not units:
-        set_meta(con, WATERMARK_KEY, _now())
+        set_meta(con, WATERMARK_KEY, t0)
         con.commit()
         report["note"] = "no new or changed units since last run — nothing to do"
         return report
@@ -1530,9 +1700,10 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
                           for r in pending_counts(con)]
 
     # Only advance the watermark on a run that wasn't cut short, or the units the
-    # budget skipped would never be triaged again.
+    # budget skipped would never be triaged again. It advances to t0 (the
+    # pre-selection snapshot), never to the current clock — see t0 above.
     if not report["stopped_early"]:
-        set_meta(con, WATERMARK_KEY, _now())
+        set_meta(con, WATERMARK_KEY, t0)
         con.commit()
     _index_written(con, report)
     return report

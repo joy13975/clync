@@ -259,14 +259,20 @@ A candidate insight passes three gates before it becomes durable:
 
 On reconcile against existing insights, the outcome is one of:
 
-- **reinforce** — same claim, new evidence → append refs, bump `support_count`,
-  extend `last_seen_at`.
+- **reinforce** — same claim, new evidence → append refs, extend
+  `last_seen_at`; `support_count` is *derived* (distinct cited source units),
+  never incremented, so re-mining the same unit cannot inflate it.
 - **refine** — same claim, better wording → new version, old row
-  `status='superseded'`, `superseded_by` set.
+  `status='superseded'`, `superseded_by` set, `superseded_kind='refine'`,
+  `valid_until = new.valid_from` (every supersession CLOSES the window; the
+  *kind* — not a NULL timestamp — is what says no change of mind happened).
 - **contradict** — the user's position changed → old row gets
-  `valid_until = new.valid_from` and `status='superseded'`; the new row is
-  active. **Nothing is deleted.** The history stays queryable, so the layer can
-  answer "when did I change my mind about X".
+  `valid_until = new.valid_from`, `status='superseded'`,
+  `superseded_kind='contradict'`; the new row is active. **Nothing is
+  deleted.** The history stays queryable, so the layer can answer "when did I
+  change my mind about X". A supersession whose new evidence *predates* the
+  target's `valid_from` is refused (it would invert the timeline) and lands as
+  a contested new row instead.
 - **new** — no match.
 
 Retraction (`status='retracted'`) is reserved for insights whose evidence
@@ -301,7 +307,8 @@ CREATE TABLE dream_insights (
     stance        text NOT NULL,         -- D5
     status        text NOT NULL,         -- active | superseded | retracted
     superseded_by text REFERENCES units(unit_id),
-    support_count int NOT NULL,
+    superseded_kind text,                -- 'refine' | 'contradict' (why superseded)
+    support_count int NOT NULL,          -- derived: distinct cited source units
     valid_from    timestamptz NOT NULL,  -- bi-temporal: when the position held
     valid_until   timestamptz,           -- NULL = still current
     first_seen_at timestamptz NOT NULL,  -- when evidence was authored

@@ -48,7 +48,9 @@ count too: pasted-file text is indexed.
 
    Facets narrow the search to one source or dimension — pass only what the
    user's phrasing implies:
-   - `source`: `"all"` (default) | `"claude_ai"` | `"claude_code"`.
+   - `source`: `"all"` (default) | `"claude_ai"` | `"claude_code"` | `"dream"`.
+     `"all"` means the two raw sources only — distilled insights come back only
+     via `source="dream"` (prefer `recall_knowledge` for those).
    - claude.ai only: `project` (name/uuid, or `"any"`/`"none"`), `model`.
    - Claude Code only: `repo`, `worktree`, `branch`, `session` (name or id).
    - Both: `since` / `until` (ISO dates), `sort` (`"relevance"` default |
