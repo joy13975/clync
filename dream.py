@@ -37,8 +37,8 @@ import subprocess
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from clync import (RAW_SOURCES, _json, _now, connect_pg, get_meta, set_meta,
-                   sql_statements)
+from clync import (RAW_SOURCES, _json, _now, connect_pg, get_meta,
+                   require_rebuild, set_meta, sql_statements)
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -181,20 +181,24 @@ _INSIGHT_COLS = {
 }
 
 
-def ensure_dream_schema() -> None:
+def ensure_dream_schema(*, rebuild: bool = False) -> None:
     """Create the Dream tables (idempotent). Assumes `units`/`messages` exist —
     `clync.ensure_cluster` applies RAW_SCHEMA first, and the FKs need it.
 
     Like the search index (ADR 0003), Dream data is DERIVED and rebuildable — the
-    insights re-derive from raw transcript by re-digging. So a stale `dream_insights`
-    layout is dropped and recreated rather than migrated. `dream_topics` is spared:
-    charters and probe queries are hand-edited config, not derived, and re-digging
-    is what costs quota, not re-seeding topics."""
+    insights re-derive from raw transcript by re-digging — so a stale
+    `dream_insights` layout is rebuilt rather than migrated. But re-digging is what
+    costs quota, which makes this the most expensive rebuild in the store: it never
+    happens implicitly. A stale shape RAISES unless `rebuild=True` (see
+    `clync.require_rebuild`). `dream_topics` is spared either way: charters and
+    probe queries are hand-edited config, not derived."""
     with connect_pg() as con:
         have = {r["column_name"] for r in con.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema='public' AND table_name='dream_insights'").fetchall()}
         if have and have != _INSIGHT_COLS:
+            require_rebuild(rebuild, layer="dream",
+                            cost="every distilled insight (re-digging spends quota)")
             con.execute("DROP TABLE IF EXISTS dream_evidence")
             con.execute("DROP TABLE IF EXISTS dream_insights")
             con.execute("DROP TABLE IF EXISTS dream_pending")

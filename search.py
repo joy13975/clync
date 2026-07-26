@@ -17,7 +17,7 @@ from datetime import datetime
 
 # The store + shared config live in the core module (SSOT). Search is core now
 # (ADR 0003): its deps are no longer an optional extra.
-from clync import (DEFAULT_TOPK, PG_BIN, connect_pg, ensure_cluster,
+from clync import (DEFAULT_TOPK, PG_BIN, connect_pg, require_rebuild,
                    resolve_sources, sql_statements, _vector_control_present)
 
 EMBED_MODEL = "BAAI/bge-m3"
@@ -72,15 +72,17 @@ CREATE TABLE IF NOT EXISTS indexed_units (
 """
 
 
-def ensure_index_schema() -> None:
+def ensure_index_schema(*, rebuild: bool = False) -> None:
     """Create the vector index tables (idempotent). Assumes the cluster + `vector`
     extension exist (clync.ensure_cluster provisions them).
 
     The index tables are DERIVED and rebuildable, so ANY stale layout — the
     pre-ADR-0003 conversation-keyed index (`indexed_convs`), or a `chunks`
-    column set that no longer matches INDEX_SCHEMA — is dropped and recreated
-    (watermarks included, so everything re-embeds). CREATE IF NOT EXISTS alone
-    would silently keep the old shape and the first insert would fail."""
+    column set that no longer matches INDEX_SCHEMA — needs dropping and recreating
+    (watermarks included, so everything re-embeds); CREATE IF NOT EXISTS alone
+    would silently keep the old shape and the first insert would fail. But that
+    drop is data loss, so it never happens implicitly: a stale shape RAISES unless
+    `rebuild=True` (see `clync.require_rebuild`)."""
     with connect_pg() as con:
         have = {r["column_name"] for r in con.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -89,6 +91,8 @@ def ensure_index_schema() -> None:
             "SELECT 1 FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name='indexed_convs'").fetchone()
         if legacy or (have and have != set(CHUNK_COLS) | {"dense", "sparse"}):
+            require_rebuild(rebuild, layer="search index",
+                            cost="every embedding (a full re-embed of the corpus)")
             con.execute("DROP TABLE IF EXISTS chunks")
             con.execute("DROP TABLE IF EXISTS indexed_convs")
             con.execute("DROP TABLE IF EXISTS indexed_units")
@@ -249,8 +253,9 @@ def _unit_signature(chunks: list[dict]) -> str:
 def build_index(full: bool = False) -> dict:
     """Embed new/changed units into the contained cluster. A unit re-embeds
     whenever the exact bytes folded into its chunks change (a content signature,
-    not a timestamp). `full` re-embeds everything. Returns stats."""
-    ensure_cluster()
+    not a timestamp). `full` re-embeds everything. Returns stats.
+
+    The store must already be provisioned (callers do it at command entry)."""
     with connect_pg() as con:
         universe = {r["unit_id"] for r in
                     con.execute("SELECT unit_id FROM units").fetchall()}
@@ -379,10 +384,13 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     """Faceted hybrid search. With a `query`, ranks by fused dense+sparse RRF +
     typed-metadata boost, collapsed to one best chunk per unit. With an EMPTY
     query, degrades to a metadata browse (units matching the facets, newest first).
-    A facet contradicting `source` fails loud."""
+    A facet contradicting `source` fails loud.
+
+    Read-only, and deliberately does NOT provision the store: provisioning takes
+    DDL locks, and a read that takes DDL locks deadlocks against its own caller's
+    open transaction. Callers provision once at command entry."""
     _validate_facets(source, project=project, model=model, repo=repo,
                      worktree=worktree, branch=branch)
-    ensure_cluster()
 
     if not query.strip() or sort == "recency":
         return _browse(topk, source, project, model, repo, worktree, branch,

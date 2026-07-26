@@ -96,7 +96,18 @@ def test_stale_insight_shape_is_recreated_topics_survive_and_units_are_purged(st
                   (dream.KIND_INSIGHT,))
     store.commit()
 
-    dream.ensure_dream_schema()
+    # A stale shape must NOT be rebuilt implicitly: the rebuild destroys every
+    # distilled insight, and it used to happen as a side effect of whatever call
+    # provisioned the store first — including a read, which then took DDL locks and
+    # deadlocked against its caller's open transaction. Refuse, and say how.
+    with pytest.raises(clync.StaleDerivedSchema, match="clync migrate"):
+        dream.ensure_dream_schema()
+    assert "contested" not in {r["column_name"] for r in store.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='dream_insights'").fetchall()}, "refusal must not mutate"
+    assert clync.get_meta(store, dream.WATERMARK_KEY) is not None
+
+    dream.ensure_dream_schema(rebuild=True)          # the explicit opt-in
 
     cols = {r["column_name"] for r in store.execute(
         "SELECT column_name FROM information_schema.columns "

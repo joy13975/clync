@@ -476,10 +476,36 @@ def sql_statements(script: str):
     return [s for s in (stmt.strip() for stmt in stripped.split(";")) if s]
 
 
-def ensure_cluster() -> None:
+class StaleDerivedSchema(RuntimeError):
+    """A derived layer's tables no longer match the shipped schema, and rebuilding
+    them would destroy derived data. Raised instead of rebuilding."""
+
+
+def require_rebuild(rebuild: bool, *, layer: str, cost: str) -> None:
+    """Gate every destructive rebuild of a DERIVED layer behind an explicit opt-in.
+
+    A stale shape used to be dropped and recreated inline by whichever call
+    happened to provision the store first. Two ways that bites, both observed:
+    an ordinary READ then takes DDL locks (and deadlocks against its own caller's
+    still-open read transaction — no timeout, no error, forever), and when it does
+    NOT deadlock it destroys the layer silently, mid-run, with nobody asking for it.
+    Rebuilding is derived-data loss, so it is an operator decision, not a side
+    effect of an arbitrary call path. SSOT for that refusal message."""
+    if not rebuild:
+        raise StaleDerivedSchema(
+            f"{layer} schema is STALE: the shipped layout has moved on. Rebuilding "
+            f"it drops and re-derives {cost}. Nothing has been changed. To rebuild, "
+            f"run:  clync migrate")
+
+
+def ensure_cluster(*, rebuild_derived: bool = False) -> None:
     """Idempotent: initdb (if absent) -> start -> create db + extensions + raw
     schema. Also ensures the search index schema so a single call fully provisions
-    the store. Fails loud on a missing PG17/pgvector toolchain."""
+    the store. Fails loud on a missing PG17/pgvector toolchain.
+
+    A derived layer whose shape is stale raises `StaleDerivedSchema` — it is NOT
+    silently rebuilt. `rebuild_derived=True` (only `clync migrate` passes it) opts
+    into the destructive rebuild."""
     if not _vector_control_present():
         raise SystemExit(
             "pgvector not found for PG17. Install with:  brew install pgvector")
@@ -504,9 +530,9 @@ def ensure_cluster() -> None:
         con.commit()
     # Each derived layer owns its own tables + their stale-shape guard.
     import search
-    search.ensure_index_schema()        # chunks/indexed_units (search owns the dims)
+    search.ensure_index_schema(rebuild=rebuild_derived)   # chunks/indexed_units
     import dream
-    dream.ensure_dream_schema()         # dream_* (dream owns the stance vocabularies)
+    dream.ensure_dream_schema(rebuild=rebuild_derived)    # dream_* (stance vocab)
 
 
 def connect():
@@ -1004,6 +1030,7 @@ def cmd_sync_cc(args) -> int:
 
 def cmd_index(args) -> int:
     import search
+    ensure_cluster()                  # command entry provisions; build_index does not
     try:
         stats = search.build_index(full=args.full)
     except Exception as e:
@@ -1011,6 +1038,34 @@ def cmd_index(args) -> int:
         raise
     print(f"reindexed_units={stats['reindexed_units']} chunks={stats['chunks']} "
           f"removed_units={stats['removed_units']}")
+    return 0
+
+
+def cmd_migrate(args) -> int:
+    """Apply a destructive rebuild of the DERIVED layers whose shape went stale.
+
+    The one door for that rebuild. Everything else refuses (`StaleDerivedSchema`)
+    so no read, sync or nightly run can destroy derived data as a side effect."""
+    before = {}
+    if cluster_running():
+        with connect_pg() as con:
+            for t in ("chunks", "dream_insights"):
+                exists = con.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema='public' AND table_name=%s", (t,)).fetchone()
+                before[t] = con.execute(
+                    f"SELECT count(*) AS n FROM {t}").fetchone()["n"] if exists else 0
+    ensure_cluster(rebuild_derived=True)
+    with connect_pg() as con:
+        after = {t: con.execute(f"SELECT count(*) AS n FROM {t}").fetchone()["n"]
+                 for t in ("chunks", "dream_insights")}
+    for t in ("chunks", "dream_insights"):
+        lost = before.get(t, 0) - after[t]
+        print(f"{t}: {before.get(t, 0)} -> {after[t]}"
+              + (f"  ({lost} row(s) dropped; re-derive with "
+                 f"{'clync index' if t == 'chunks' else 'clync dream backfill'})"
+                 if lost > 0 else "  (unchanged)"))
+    print("schema migrated. Search and dream schemas now match the shipped layout.")
     return 0
 
 
@@ -1538,6 +1593,10 @@ def main() -> int:
     sub.add_parser("scheduled", parents=[cred],
                    help="launchd entry point (sync + loud fail/late notify)"
                    ).set_defaults(func=cmd_scheduled)
+
+    sub.add_parser("migrate", help="rebuild DERIVED schemas whose shape went stale "
+                                   "(DESTRUCTIVE: drops embeddings/insights)"
+                   ).set_defaults(func=cmd_migrate)
 
     sp = sub.add_parser("search", help="faceted hybrid (dense + sparse) semantic "
                                        "search across claude.ai + Claude Code")

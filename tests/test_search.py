@@ -2,6 +2,8 @@
 the SQL / RRF-fusion / watermark / faceting logic is what's under test, not BGE-M3."""
 from __future__ import annotations
 
+import pytest
+
 import clync
 
 # valid timestamptz values (units.updated_at is a real timestamp)
@@ -232,10 +234,43 @@ def test_legacy_conversation_keyed_index_is_replaced(pg_test_db, mock_embed):
     con.commit()
     con.close()
 
-    search.ensure_index_schema()
+    # Refusal first: the rebuild re-embeds the whole corpus, so it is never an
+    # implicit side effect of provisioning (a read used to trigger it and deadlock).
+    with pytest.raises(clync.StaleDerivedSchema, match="clync migrate"):
+        search.ensure_index_schema()
+    search.ensure_index_schema(rebuild=True)                        # explicit opt-in
     _seed("A", "Alpha", T1, ["alpha body"])
     assert search.build_index(full=False)["reindexed_units"] == 1   # new shape works
     assert _pg_units(search) == {"A"}
+
+
+def test_read_path_never_provisions_so_it_cannot_ddl(pg_test_db, mock_embed):
+    """A read must not provision the store. Provisioning takes DDL locks, and a
+    read that takes DDL locks (a) deadlocks against its own caller's still-open
+    read transaction — observed live as a permanent hang, no timeout, no error —
+    and (b) when it does not deadlock, silently destroys the derived layer it just
+    decided was stale. So: with a DELIBERATELY STALE derived shape, a search still
+    answers and the stale shape is still there afterwards. If someone reinstates
+    provisioning inside the read path, this fails (loudly, on the refusal) instead
+    of hanging the suite."""
+    search = pg_test_db
+    _seed("A", "Alpha", T1, ["alpha body"])
+    search.build_index(full=False)
+    con = clync.connect()
+    con.execute("ALTER TABLE dream_insights ADD COLUMN zz_stale text")   # stale now
+    con.commit()
+    con.close()
+
+    assert search.hybrid_search("alpha", topk=5)          # read still answers
+
+    con = clync.connect()
+    try:
+        assert con.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_name="
+            "'dream_insights' AND column_name='zz_stale'").fetchone(), \
+            "the read path mutated the schema"
+    finally:
+        con.close()
 
 
 def test_stale_chunks_column_set_is_replaced(pg_test_db, mock_embed):
@@ -252,7 +287,9 @@ def test_stale_chunks_column_set_is_replaced(pg_test_db, mock_embed):
     con.commit()
     con.close()
 
-    search.ensure_index_schema()
+    with pytest.raises(clync.StaleDerivedSchema, match="clync migrate"):
+        search.ensure_index_schema()
+    search.ensure_index_schema(rebuild=True)                        # explicit opt-in
     _seed("A", "Alpha", T1, ["alpha body"])
     assert search.build_index(full=False)["reindexed_units"] == 1
     assert _pg_units(search) == {"A"}
