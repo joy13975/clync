@@ -15,9 +15,10 @@ This file is an index — the actual documentation lives in these:
 | [skill-ops/SKILL.md](skill-ops/SKILL.md) | The `clync-ops` skill — invoked to run/troubleshoot sync, index, search, doctor from the shell. |
 | `clync.py` (module docstring + `--help`) | Sync engine, cookie/Cloudflare handling, the contained Postgres store, CLI. |
 | `cc.py` (module docstring) | Local Claude Code session ingest: JSONL parsing, cleaning, metadata extraction. |
-| `mcp_server.py` (docstring) | The two MCP tools (`search_history`, `get_conversation`) over both sources. |
+| `mcp_server.py` (docstring) | The three MCP tools: `search_history` + `get_conversation` over the raw sources, `recall_knowledge` over the distilled Dream layer. |
 | `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, RRF-fused dense+sparse query. |
-| [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003). |
+| `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p` (no API billing). Two separate run modes: incremental nightly, explicit bulk backfill. |
+| [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004). |
 
 ## One-command setup
 
@@ -35,8 +36,16 @@ defined in this repo, symlinked/registered out. `clync unsetup` reverses it
 - **SSOT:** `clync.py` owns cookies + API client + the contained Postgres
   store (single source of truth AND search index, ADR 0003); `cc.py` owns
   local Claude Code session parsing/cleaning (no DB); `search.py` owns the
-  vector index + hybrid query; `mcp_server.py` imports from `clync.py`/`search.py`.
-  Don't duplicate store/query logic across these.
+  vector index + hybrid query; `dream.py` owns the derived knowledge layer
+  (its own tables, prompts, gates, and the `format_recall` renderer both
+  surfaces print); `mcp_server.py` imports from `clync.py`/`search.py`/`dream.py`.
+  Don't duplicate store/query logic across these. Each derived layer ensures its
+  OWN schema (`search.ensure_index_schema`, `dream.ensure_dream_schema`) — there
+  is no migration mechanism, so a changed shape is dropped and rebuilt.
+- **The Dream layer must never read its own output.** `source='all'` means raw
+  only; the dig rejects any citation to a non-raw unit; the worker runs with
+  `--no-session-persistence` so it writes no transcript for `sync-cc` to ingest.
+  Breaking any of those three makes the layer feed on itself.
 - **Config, not hardcoded:** `$CLYNC_PROFILE` / `--profile`, `$CLYNC_DATA_HOME`,
   `$CLYNC_CC_ROOT`, `$CLYNC_PG_BIN`/`$CLYNC_PG_PORT`/`$CLYNC_PG_DB`, `--org`.
   Nothing personal is baked into source.

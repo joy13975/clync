@@ -20,8 +20,12 @@ macOS + Chrome only.
    **text-attachment content**) into clync's own contained Postgres 17 +
    pgvector cluster — the single source of truth *and* the search index.
    Incremental by `updated_at` (claude.ai) / file mtime (Claude Code).
-5. **Query** — `mcp_server.py` exposes `search_history` (one faceted hybrid
-   search across both sources) and `get_conversation` to Claude Code over stdio.
+5. **Dream** — a third layer, derived rather than synced: `dream.py` distills
+   topic-scoped knowledge (grounded, stance-tagged insights + structured
+   digests) out of the raw transcripts. See [Dream layer](#dream-layer) below.
+6. **Query** — `mcp_server.py` exposes `search_history` (one faceted hybrid
+   search across both raw sources), `recall_knowledge` (dream-first recall over
+   the distilled layer), and `get_conversation` to Claude Code over stdio.
 
 **Fail-loud:** any auth/HTTP/schema error raises and exits non-zero. It never
 silently serves stale data. The scheduled run additionally fires a macOS
@@ -62,9 +66,14 @@ session to load the MCP tools + skills.
 | `search [<q>] [--source all\|claude_ai\|claude_code] [--project P] [--model M] [--repo R] [--worktree W] [--branch B] [--session S] [--since DATE] [--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | faceted hybrid semantic + lexical search over both sources; empty query browses by recency |
 | `list [--limit N] [--source all\|claude_ai\|claude_code]` | most recently updated units |
 | `whoami` | resolved claude.ai account + org |
-| `doctor` | health check: store, deps, launchd job, MCP registration, search index |
+| `doctor` | health check: store, deps, launchd job, MCP registration, search index, dream layer |
 | `status [--tail N]` | last successful sync, launchd state, recent scheduled-run log |
 | `install [--at HH:MM]` / `uninstall` | manage the daily launchd job |
+| `dream topics [--seed] [--all]` | list dream topics (id, status, active insight count, digest presence, last dig time); `--seed` inserts the built-in starter topics if absent, `--all` includes non-active topics |
+| `dream run [--max-calls N]` | the incremental (nightly-shaped) dream pass — see [Dream layer](#dream-layer) |
+| `dream backfill [--topic T] [--max-calls N]` | the explicit bulk dream pass — see [Dream layer](#dream-layer) |
+| `dream recall "<query>" [--topic T] [--limit N] [--as-of ISO] [--evidence]` | dream-first tiered recall from the shell: TOPIC / COVERAGE / DIGEST / INSIGHTS / RAW TRANSCRIPTS |
+| `dream status` | watermark, per-topic table, model-usage totals by stage, failed queue count |
 
 ## Claude Code sessions
 
@@ -123,6 +132,74 @@ A `clync` wrapper script sits in the repo; symlink it onto your PATH for global 
 ln -s ~/code/clync/clync ~/.local/bin/clync   # then: clync search "…", clync sync, clync status
 ```
 
+## Dream layer
+
+A third content layer (design: [docs/adr/0004](docs/adr/0004-dream-layer.md)),
+built on top of the raw `units`/`messages` store. Where `search`/`search_history`
+answer *"where did I discuss X?"*, the Dream layer answers *"what do I actually
+think about X?"* by distilling topic-scoped **insight** atoms and per-topic
+**digests** out of the raw transcripts.
+
+- **Inference has no API billing.** All model calls go through the local
+  headless `claude -p` CLI under the existing subscription OAuth — no
+  `ANTHROPIC_API_KEY`, no API quota. This consumes the subscription's rate
+  limits; if a run gets throttled it stops cleanly, keeps its state, and warns
+  (not a failure) rather than retrying — the next `dream run`/`backfill`
+  resumes where it left off.
+- **Every insight is grounded.** It must cite real `(unit_id, msg_id)` pairs
+  whose quoted text is found verbatim in the stored message, or it is
+  rejected — a mechanical DB check, not the model's self-report.
+- **Every insight carries a stance** — who held the position:
+  `user_asserted` / `user_endorsed` / `user_rejected` / `co_derived` /
+  `claude_proposed`. A position the user rejected stays retrievable as
+  rejected; a Claude suggestion is never silently promoted into "what the user
+  thinks".
+- **Nothing is deleted.** A changed position closes the old insight's validity
+  window and links the supersession, which is what `dream recall --as-of`
+  reads — positions held at a given date, not just now.
+- **Non-circular by construction.** `source=all`/`search_history` still means
+  raw-only (`claude_ai` + `claude_code`); dreams are reachable only via
+  `source=dream` or `recall_knowledge`. The dig cannot retrieve its own output,
+  and the worker writes no session transcript, so the layer can never feed on
+  itself.
+- **Coverage gaps are stated loudly, never hidden** — an un-dug or stale topic
+  says so explicitly in its output rather than presenting thin coverage as
+  complete.
+
+Two separate passes, with cost profiles two orders of magnitude apart:
+
+- **`dream run [--max-calls N]`** — the incremental, nightly-shaped pass, gated
+  by triage: only units changed since the watermark are looked at (batched 15
+  per triage call), and a digest is only rebuilt if its insight set actually
+  changed. Digs are **batched across nights**: a triaged unit is queued against
+  its topic, and that topic is dug once 3 units have accumulated or its oldest
+  has waited a week. This matters because nightly cost scales with *topics dug*,
+  not units changed — measured, digging every flagged topic immediately cost 14
+  calls for one ordinary day. Nothing is lost by waiting (the queue is a table,
+  and `dream run`/`dream status` both report the backlog). So: no changed units
+  costs 0 calls, changed units with nothing ripe costs 1, and a ripe topic costs
+  4-5. This runs automatically inside the daily `clync scheduled` launchd job,
+  immediately after sync+index. The very first `dream run` deliberately does
+  nothing but initialize the watermark — it tells you to use `dream backfill` to
+  mine existing history.
+- **`dream backfill [--topic T] [--max-calls N]`** — the bulk pass. Explicit
+  only, never scheduled. This is what mines the existing history and is where
+  the real cost lives (on the order of 100-200 calls for a full first pass
+  across all topics). Resumable: a capped run picks up where it stopped,
+  because progress lives in the evidence table.
+
+`dream recall "<query>" [--topic T] [--limit N] [--as-of ISO] [--evidence]`
+does dream-first tiered retrieval from the shell: TOPIC / COVERAGE / DIGEST /
+INSIGHTS / RAW TRANSCRIPTS. `--as-of` reads the bi-temporal history (positions
+held at that date, not now); `--evidence` prints the quoted source text behind
+each insight. The same tiered retrieval is exposed to Claude Code as the
+`recall_knowledge` MCP tool (see below) — use it for "what do I think about X",
+and keep `search_history` for "where did I discuss X".
+
+`dream status` reports the watermark, a per-topic table, model-usage totals by
+stage, and the failed-queue count; `clync doctor` includes a one-line dream
+health summary.
+
 ## Config
 
 | Setting | Source | Default |
@@ -169,3 +246,10 @@ this Mac only.
   claude.ai login per profile. The tool is pointed at a profile because that is
   where the login cookie physically lives; the org is selected after
   authenticating (`--org` to pick a non-default one).
+- **Dream layer:** distillation quality depends on the topic charters — a
+  charter that's too broad or too narrow shapes what gets triaged into a
+  topic, same as any retrieval-driven system. `dream backfill` (mining
+  existing history) is the expensive pass, on the order of 100-200 model
+  calls for a full first pass across all topics; `dream run` (nightly) stays
+  cheap by construction, but a topic added or a charter materially rewritten
+  needs a fresh `backfill` to catch it up.

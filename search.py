@@ -17,8 +17,8 @@ from datetime import datetime
 
 # The store + shared config live in the core module (SSOT). Search is core now
 # (ADR 0003): its deps are no longer an optional extra.
-from clync import (DEFAULT_TOPK, PG_BIN, VALID_SOURCES, connect_pg,
-                   ensure_cluster, _vector_control_present)
+from clync import (DEFAULT_TOPK, PG_BIN, RAW_SOURCES, VALID_SOURCES, connect_pg,
+                   ensure_cluster, sql_statements, _vector_control_present)
 
 EMBED_MODEL = "BAAI/bge-m3"
 DENSE_DIM = 1024
@@ -92,9 +92,8 @@ def ensure_index_schema() -> None:
             con.execute("DROP TABLE IF EXISTS chunks")
             con.execute("DROP TABLE IF EXISTS indexed_convs")
             con.execute("DROP TABLE IF EXISTS indexed_units")
-        for stmt in (s.strip() for s in INDEX_SCHEMA.split(";")):
-            if stmt:
-                con.execute(stmt)
+        for stmt in sql_statements(INDEX_SCHEMA):
+            con.execute(stmt)
         con.commit()
 
 
@@ -305,6 +304,13 @@ def _validate_facets(source: str, *, project, model, repo, worktree, branch) -> 
         raise ValueError(f"source must be one of {VALID_SOURCES}, got {source!r}")
     cc_facets = {"repo": repo, "worktree": worktree, "branch": branch}
     ai_facets = {"project": project, "model": model}
+    if source == "dream":
+        # Dream units carry NO raw-source facets, so any of them silently matches
+        # nothing. Fail loud rather than return a confusing empty result.
+        bad = [k for k, v in {**cc_facets, **ai_facets}.items() if v]
+        if bad:
+            raise ValueError(f"facet(s) {bad} do not apply to source='dream' "
+                             f"(derived knowledge has no repo/project facets)")
     if source == "claude_ai":
         bad = [k for k, v in cc_facets.items() if v]
         if bad:
@@ -329,6 +335,10 @@ def _facet_where(source, project, model, repo, worktree, branch, session,
 
     if source and source != "all":
         add("source = %(source)s", source=source)
+    else:
+        # 'all' == raw only (clync.VALID_SOURCES): derived dream units never leak
+        # into an unqualified search, so the dig can't read its own output.
+        add("source = ANY(%(raw_sources)s)", raw_sources=list(RAW_SOURCES))
     if project == "any":
         add("project_uuid IS NOT NULL")
     elif project == "none":

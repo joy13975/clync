@@ -3,6 +3,7 @@
 Read-only query layer over the contained Postgres store that `clync sync`
 populates (claude.ai chats + local Claude Code sessions + project docs — ADR
 0003). `search_history` is one faceted hybrid-search endpoint across both sources;
+`recall_knowledge` is the dream-first surface over the DISTILLED layer (ADR 0004);
 `get_conversation` returns a full transcript by unit id. Registered with:
 
     claude mcp add --scope user clync -- \
@@ -64,6 +65,46 @@ def search_history(
             f"  {snippet}"
         )
     return "\n".join(out)
+
+
+@mcp.tool()
+def recall_knowledge(query: str = "", topic: str | None = None,
+                     limit: int = DEFAULT_TOPK, as_of: str | None = None,
+                     include_evidence: bool = False) -> str:
+    """Dream-first recall: the user's own DISTILLED knowledge on a topic — what they
+    THINK, not just where they said it. Use this (not `search_history`) when the ask
+    is "what do I think about X" / "what's my position on X" / "summarize my
+    knowledge on X"; keep `search_history` for "where did I discuss X".
+
+    Output is tiered, never one blended ranking:
+      - COVERAGE: explicit gaps — topics never dug, or with raw activity newer than
+        the last dig. Always stated; a thin digest presented as complete is worse
+        than an honest "not distilled yet".
+      - DIGEST: the topic's current synthesized position, if one has been written.
+      - INSIGHTS: atomic claims with stance (e.g. user_asserted vs claude_proposed)
+        and citation count; pass include_evidence=True to also print the quoted
+        source text backing each one.
+      - RAW: a small drill-down of raw transcript hits, clearly separated from the
+        distilled tiers above.
+
+    topic: restrict to one topic id (see `clync dream topics` for ids); omitted =>
+      best-effort match from the query.
+    as_of: ISO date — reads the bi-temporal history, i.e. the position(s) held AT
+      that date rather than the current ones.
+    """
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        result = dream.recall(con, query, topic_id=topic, limit=limit, as_of=as_of,
+                              include_evidence=include_evidence)
+    except ValueError as e:
+        return f"Invalid query: {e}"
+    finally:
+        con.close()
+
+    return "\n".join(dream.format_recall(
+        result, requested_topic=topic, include_evidence=include_evidence))
 
 
 @mcp.tool()

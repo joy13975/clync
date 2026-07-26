@@ -69,7 +69,12 @@ AUTH_COOKIE_NAMES = ("sessionKey", "cf_clearance")
 REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate-limited
 DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
 # SSOT for the `source` facet values (CLI argparse choices + search validation).
-VALID_SOURCES = ("all", "claude_ai", "claude_code")
+# `all` deliberately means RAW ONLY (claude_ai + claude_code). The Dream layer
+# (ADR 0004) is reachable via source='dream' or the dream-first `recall_knowledge`
+# surface, never by accident: that keeps every pre-existing query's meaning intact
+# AND makes non-circularity the default — the dig cannot retrieve its own output.
+VALID_SOURCES = ("all", "claude_ai", "claude_code", "dream")
+RAW_SOURCES = ("claude_ai", "claude_code")
 
 REPO_DIR = Path(__file__).resolve().parent
 LAUNCHD_LABEL = "io.clync.sync"
@@ -450,6 +455,17 @@ def connect_pg():
     return con
 
 
+def sql_statements(script: str):
+    """Split a DDL script into individual statements (psycopg runs one per execute).
+
+    Line comments are stripped FIRST: a `;` inside a `-- comment` is prose, not a
+    statement terminator, and splitting naively on `;` turns the comment's tail
+    into a bare statement and a syntax error. SSOT for both schema scripts
+    (`RAW_SCHEMA` here, `search.INDEX_SCHEMA`)."""
+    stripped = "\n".join(line.split("--", 1)[0] for line in script.splitlines())
+    return [s for s in (stmt.strip() for stmt in stripped.split(";")) if s]
+
+
 def ensure_cluster() -> None:
     """Idempotent: initdb (if absent) -> start -> create db + extensions + raw
     schema. Also ensures the search index schema so a single call fully provisions
@@ -473,12 +489,14 @@ def ensure_cluster() -> None:
                         "-d", "postgres", "-c", f'CREATE DATABASE "{PG_DB}"'],
                        check=True, capture_output=True)
     with connect_pg() as con:
-        for stmt in (s.strip() for s in RAW_SCHEMA.split(";")):
-            if stmt:
-                con.execute(stmt)       # psycopg runs one statement per execute
+        for stmt in sql_statements(RAW_SCHEMA):
+            con.execute(stmt)
         con.commit()
+    # Each derived layer owns its own tables + their stale-shape guard.
     import search
-    search.ensure_index_schema()        # chunks/indexed_units (search owns dims)
+    search.ensure_index_schema()        # chunks/indexed_units (search owns the dims)
+    import dream
+    dream.ensure_dream_schema()         # dream_* (dream owns the stance vocabularies)
 
 
 def connect():
@@ -1013,7 +1031,29 @@ def cmd_scheduled(args) -> int:
                "Mac was likely asleep/off. Synced now.")
     if err:
         raise err
-    print("[scheduled] ok")
+    # The nightly dream pass runs INSIDE this job, immediately after sync+index,
+    # rather than as a second launchd job at a later hour: the dig is only as good
+    # as the index it queries, and sequencing it here makes that ordering true by
+    # construction instead of depending on the sync having finished by some
+    # guessed-at second wake time. A sync failure above already raised, so the
+    # index is current whenever this line is reached.
+    import dream
+    con = connect()
+    try:
+        report = dream.run_incremental(con)
+    except dream.DreamThrottled as e:
+        # Expected and resumable: the subscription's limit is a fact of the
+        # substrate, not a defect. State is in dream_queue; the next run continues.
+        notify("warn", "clync dream throttled", str(e))
+        print(f"[scheduled] sync ok; dream throttled: {e}")
+        return 0
+    except Exception as e:
+        notify("fail", "clync dream failed", str(e))
+        raise
+    finally:
+        con.close()
+    print(f"[scheduled] ok; dream calls={report['calls']} "
+          f"changed={report['changed']} topics={report['topics_touched']}")
     return 0
 
 
@@ -1051,6 +1091,136 @@ def cmd_list(args) -> int:
     return 0
 
 
+def cmd_dream_topics(args) -> int:
+    """List dream topics: id, status, active insight count, digest presence, last dig."""
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        if args.seed:
+            n = dream.seed_topics(con)
+            print(f"seeded {n} new topic(s)")
+        st = dream.status(con)
+    finally:
+        con.close()
+    rows = st["topics"] if args.all else [r for r in st["topics"] if r["status"] == "active"]
+    if not rows:
+        print("(no topics)")
+    for r in rows:
+        print(f"{r['topic_id']:<28} {r['status']:<10} active={r['active']:<4} "
+              f"digest={'yes' if r['digest'] else 'no':<3} last_dig_at={r['last_dig_at']}")
+    return 0
+
+
+def cmd_dream_run(args) -> int:
+    """Run the incremental (nightly-shaped) dream pass and print the report."""
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        report = dream.run_incremental(con, max_calls=args.max_calls)
+    finally:
+        con.close()
+    _print_dream_report(report)
+    return 0
+
+
+def cmd_dream_backfill(args) -> int:
+    """Run the explicit bulk backfill pass and print the report."""
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        report = dream.run_backfill(con, topic_id=args.topic, max_calls=args.max_calls)
+    finally:
+        con.close()
+    _print_dream_report(report)
+    return 0
+
+
+def _print_dream_report(report: dict) -> int:
+    print(f"mode        : {report['mode']}")
+    if "changed" in report:
+        print(f"changed     : {report['changed']} unit(s) since watermark")
+    if report.get("topics_touched"):
+        print(f"topics      : {', '.join(report['topics_touched'])}")
+    if "queued" in report:
+        print(f"queued      : {report['queued']} (topic, unit) assignment(s) for digging")
+    for tid, digs in report.get("digs", {}).items():
+        for d in (digs if isinstance(digs, list) else [digs]):
+            written = ", ".join(f"{k}={v}" for k, v in d["written"].items()) or "(none)"
+            print(f"  dig[{tid}] units={d['units']} candidates={d['candidates']} "
+                  f"rejected(grounding={d['rejected_grounding']}, "
+                  f"falsify={d['rejected_falsify']}, substance={d['rejected_substance']}) "
+                  f"written={{{written}}}")
+            # The REASONS, not just the count: a high reject rate is information about
+            # charter and prompt quality, and it is useless as a bare number.
+            for r in d.get("rejections", []):
+                print(f"      - {r}")
+    if report.get("consolidated"):
+        print(f"consolidated: {', '.join(report['consolidated'])}")
+    print(f"calls       : {report['calls']}")
+    if report.get("stopped_early"):
+        print(f"stopped_early: {report['stopped_early']}")
+    # A night that digs nothing is normal (topics batch up across nights) — but it
+    # must SAY what is waiting, so "cheap" is never mistaken for "stuck".
+    for d in report.get("deferred", []):
+        print(f"  deferred[{d['topic_id']}] pending={d['pending']} "
+              f"oldest={d['oldest']} (digs at {dream_thresholds()})")
+    if report.get("note"):
+        print(f"note        : {report['note']}")
+    return 0
+
+
+def dream_thresholds() -> str:
+    import dream
+    return (f">={dream.DIG_MIN_UNITS} units or >{dream.DIG_MAX_DEFER_DAYS}d old")
+
+
+def cmd_dream_recall(args) -> int:
+    """Dream-first recall: tiered coverage / digest / insights / raw output."""
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        result = dream.recall(con, args.query, topic_id=args.topic, limit=args.limit,
+                              as_of=args.as_of, include_evidence=args.evidence)
+    finally:
+        con.close()
+    print("\n".join(dream.format_recall(result, requested_topic=args.topic,
+                                        include_evidence=args.evidence)))
+    return 0
+
+
+def cmd_dream_status(args) -> int:
+    """Watermark, topic table, and usage totals for the dream layer."""
+    import dream
+    ensure_cluster()
+    con = connect()
+    try:
+        st = dream.status(con)
+    finally:
+        con.close()
+    print(f"watermark : {st['watermark']}")
+    print("\ntopics:")
+    for r in st["topics"]:
+        print(f"  {r['topic_id']:<28} {r['status']:<10} active={r['active']:<4} "
+              f"superseded={r['superseded']:<4} contested={r['contested']:<4} "
+              f"digest={'yes' if r['digest'] else 'no':<3} last_dig_at={r['last_dig_at']}")
+    print("\nusage by kind:")
+    for r in st["usage"]["by_kind"]:
+        print(f"  {r['kind']:<10} calls={r['calls']:<4} input={r['input_tokens']:<8} "
+              f"output={r['output_tokens']:<8} cache_read={r['cache_read']:<8} "
+              f"cache_create={r['cache_create']}")
+    print("\npending (triaged, awaiting a dig):")
+    for r in st["pending"]:
+        print(f"  {r['topic_id']:<28} pending={r['n']:<4} oldest={r['oldest']}")
+    if not st["pending"]:
+        print("  (none)")
+    print(f"\nfailed queue items: {st['usage']['failed']}")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """Health check: store cluster + counts, search index, MCP, launchd."""
     problems: list[str] = []
@@ -1080,6 +1250,8 @@ def cmd_doctor(args) -> int:
             nfile = _n("SELECT COUNT(*) n FROM files")
             ndl = _n("SELECT COUNT(*) n FROM files WHERE local_path IS NOT NULL")
             last = get_meta(con, "last_success")
+            import dream
+            dst = dream.status(con)
         finally:
             con.close()
         print(f"store       : {PG_DB}@localhost:{PG_PORT}\n"
@@ -1091,6 +1263,19 @@ def cmd_doctor(args) -> int:
             if gap > timedelta(hours=LATE_THRESHOLD_H):
                 problems.append(f"last claude.ai sync was {gap.total_seconds()/3600:.0f}h "
                                 f"ago (> {LATE_THRESHOLD_H}h) — scheduler may not be running.")
+
+        import dream
+        con = connect()
+        try:
+            dst = dream.status(con)
+        finally:
+            con.close()
+        n_active_topics = sum(1 for r in dst["topics"] if r["status"] == "active")
+        n_active_insights = sum(r["active"] for r in dst["topics"])
+        n_digests = sum(1 for r in dst["topics"] if r["digest"])
+        print(f"dream       : {n_active_topics} active topic(s), {n_active_insights} "
+              f"active insight(s), {n_digests} digest(s), "
+              f"{dst['usage']['failed']} failed queue item(s)")
 
     try:
         import mcp_server  # noqa: F401 — self-test that deps resolve + server builds
@@ -1232,6 +1417,19 @@ def cmd_setup(args) -> int:
           f"indexed reindexed_units={stats['reindexed_units']} "
           f"chunks={stats['chunks']}")
 
+    # The Dream layer distils only what `dream_topics` says to distil, so an unseeded
+    # install has a layer that silently does nothing. Seeding is free (no model calls)
+    # and idempotent; mining history is the explicit, costly step the user opts into.
+    import dream
+    con = connect()
+    try:
+        seeded = dream.seed_topics(con)
+    finally:
+        con.close()
+    print(f"✓ dream layer: schema ready, {seeded} topic(s) seeded "
+          f"(nightly pass runs inside the daily job; run `clync dream backfill` "
+          f"to mine existing history — that one spends real quota)")
+
     print("\nSetup complete. Open a NEW Claude Code session to load the MCP tools "
           "+ skill. Reverse anytime with `clync unsetup`.")
     return 0
@@ -1354,6 +1552,36 @@ def main() -> int:
 
     sub.add_parser("doctor", help="health check store / index / launchd / MCP"
                    ).set_defaults(func=cmd_doctor)
+
+    dp = sub.add_parser("dream", help="knowledge-distillation layer (ADR 0004)")
+    dsub = dp.add_subparsers(dest="dream_action", required=True)
+
+    sp = dsub.add_parser("topics", help="list dream topics")
+    sp.add_argument("--seed", action="store_true", help="insert the seed topics first")
+    sp.add_argument("--all", action="store_true", help="include non-active topics")
+    sp.set_defaults(func=cmd_dream_topics)
+
+    sp = dsub.add_parser("run", help="incremental (nightly-shaped) dream pass")
+    sp.add_argument("--max-calls", type=int, default=None,
+                    dest="max_calls", help="cap model calls this run (default: no cap)")
+    sp.set_defaults(func=cmd_dream_run)
+
+    sp = dsub.add_parser("backfill", help="explicit bulk backfill pass (spends real quota)")
+    sp.add_argument("--topic", help="restrict to one topic id (default: all topics)")
+    sp.add_argument("--max-calls", type=int, default=30, dest="max_calls",
+                    help="cap model calls this run (default: 30)")
+    sp.set_defaults(func=cmd_dream_backfill)
+
+    sp = dsub.add_parser("recall", help="dream-first recall: digest -> insights -> raw")
+    sp.add_argument("query", nargs="?", default="", help="natural-language query")
+    sp.add_argument("--topic", help="restrict to one topic id")
+    sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)
+    sp.add_argument("--as-of", dest="as_of", help="ISO date — positions held at that date")
+    sp.add_argument("--evidence", action="store_true", help="also print cited quotes")
+    sp.set_defaults(func=cmd_dream_recall)
+
+    dsub.add_parser("status", help="watermark, topic table, usage totals"
+                    ).set_defaults(func=cmd_dream_status)
 
     sp = sub.add_parser("setup", parents=[cred],
                         help="one-shot install: deps, CLI, MCP, scheduler, skill")
