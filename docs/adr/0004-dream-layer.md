@@ -285,9 +285,17 @@ substantive reasoning.
 #### Bulk (explicit, one-time-ish) — `dream backfill`
 
 The *deep slate*: unrestricted `sort=relevance` retrieval per probe query, minus
-units already in the topic's evidence set, walked in batches until the topic's
+units already in the topic's ATTEMPT record (`dream_attempted`, written the
+moment a batch is handed to the distiller), walked in batches until the topic's
 candidate pool is exhausted. Never runs on the nightly schedule. Invoked
-deliberately, capped by `--max-calls`, resumable from `dream_queue`.
+deliberately, capped by `--max-calls`, resumable from `dream_attempted`.
+
+Progress deliberately derives from the **attempt**, never from what survived the
+gates: the gates reject whole batches by design (10 of 14, 7 of 27 measured), so
+inferring "already mined" from `dream_evidence` re-selected every fully-rejected
+batch at the same rank and re-dug it until the budget expired. The same record
+sets `dream_topics.last_dig_at`, so recall's coverage tier reports "never been
+dug" only when that is literally true.
 
 `dream backfill` is also the right tool after adding a new topic or materially
 rewriting a charter — those are the only recurring reasons to re-sweep history.
@@ -441,6 +449,13 @@ CREATE TABLE dream_pending (             -- triaged, awaiting a dig (see D9)
     queued_at timestamptz NOT NULL,
     PRIMARY KEY (topic_id, unit_id)
 );
+
+CREATE TABLE dream_attempted (           -- the ATTEMPT record (see D4, bulk mode)
+    topic_id  text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
+    unit_id   text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
+    dug_at    timestamptz NOT NULL,
+    PRIMARY KEY (topic_id, unit_id)
+);
 ```
 
 `dream_pending` is what makes the nightly pass both cheap and lossless: an
@@ -586,7 +601,7 @@ is duplicated — the ADR 0003 boundary holds.
   gate (mechanical), falsification (adversarial), stance (no false attribution),
   and no recursion (no amplification) — but not eliminated. Retraction is a
   first-class state for this reason.
-- **The store's schema grows** by four tables and two enum values. Accepted:
+- **The store's schema grows** by five tables and two enum values. Accepted:
   the alternative is a parallel text store and a second retrieval path.
 - **Ongoing subscription consumption is near-negligible.** ~3–8 calls a night in
   steady state; one call on a quiet day. The one-time bulk dream is the only
@@ -594,15 +609,16 @@ is duplicated — the ADR 0003 boundary holds.
 
 ## Open questions (need a decision before implementation)
 
-1. **Insight granularity.** Target ~50 or ~500 insights per topic? Drives whether
-   a rendered digest stays readable and whether falsify's held-insight listing stays
-   cheap (it is shown every held claim for the topic, so this is the term that grows).
-2. **cc sessions are noisy.** A large share are mechanical (fix CI, rerun tests)
+1. **cc sessions are noisy.** A large share are mechanical (fix CI, rerun tests)
    and carry no durable knowledge. Is batched skeleton triage enough to drop them,
    or should there be a cheap pre-filter before triage even sees them?
-3. **Bulk timing.** Ration the first `dream backfill` across nights, or drive it
+2. **Bulk timing.** Ration the first `dream backfill` across nights, or drive it
    in one attended session? (Recommend: one topic end-to-end first, to validate
    prompt and gate quality on real output before committing all six.)
 
 **Resolved:** digest shape — fixed structured sections (D2). Nightly cost — the
 incremental/bulk mode split (D4, D9); nightly must never re-sweep history.
+Insight granularity / falsify's held-insight listing — the listing is bounded to
+`FALSIFY_HELD_MAX` held insights nearest the candidates by dense similarity (the
+vectors the index already holds), so per-dig cost no longer grows with the
+topic's total insight count.

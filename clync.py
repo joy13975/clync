@@ -1124,6 +1124,7 @@ def cmd_scheduled(args) -> int:
 
 def cmd_search(args) -> int:
     import search
+    ensure_cluster()                  # command entry provisions; hybrid_search does not
     results = search.hybrid_search(
         args.query, topk=args.limit, source=args.source, project=args.project,
         model=args.model, repo=args.repo, worktree=args.worktree, branch=args.branch,

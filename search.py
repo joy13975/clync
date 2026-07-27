@@ -303,34 +303,52 @@ def build_index(full: bool = False) -> dict:
 # --------------------------------------------------------------------------- #
 # Faceted hybrid search
 # --------------------------------------------------------------------------- #
-def _validate_facets(source: str, *, project, model, repo, worktree, branch) -> None:
-    """Fail loud on a facet that contradicts the chosen source (ADR 0003)."""
+# Every source-specific facet the WHERE builder understands, mapped to the ONE raw
+# source whose units can satisfy it. This registry is the SSOT read by BOTH
+# `_validate_facets` and `_facet_where` (they take the same `facets` dict), so a
+# facet added to the WHERE builder cannot be silently un-guarded: an unregistered
+# key fails loud on the first call instead of validating and then ANDing an
+# unsatisfiable predicate into an empty, confident "no matches". (`session` was
+# exactly that hole: it reached the WHERE builder but not the hand-enumerated
+# guard, so source='dream' + session=... returned nothing with no error.)
+FACET_SOURCES = {
+    "repo": "claude_code", "worktree": "claude_code", "branch": "claude_code",
+    "session": "claude_code",
+    "project": "claude_ai", "model": "claude_ai",
+}
+
+
+def _check_registered(facets: dict) -> None:
+    unknown = sorted(set(facets) - set(FACET_SOURCES))
+    if unknown:
+        raise ValueError(f"facet(s) {unknown} are not registered in FACET_SOURCES — "
+                         f"register each with the source whose units carry it")
+
+
+def _validate_facets(source: str, facets: dict) -> None:
+    """Fail loud on a facet that contradicts the chosen source (ADR 0003).
+    `facets` must carry EVERY key in `FACET_SOURCES` (see the registry note)."""
     resolve_sources(source)   # raises on an unknown source (the value-set SSOT)
-    cc_facets = {"repo": repo, "worktree": worktree, "branch": branch}
-    ai_facets = {"project": project, "model": model}
+    _check_registered(facets)
     if source == "dream":
         # Dream units carry NO raw-source facets, so any of them silently matches
         # nothing. Fail loud rather than return a confusing empty result.
-        bad = [k for k, v in {**cc_facets, **ai_facets}.items() if v]
+        bad = [k for k, v in facets.items() if v]
         if bad:
             raise ValueError(f"facet(s) {bad} do not apply to source='dream' "
                              f"(derived knowledge has no repo/project facets)")
-    if source == "claude_ai":
-        bad = [k for k, v in cc_facets.items() if v]
+    elif source in ("claude_ai", "claude_code"):
+        bad = [k for k, v in facets.items() if v and FACET_SOURCES[k] != source]
         if bad:
-            raise ValueError(f"facet(s) {bad} apply only to Claude Code sessions, "
-                             f"not source='claude_ai'")
-    if source == "claude_code":
-        bad = [k for k, v in ai_facets.items() if v]
-        if bad:
-            raise ValueError(f"facet(s) {bad} apply only to claude.ai chats, "
-                             f"not source='claude_code'")
+            raise ValueError(f"facet(s) {bad} apply only to source="
+                             f"'{FACET_SOURCES[bad[0]]}', not source='{source}'")
 
 
-def _facet_where(source, project, model, repo, worktree, branch, session,
-                 since, until, params: dict) -> str:
+def _facet_where(source, facets: dict, since, until, params: dict) -> str:
     """Build the shared WHERE fragment (on `chunks`) from the given facets, filling
-    `params`. Returns '' or 'WHERE ...'."""
+    `params`. Returns '' or 'WHERE ...'. Rejects a facet key that is not in
+    `FACET_SOURCES` — the registry both guards read (same dict, same keys)."""
+    _check_registered(facets)
     conds = []
 
     def add(cond: str, **kw):
@@ -341,23 +359,24 @@ def _facet_where(source, project, model, repo, worktree, branch, session,
     # policy (cmd_list shares it): derived dream units never leak into an
     # unqualified search, so the dig can't read its own output.
     add("source = ANY(%(sources)s)", sources=resolve_sources(source))
+    project = facets.get("project")
     if project == "any":
         add("project_uuid IS NOT NULL")
     elif project == "none":
         add("project_uuid IS NULL AND kind = 'chat'")
     elif project:
         add("(project_name = %(project)s OR project_uuid = %(project)s)", project=project)
-    if model:
-        add("model = %(model)s", model=model)
-    if repo:
-        add("repo = %(repo)s", repo=repo)
-    if worktree:
-        add("worktree = %(worktree)s", worktree=worktree)
-    if branch:
-        add("git_branch = %(branch)s", branch=branch)
-    if session:
+    if facets.get("model"):
+        add("model = %(model)s", model=facets["model"])
+    if facets.get("repo"):
+        add("repo = %(repo)s", repo=facets["repo"])
+    if facets.get("worktree"):
+        add("worktree = %(worktree)s", worktree=facets["worktree"])
+    if facets.get("branch"):
+        add("git_branch = %(branch)s", branch=facets["branch"])
+    if facets.get("session"):
         add("(unit_id = %(session)s OR title ILIKE %(session_like)s)",
-            session=session, session_like=f"%{session}%")
+            session=facets["session"], session_like=f"%{facets['session']}%")
     if since:
         add("updated_at >= %(since)s", since=since)
     if until:
@@ -394,12 +413,12 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     Read-only, and deliberately does NOT provision the store: provisioning takes
     DDL locks, and a read that takes DDL locks deadlocks against its own caller's
     open transaction. Callers provision once at command entry."""
-    _validate_facets(source, project=project, model=model, repo=repo,
-                     worktree=worktree, branch=branch)
+    facets = {"project": project, "model": model, "repo": repo,
+              "worktree": worktree, "branch": branch, "session": session}
+    _validate_facets(source, facets)
 
     if not query.strip() or sort == "recency":
-        return _browse(topk, source, project, model, repo, worktree, branch,
-                       session, since, until, query=query)
+        return _browse(topk, source, facets, since, until, query=query)
 
     (qd,), (qs,) = _embed([query], max_length=512)
     qlang = _lang(query)
@@ -410,8 +429,7 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     params: dict = {"qd": _dense_literal(qd), "qlang": qlang}
     if lang:
         params["lang"] = lang
-    where = _facet_where(source, project, model, repo, worktree, branch, session,
-                         since, until, params)
+    where = _facet_where(source, facets, since, until, params)
     if lang:
         where = (where + (" AND " if where else "WHERE ") + "lang = %(lang)s")
 
@@ -449,13 +467,11 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     return results[:topk]
 
 
-def _browse(topk, source, project, model, repo, worktree, branch, session,
-            since, until, *, query: str) -> list[dict]:
+def _browse(topk, source, facets: dict, since, until, *, query: str) -> list[dict]:
     """Metadata browse: units matching the facets, newest first (no content
     vector). Backs the empty-query and sort='recency' modes."""
     params: dict = {}
-    where = _facet_where(source, project, model, repo, worktree, branch, session,
-                         since, until, params)
+    where = _facet_where(source, facets, since, until, params)
     # For recency-sorted content queries we still narrow by lexical title match if a
     # query was given, but ranking is purely recency here.
     if query.strip():

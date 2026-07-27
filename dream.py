@@ -98,6 +98,14 @@ MAX_EXPANSIONS = 6               # ranges the dreamer may request per round
 # `candidates` runs one hybrid search per probe query, and every dig may propose
 # more while nothing ever removed any: a live topic reached 49 from 5 seeds.
 PROBE_QUERIES_MAX = 20
+# falsify prefills the topic's held insights (dedup + reconcile need them), and a
+# well-backfilled topic can hold hundreds (ADR 0004 contemplates ~500) — unbounded,
+# the prompt grows monotonically until the context limit makes the topic
+# permanently un-diggable by ANY code path. So the listing is bounded to the held
+# insights NEAREST the candidates (dense similarity over the vectors the index
+# already holds): those are the only ones a restate/refine/contradict decision can
+# be about, so the cap costs discrimination nothing where it matters.
+FALSIFY_HELD_MAX = 40
 MAX_NAV_ROUNDS = 1               # rounds of requested expansion per dig
 # Nightly digs are batched ACROSS nights. Measured on the real corpus: six changed
 # units triaged into four topics, and digging every flagged topic immediately cost
@@ -108,8 +116,7 @@ MAX_NAV_ROUNDS = 1               # rounds of requested expansion per dig
 WATERMARK_KEY = "dream_last_run_at"   # meta key: high-water mark of the nightly pass
 DIG_MIN_UNITS = 3                # dig a topic once this many units are pending...
 DIG_MAX_DEFER_DAYS = 7           # ...or this long since its oldest pending unit
-QUOTE_MATCH_CHARS = 60           # prefix of a quote that must appear verbatim
-QUOTE_MIN_CHARS = 25             # ...and the minimum that can identify a message
+QUOTE_MIN_CHARS = 25             # minimum quote length that can identify a message
 # Relevance floor for the recall insight tier, on BGE-M3 dense cosine similarity
 # (RRF scores are rank-only and always return topk rows, so they cannot express
 # "nothing matches"). Calibrated 2026-07-26 on the live store's dream units:
@@ -170,7 +177,8 @@ CREATE TABLE IF NOT EXISTS dream_evidence (
     -- searchable, and `dream recall --evidence` went on reprinting verbatim text from
     -- the conversation that was deleted. An insight whose grounding no longer exists
     -- cannot be re-checked by the gate that produced it, so its evidence goes with
-    -- the source; `support_count` is re-derived from the surviving rows.
+    -- the source; `reconcile_evidence` re-derives support_count from the surviving
+    -- rows and removes insights left with none.
     src_unit_id text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
     src_msg_id  text NOT NULL,
     quote       text NOT NULL,
@@ -203,6 +211,20 @@ CREATE TABLE IF NOT EXISTS dream_pending (
     queued_at timestamptz NOT NULL,
     PRIMARY KEY (topic_id, unit_id)
 );
+
+-- The ATTEMPT record: every (topic, unit) pair ever handed to the distiller,
+-- written at the moment of handoff — NOT derived from what survived the gates.
+-- Progress and coverage must derive from the attempt: the gates reject heavily
+-- by design (10 of 14, 7 of 27 measured), so "no insight survived" is an
+-- ordinary outcome, and inferring "never mined" from dream_evidence made
+-- backfill re-dig the same fully-rejected batch until the budget expired, while
+-- recall's coverage tier called a dug topic "never been dug".
+CREATE TABLE IF NOT EXISTS dream_attempted (
+    topic_id  text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
+    unit_id   text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
+    dug_at    timestamptz NOT NULL,
+    PRIMARY KEY (topic_id, unit_id)
+);
 """
 
 # The column set `dream_insights` must have. A mismatch means the shipped schema
@@ -230,7 +252,8 @@ def _declared_cols(table: str) -> set[str]:
 
 # The shapes the guard checks. `dream_topics` is deliberately absent: it is
 # hand-edited config, never rebuilt.
-_GUARDED_TABLES = ("dream_insights", "dream_evidence", "dream_pending")
+_GUARDED_TABLES = ("dream_insights", "dream_evidence", "dream_pending",
+                   "dream_attempted")
 
 
 def ensure_dream_schema(*, rebuild: bool = False) -> None:
@@ -262,6 +285,11 @@ def ensure_dream_schema(*, rebuild: bool = False) -> None:
             con.execute("DROP TABLE IF EXISTS dream_evidence")
             con.execute("DROP TABLE IF EXISTS dream_insights")
             con.execute("DROP TABLE IF EXISTS dream_pending")
+            con.execute("DROP TABLE IF EXISTS dream_attempted")
+            # last_dig_at is derived progress state (it is set with the attempt
+            # record), so it goes with the attempts: keeping it would make
+            # coverage say "dug at T" about a layer whose digs were just erased.
+            con.execute("UPDATE dream_topics SET last_dig_at=NULL")
             # The watermark goes too. Keeping it would leave the nightly pass looking
             # at only units changed since a rebuild that threw everything away — so
             # the wiped history would never be re-mined, and the run would report
@@ -808,7 +836,8 @@ _DISTILL_SYSTEM = (
     "RULES\n"
     "1. One claim per insight. A statement that needs 'and' is usually two insights.\n"
     "2. Every insight MUST cite evidence: the short `ref` label of the message it came "
-    "from — the token inside that message's [e<N> sender] marker, e.g. \"e7\" — plus a "
+    "from — the token inside that message's [<slot>#<index> sender] marker, e.g. "
+    "\"a#1042\" from a marker [a#1042 user] — plus a "
     "quote copied VERBATIM from that same message, character for character, no "
     "paraphrasing, no ellipsis, no cleanup. Use only labels that appear in the "
     "transcripts below. If you cannot cite a real label, DROP the insight — never "
@@ -886,12 +915,14 @@ def _distill_prompt(topic: dict, bodies: str, n: int, *, held: list[dict],
             + (("ALREADY CAPTURED in this dig (do not repeat these):\n"
                 + "\n".join(f"  - {c['statement']}" for c in held) + "\n\n")
                if held else "")
-            + "Distill this topic's durable knowledge from the windows above. Cite "
-              "each insight with the `ref` label of the message it came from (the "
-              "token in its [<slot>#<index> sender] marker) plus a verbatim quote "
-              "from that same message. Suggest any search phrases that would have "
-              "found this material but are not obvious from the topic name. Request "
-              "further passages only where a window genuinely cuts off what you need.")
+            # The citation-ref format is stated ONCE, in the system prompt (rule 2)
+            # — a restatement here already drifted from it once ("e7" vs "a#1042"),
+            # and the higher-authority wrong copy cost genuinely-grounded insights.
+            + "Distill this topic's durable knowledge from the windows above, citing "
+              "each insight as the RULES require. Suggest any search phrases that "
+              "would have found this material but are not obvious from the topic "
+              "name. Request further passages only where a window genuinely cuts "
+              "off what you need.")
 
 
 def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
@@ -903,7 +934,13 @@ def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
     around that position. The distiller may ask to read further ranges; code fulfils
     the request and re-invokes with the wider rendering, up to `MAX_NAV_ROUNDS`. The
     insights from each round are KEPT and unioned — a round is an addition, not a
-    do-over, so nothing already paid for is thrown away.
+    do-over, so nothing already paid for is thrown away. The refmap is unioned the
+    same way: a later round's rendering is NOT a superset of an earlier one (the
+    per-range budget is spent nearest-first over the MERGED range, so a wide
+    expansion can push a round-0 message out of round 1), and a ref is a pure rule
+    (slot+index -> (unit_id, msg_id)) so the union is always consistent. Replacing
+    the map each round made `ground` reject already-paid round-0 insights as
+    "fabricated citation" when their message fell out of the final rendering.
 
     Also folds back any probe queries the distiller proposes, so vocabulary the seed
     queries missed sharpens the NEXT dig's retrieval.
@@ -917,7 +954,8 @@ def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
     found: list[dict] = []
     refmap: dict[str, tuple[str, str]] = {}
     for round_no in range(MAX_NAV_ROUNDS + 1):
-        bodies, refmap, slots = render_windows(con, seeds, expansions)
+        bodies, round_refmap, slots = render_windows(con, seeds, expansions)
+        refmap.update(round_refmap)
         note = ("The passages you requested are now included below.\n\n"
                 if round_no else "")
         out = _call(con, "distill",
@@ -979,10 +1017,12 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
       * the `ref` label must be one the distiller was actually shown (`refmap`);
       * the message it resolves to must EXIST and belong to a RAW source — citing a
         dream unit would make the layer circular;
-      * the quote's first `QUOTE_MATCH_CHARS` must occur in that message under
-        case-folding and whitespace collapse — a substring test, not byte equality,
-        so "verbatim" here means "the model did not paraphrase", not "identical
-        bytes";
+      * the WHOLE quote must occur in that message under case-folding and
+        whitespace collapse — a substring test, not byte equality, so "verbatim"
+        here means "the model did not paraphrase", not "identical bytes". The
+        whole quote, never a prefix: the full text is what gets stored, shown to
+        the falsifier and printed as evidence, and a prefix check would let a
+        genuine opening carry an invented continuation through every gate;
       * and it must be at least `QUOTE_MIN_CHARS` long, or it identifies no
         particular message and grounds nothing.
     Every citation must resolve. A candidate with one bad reference is not partly
@@ -1004,7 +1044,8 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
                 f"for {candidate['statement'][:60]!r}")
         src_unit_id, src_msg_id = refmap[ref]
         row = con.execute(
-            f"SELECT {_TEXT} AS t, m.sender, u.source "
+            f"SELECT {_TEXT} AS t, m.sender, u.source, "
+            "coalesce(m.created_at, u.created_at) AS authored_at "
             "FROM messages m JOIN units u USING(unit_id) "
             "WHERE m.unit_id=%s AND m.msg_id=%s",
             (src_unit_id, src_msg_id)).fetchone()
@@ -1016,9 +1057,18 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
             raise DreamError(
                 f"citation points at a non-raw unit (source={row['source']}) — the "
                 f"dig must never read derived text")
+        if row["authored_at"] is None:
+            # Rejected HERE (a per-candidate gate outcome), not deep in persist:
+            # evidence with no authoring time — neither on the message nor on its
+            # unit — cannot be placed on the bi-temporal timeline, and the
+            # chronology/supersession machinery must never see it.
+            raise DreamError(
+                f"citation ({src_unit_id}, {src_msg_id}) carries no authoring time "
+                f"(message and unit created_at both NULL) — cannot be placed on "
+                f"the bi-temporal timeline for {candidate['statement'][:60]!r}")
         e = {"src_unit_id": src_unit_id, "src_msg_id": src_msg_id,
              "quote": raw["quote"], "sender": row["sender"]}
-        needle = _norm(e["quote"])[:QUOTE_MATCH_CHARS]
+        needle = _norm(e["quote"])
         # A minimum, not just a cap. Any real message contains "postgres" or "cache",
         # so a two-word "quote" would ground an arbitrary claim while printing under
         # --evidence as if it proved it. Short quotes are rejected, not silently
@@ -1113,6 +1163,35 @@ _FALSIFY_SCHEMA = {
 }
 
 
+def _held_for_falsify(con, topic: dict, candidates: list[dict]) -> list[dict]:
+    """The topic's active insights to show the falsifier, BOUNDED at
+    `FALSIFY_HELD_MAX` (see the constant). Past the cap, the kept insights are the
+    ones nearest any candidate statement by dense similarity — computed over the
+    vectors `build_index` already wrote for each insight's unit. An insight
+    persisted so recently it has no chunk yet (this run indexes at the END) cannot
+    be ranked, so it is KEPT, never silently dropped: it is the likeliest duplicate
+    target for material mined moments apart. Order (valid_from) is preserved either
+    way, so the `[hN]` labels stay stable within one call."""
+    held = con.execute(
+        "SELECT unit_id, statement, stance, valid_from FROM dream_insights "
+        "WHERE topic_id=%s AND status=%s ORDER BY valid_from",
+        (topic["topic_id"], STATUS_ACTIVE)).fetchall()
+    if len(held) <= FALSIFY_HELD_MAX:
+        return held
+    import search
+    dense, _ = search._embed([c["statement"] for c in candidates], max_length=512)
+    sims: dict[str, float] = {}
+    for lit in (search._dense_literal(d) for d in dense):
+        for r in con.execute(
+                "SELECT unit_id, max(1 - (dense <=> %s::vector)) AS sim FROM chunks "
+                "WHERE unit_id = ANY(%s) GROUP BY unit_id",
+                (lit, [h["unit_id"] for h in held])).fetchall():
+            sims[r["unit_id"]] = max(sims.get(r["unit_id"], -1.0), float(r["sim"]))
+    ranked = sorted(held, key=lambda h: -sims.get(h["unit_id"], float("inf")))
+    keep = {h["unit_id"] for h in ranked[:FALSIFY_HELD_MAX]}
+    return [h for h in held if h["unit_id"] in keep]
+
+
 def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = None
             ) -> list[dict]:
     """Batched adversarial pass AND the reconcile decision, in one call. Returns the
@@ -1138,10 +1217,7 @@ def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = 
     and a bare reject COUNT throws it away."""
     if not candidates:
         return []
-    held = con.execute(
-        "SELECT unit_id, statement, stance, valid_from FROM dream_insights "
-        "WHERE topic_id=%s AND status=%s ORDER BY valid_from",
-        (topic["topic_id"], STATUS_ACTIVE)).fetchall()
+    held = _held_for_falsify(con, topic, candidates)
     # The held-since date is shown so the model is not judging recency blind —
     # `contradict` asserts "this one is the current view", which is a temporal claim
     # (persist still gates chronology mechanically; this improves the input).
@@ -1217,15 +1293,30 @@ def _evidence_sig(evidence: list[dict]) -> str:
 
 def _evidence_span(con, evidence: list[dict]) -> tuple[datetime, datetime]:
     """When the cited material was AUTHORED — the insight's real temporal extent
-    (distinct from when we happened to derive it)."""
+    (distinct from when we happened to derive it).
+
+    A message with no timestamp falls back EXPLICITLY to its unit's `created_at`
+    (project docs are written with a NULL message timestamp on real sync paths) —
+    that is still an authoring-time fact. It must never fall back to wall-clock
+    now(): the span feeds the chronology gate and the supersession close, and
+    `now` is the MOST PERMISSIVE value that gate can see, so a timestamp-less
+    source would silently supersede the genuinely current position. Evidence with
+    no authoring time at all cannot be placed on the bi-temporal timeline: raise."""
     rows = con.execute(
-        "SELECT min(m.created_at) AS lo, max(m.created_at) AS hi FROM messages m "
+        "SELECT min(coalesce(m.created_at, u.created_at)) AS lo, "
+        "       max(coalesce(m.created_at, u.created_at)) AS hi, "
+        "       array_agg(p.u || '/' || p.g) FILTER "
+        "         (WHERE m.created_at IS NULL AND u.created_at IS NULL) AS untimed "
+        "FROM messages m JOIN units u USING(unit_id) "
         "JOIN unnest(%s::text[], %s::text[]) AS p(u, g) "
         "  ON m.unit_id = p.u AND m.msg_id = p.g",
         ([e["src_unit_id"] for e in evidence],
          [e["src_msg_id"] for e in evidence])).fetchone()
-    now = datetime.now(timezone.utc)
-    return (rows["lo"] or now), (rows["hi"] or now)
+    if rows["untimed"] or rows["lo"] is None:
+        raise DreamError(
+            "evidence with no authoring time cannot be placed on the bi-temporal "
+            f"timeline (src_unit_id/src_msg_id: {rows['untimed'] or 'no rows matched'})")
+    return rows["lo"], rows["hi"]
 
 
 def _write_unit(con, unit_id: str, kind: str, title: str, body: str,
@@ -1357,6 +1448,39 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
     return stats
 
 
+def reconcile_evidence(con) -> dict:
+    """Re-derive every insight's liveness and `support_count` from its SURVIVING
+    evidence rows. Returns {"removed": n, "recounted": n}.
+
+    Deleting a source unit cascades its `dream_evidence` rows away (the DDL's
+    contract), but the insight row, its `units` entry and its index chunks know
+    nothing of it — left alone, a claim with NO grounding stays active, ranked and
+    printed as "[stance, N source(s)]" with the N overstated. This is the ONE owner
+    of that re-derivation, and it runs at every boundary that reads or extends the
+    derived layer (`recall`, `run_incremental`, `run_backfill`), so the stale state
+    cannot be observed there.
+
+    An insight whose evidence set became EMPTY is deleted outright (the `units` row
+    cascades the insight row — they are one object): with zero surviving citations
+    the claim cannot be re-checked by the gate that produced it and has nothing
+    behind it, and its source went away because the USER deleted it — keeping the
+    derived claim would outlive the deletion it derives from. `build_index` drops
+    the deleted unit's chunks on its next run (the `gone` path)."""
+    orphans = [r["unit_id"] for r in con.execute(
+        "SELECT i.unit_id FROM dream_insights i WHERE NOT EXISTS "
+        "(SELECT 1 FROM dream_evidence e WHERE e.unit_id = i.unit_id)").fetchall()]
+    for uid in orphans:
+        con.execute("DELETE FROM units WHERE unit_id=%s", (uid,))
+    recounted = con.execute(
+        "UPDATE dream_insights i SET support_count = c.n "
+        "FROM (SELECT unit_id, count(DISTINCT src_unit_id) AS n "
+        "      FROM dream_evidence GROUP BY unit_id) c "
+        "WHERE c.unit_id = i.unit_id AND i.support_count <> c.n "
+        "RETURNING i.unit_id").fetchall()
+    con.commit()
+    return {"removed": len(orphans), "recounted": len(recounted)}
+
+
 # --------------------------------------------------------------------------- #
 # The dig — retrieval-driven, over the WHOLE corpus (no lookback window)
 # --------------------------------------------------------------------------- #
@@ -1365,6 +1489,37 @@ def cited_units(con, topic_id: str) -> set[str]:
     return {r["src_unit_id"] for r in con.execute(
         "SELECT DISTINCT e.src_unit_id FROM dream_evidence e "
         "JOIN dream_insights i USING(unit_id) WHERE i.topic_id=%s",
+        (topic_id,)).fetchall()}
+
+
+def record_attempt(con, topic_id: str, unit_ids: list[str]) -> None:
+    """Record the ATTEMPT: these units are being handed to the distiller for this
+    topic, NOW — regardless of what the gates later reject. This is the ONE place
+    progress is written (the attempt rows AND `last_dig_at` move together), and
+    every consumer of "already mined / when was this dug" reads it: `run_backfill`'s
+    exclusion set, `recall`'s coverage tier, the resumability contract. Deriving
+    either from `dream_evidence` conflates *mined* with *yielded* — the gates
+    reject whole batches by design, and a fully-rejected batch must still count as
+    dug or it is re-bought forever. Committed before the model call: the quota is
+    about to be spent whether or not the call succeeds. An EMPTY batch records
+    nothing — no units were handed over, so no attempt happened."""
+    if not unit_ids:
+        return
+    for unit_id in unit_ids:
+        con.execute(
+            "INSERT INTO dream_attempted (topic_id, unit_id, dug_at) "
+            "VALUES (%s,%s,%s) ON CONFLICT (topic_id, unit_id) "
+            "DO UPDATE SET dug_at=EXCLUDED.dug_at", (topic_id, unit_id, _now()))
+    con.execute("UPDATE dream_topics SET last_dig_at=%s WHERE topic_id=%s",
+                (_now(), topic_id))
+    con.commit()
+
+
+def attempted_units(con, topic_id: str) -> set[str]:
+    """Source units already handed to the distiller for this topic — the attempt
+    record, independent of whether any insight survived the gates."""
+    return {r["unit_id"] for r in con.execute(
+        "SELECT unit_id FROM dream_attempted WHERE topic_id=%s",
         (topic_id,)).fetchall()}
 
 
@@ -1442,6 +1597,7 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
     report = {"units": len(seeds), "candidates": 0, "rejected_grounding": 0,
               "rejected_falsify": 0, "rejected_substance": 0, "written": {},
               "rejections": [], "notes": []}
+    record_attempt(con, topic["topic_id"], [s["unit_id"] for s in seeds])
     raw, refmap = distill(con, topic, seeds, report["notes"])
     report["candidates"] = len(raw)
     if not raw:
@@ -1482,9 +1638,6 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
             report["rejections"].append(f"substance: {s['statement'][:70]}")
 
     report["written"] = persist(con, topic, final)
-    con.execute("UPDATE dream_topics SET last_dig_at=%s WHERE topic_id=%s",
-                (_now(), topic["topic_id"]))
-    con.commit()
     return report
 
 
@@ -1605,6 +1758,9 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
                 f"got {as_of!r}") from e
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise DreamError(f"limit must be a positive integer, got {limit!r}")
+    # Source deletions since the last run may have cascaded evidence away; recall
+    # must never present an ungrounded claim or an overstated support_count.
+    reconcile_evidence(con)
     topic = get_topic(con, topic_id) if topic_id else None
 
     # --- insight tier: semantic retrieval restricted to dream units, then ranked
@@ -1905,6 +2061,9 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     run reports that `dream backfill` is what mines history."""
     budget = _Budget(max_calls)
     calls_before = _calls_made(con)
+    # Yesterday's source deletions must be reconciled before tonight's digs read
+    # the held insights (falsify's dedup input) or write beside stale rows.
+    reconcile_evidence(con)
     # The new watermark is snapshotted BEFORE selection, and it is what every
     # success path writes. Writing end-of-run _now() instead would open a window
     # the length of the pass (minutes of Opus calls): a unit synced in between
@@ -1996,12 +2155,18 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
 def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
     """The bulk pass — EXPLICIT only, never scheduled. Walks the deep slate:
     unrestricted relevance retrieval per probe query, minus units this topic has
-    already drawn evidence from, in batches until the budget runs out.
+    already ATTEMPTED (plus any cited before the attempt record existed), in
+    batches until the budget runs out.
 
-    Resumable by construction: progress lives in `dream_evidence` (which units are
-    already mined), so the next invocation continues where this one stopped."""
+    Resumable by construction: progress lives in `dream_attempted` (written the
+    moment a batch is handed to the distiller — see `record_attempt`), so the next
+    invocation continues where this one stopped. It must NOT live in
+    `dream_evidence`: that records what survived the gates, and a fully-rejected
+    batch (ordinary — the gates reject heavily by design) would be re-selected at
+    the same rank and re-dug on every invocation, forever."""
     budget = _Budget(max_calls)
     calls_before = _calls_made(con)
+    reconcile_evidence(con)          # same boundary duty as run_incremental's
     report: dict = {"mode": "backfill", "digs": {}, "calls": 0,
                     "stopped_early": None}
     targets = [get_topic(con, topic_id)] if topic_id else topics(con)
@@ -2012,7 +2177,7 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
                 if not budget.take(3):
                     report["stopped_early"] = "max-calls reached"
                     break
-                mined = cited_units(con, t["topic_id"])
+                mined = attempted_units(con, t["topic_id"]) | cited_units(con, t["topic_id"])
                 batch = candidates(con, t, exclude=mined, limit=DIG_BATCH_UNITS)
                 if not batch:
                     break               # this topic's candidate pool is exhausted

@@ -1216,6 +1216,233 @@ def test_a_run_that_wrote_nothing_does_not_index(store, pg_test_db, mock_embed):
 
 
 # --------------------------------------------------------------------------- #
+# Progress derives from the ATTEMPT, never from surviving gate output
+# --------------------------------------------------------------------------- #
+_EMPTY_DISTILL = {"insights": [], "probe_queries_to_add": [], "read_requests": []}
+
+
+def test_a_fully_rejected_dig_still_records_the_attempt(store, stub_worker,
+                                                        pg_test_db, mock_embed):
+    """An empty insight list is an explicitly valid worker answer, and the gates
+    reject whole batches by design — yet a dig that yielded nothing used to leave
+    no trace: no last_dig_at (so coverage said "never been dug") and no exclusion
+    record (so backfill re-bought the same batch forever)."""
+    t = dream.get_topic(store, "t1")
+    stub_worker.append(_EMPTY_DISTILL)
+    dream.dig(store, t, [{"unit_id": "u1", "msg_idx": 0}])
+    assert dream.attempted_units(store, "t1") == {"u1"}
+    assert dream.get_topic(store, "t1")["last_dig_at"] is not None
+    cov = dream.recall(store, "", topic_id="t1")["coverage"]
+    assert not any("never been dug" in c for c in cov)
+    assert any("no insights" in c for c in cov)   # honest, and distinct from undug
+
+
+def test_backfill_excludes_attempted_units_so_a_rejected_batch_is_never_rebought(
+        store, stub_worker, pg_test_db, mock_embed):
+    """The re-dig loop: `candidates` is deterministic for a fixed index, so
+    excluding only CITED units re-selected a fully-rejected batch at the same rank
+    and re-dug it with the identical prompt until the budget expired."""
+    stub_worker.append(_EMPTY_DISTILL)
+    r = dream.run_backfill(store, topic_id="t1", max_calls=30)
+    assert not stub_worker, "the same batch was dug more than once"
+    assert len(r["digs"]["t1"]) == 1
+    assert r["stopped_early"] is None             # pool exhausted, not budget
+    assert dream.attempted_units(store, "t1") == {"u1"}
+    # a later invocation resumes past the attempted unit at zero model calls
+    r2 = dream.run_backfill(store, topic_id="t1", max_calls=30)
+    assert r2["digs"] == {} and r2["calls"] == 0
+
+
+def test_an_empty_seed_batch_records_no_attempt(store):
+    dream.record_attempt(store, "t1", [])
+    assert dream.attempted_units(store, "t1") == set()
+    assert dream.get_topic(store, "t1")["last_dig_at"] is None
+
+
+def test_a_derived_schema_rebuild_erases_the_progress_record_too(store):
+    """last_dig_at is derived progress state (written with the attempt record);
+    surviving a rebuild would make coverage claim digs that were just erased."""
+    dream.record_attempt(store, "t1", ["u1"])
+    store.execute("ALTER TABLE dream_insights ADD COLUMN legacy int")
+    store.commit()
+    dream.ensure_dream_schema(rebuild=True)
+    assert dream.attempted_units(store, "t1") == set()
+    assert dream.get_topic(store, "t1")["last_dig_at"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Evidence loss — support and liveness re-derived from the surviving rows
+# --------------------------------------------------------------------------- #
+def test_evidence_loss_recounts_support_and_removes_ungrounded_insights(store):
+    """Deleting a source unit cascades its evidence rows, but the insight, its
+    units row and its index entry knew nothing of it: the claim stayed active with
+    an overstated 'N source(s)'. reconcile_evidence is the one owner of the
+    re-derivation, and recall runs it, so the stale state is unobservable there."""
+    first = _persist_one(store)
+    _add_units(store, 1, start=90)                       # u90, a second source
+    c2 = _candidate(evidence=[{"ref": "e9",
+                               "quote": "Fix bugs at the layer that should have prevented"}])
+    c2["_evidence"] = dream.ground(store, c2, {**REFMAP, "e9": ("u90", "m1")})
+    c2.update({"action": "reinforce", "target_id": first["unit_id"]})
+    dream.persist(store, dream.get_topic(store, "t1"), [c2])
+    assert store.execute("SELECT support_count FROM dream_insights"
+                         ).fetchone()["support_count"] == 2
+
+    store.execute("DELETE FROM units WHERE unit_id='u90'")   # as sync does
+    store.commit()
+    assert dream.reconcile_evidence(store) == {"removed": 0, "recounted": 1}
+    assert store.execute("SELECT support_count FROM dream_insights"
+                         ).fetchone()["support_count"] == 1
+
+    store.execute("DELETE FROM units WHERE unit_id='u1'")    # the last grounding
+    store.commit()
+    r = dream.recall(store, "", topic_id="t1")               # recall reconciles
+    assert r["insights"] == [] and r["digest"] == []
+    assert store.execute("SELECT count(*) n FROM units WHERE unit_id=%s",
+                         (first["unit_id"],)).fetchone()["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Quote verification — every stored/displayed evidence byte was matched
+# --------------------------------------------------------------------------- #
+def test_ground_rejects_a_genuine_prefix_with_an_invented_continuation(store):
+    """Only the first 60 normalized chars used to be verified while the FULL quote
+    was stored, shown to the falsifier and printed as verbatim evidence — so a
+    genuine opening could carry an invented continuation through every gate."""
+    c = _candidate(evidence=[{
+        "ref": "a#0",
+        "quote": "Fix bugs at the layer that should have prevented them. "
+                 "Always add a compensating fallback afterwards."}])
+    with pytest.raises(dream.DreamError, match="not found verbatim"):
+        dream.ground(store, c, REFMAP)
+
+
+# --------------------------------------------------------------------------- #
+# Evidence authoring time — explicit fallback to the unit, never wall-clock now
+# --------------------------------------------------------------------------- #
+def test_evidence_authoring_time_falls_back_to_the_unit_never_the_clock(store):
+    """Project docs are written with NULL message timestamps on real sync paths.
+    Substituting now() fed the chronology gate its MOST PERMISSIVE value, letting
+    a timestamp-less source supersede the genuinely current position."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,created_at,"
+                  "msg_count,synced_at) VALUES ('ud','project_doc','claude_ai',"
+                  "'doc','2026-02-01',1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+                  "VALUES ('ud','m1',0,'project_doc',"
+                  "'A durable documented position on layered bug fixing.',NULL)")
+    store.commit()
+    c = _candidate(stance="co_derived", evidence=[{
+        "ref": "d#0",
+        "quote": "A durable documented position on layered bug fixing."}])
+    ev = dream.ground(store, c, {"d#0": ("ud", "m1")})
+    lo, hi = dream._evidence_span(store, ev)
+    assert lo.date().isoformat() == "2026-02-01" and hi == lo
+
+
+def test_evidence_with_no_authoring_time_at_all_is_rejected_not_defaulted(store):
+    store.execute("INSERT INTO units (unit_id,kind,source,title,msg_count,synced_at)"
+                  " VALUES ('un','chat','claude_ai','untimed',1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+                  "VALUES ('un','m1',0,'human',"
+                  "'An untimestamped but quotable position statement.',NULL)")
+    store.commit()
+    c = _candidate(stance="co_derived", evidence=[{
+        "ref": "n#0", "quote": "An untimestamped but quotable position statement."}])
+    with pytest.raises(dream.DreamError, match="no authoring time"):
+        dream.ground(store, c, {"n#0": ("un", "m1")})
+    # and the span computation refuses too (backstop for any other caller)
+    with pytest.raises(dream.DreamError, match="bi-temporal"):
+        dream._evidence_span(store, [{"src_unit_id": "un", "src_msg_id": "m1",
+                                      "quote": "x"}])
+
+
+# --------------------------------------------------------------------------- #
+# Navigation — the refmap is a union across rounds, like the insights
+# --------------------------------------------------------------------------- #
+def test_distill_unions_refmaps_across_rounds(store, stub_worker, monkeypatch):
+    """Round 1's rendering is NOT a superset of round 0's (the per-range budget is
+    spent nearest-first over the MERGED range), so replacing the refmap each round
+    made ground() reject already-paid round-0 insights as 'fabricated citation'
+    when their message fell out of the final rendering."""
+    maps = [{"a#0": ("u1", "m1")}, {"a#5": ("u1", "m2")}]   # round 1 lost a#0
+    calls: list[int] = []
+
+    def fake_render(con, seeds, expansions=None):
+        m = maps[len(calls)]
+        calls.append(1)
+        return "body", dict(m), {"a": "u1"}
+
+    monkeypatch.setattr(dream, "render_windows", fake_render)
+    round0 = _candidate()                                    # cites a#0
+    stub_worker += [
+        {"insights": [round0], "probe_queries_to_add": [],
+         "read_requests": [{"slot": "a", "from_idx": 0, "to_idx": 3, "why": "w"}]},
+        _EMPTY_DISTILL,
+    ]
+    t = dream.get_topic(store, "t1")
+    found, refmap = dream.distill(store, t, [{"unit_id": "u1", "msg_idx": 0}])
+    assert set(refmap) == {"a#0", "a#5"}
+    assert len(dream.ground(store, found[0], refmap)) == 1   # round-0 pay kept
+
+
+# --------------------------------------------------------------------------- #
+# Prompts — the citation-ref format is stated once and matches the renderer
+# --------------------------------------------------------------------------- #
+def test_distill_system_prompt_teaches_the_refs_the_renderer_emits(store):
+    """The system prompt once taught [e<N>]/'e7' while the renderer emitted
+    a#1042 — two contradicting instructions in one call, the wrong one carrying
+    the DROP-the-insight consequence. The worked example must be a ref ground()
+    could actually resolve, and the format must appear ONCE (system prompt only)."""
+    import re
+    _, refmap, _ = dream.render_windows(store, [{"unit_id": "u1", "msg_idx": 0}])
+    ref_shape = re.compile(r"^[a-z]#\d+$")
+    assert all(ref_shape.match(r) for r in refmap)
+    example = re.search(r'e\.g\.\s+"([^"]+)"', dream._DISTILL_SYSTEM)
+    assert example and ref_shape.match(example.group(1)), (
+        "the system prompt's worked example is not a ref the renderer emits")
+    assert "[<slot>#<index> sender]" in dream._DISTILL_SYSTEM
+    user_prompt = dream._distill_prompt({"name": "n", "charter": "c"}, "b", 1, held=[])
+    assert "#<index>" not in user_prompt and "e<N>" not in user_prompt
+
+
+# --------------------------------------------------------------------------- #
+# falsify — the held-insight listing is bounded (nearest first), never the world
+# --------------------------------------------------------------------------- #
+def _insert_insight(store, uid, statement, when="2026-01-01"):
+    from datetime import datetime, timezone
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    dream._write_unit(store, uid, dream.KIND_INSIGHT, statement, statement, ts, ts)
+    store.execute(
+        "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
+        "support_count,contested,valid_from,first_seen_at,last_seen_at,"
+        "distilled_at,model,evidence_sig) VALUES "
+        "(%s,'t1',%s,'user_asserted','active',1,false,%s,%s,%s,%s,'opus','sig')",
+        (uid, statement, when, when, when, when))
+    store.commit()
+
+
+def test_falsify_held_listing_is_bounded_to_the_insights_nearest_the_candidates(
+        store, monkeypatch, pg_test_db, mock_embed):
+    """Unbounded, the listing grew monotonically with the topic's insight count
+    until the context limit made the topic permanently un-diggable. Bounded to
+    the held insights nearest the candidates, the restate/refine/contradict
+    decision keeps exactly the rows it can be about."""
+    monkeypatch.setattr(dream, "FALSIFY_HELD_MAX", 5)
+    for i in range(7):
+        _insert_insight(store, f"dream-far{i}",
+                        f"Knitting sweaters requires wool tension number {i}.")
+    _insert_insight(store, "dream-near", "Fix bugs at the preventing layer.")
+    _reindex()
+    t = dream.get_topic(store, "t1")
+    held = dream._held_for_falsify(store, t, [_candidate()])
+    assert len(held) == 5
+    assert "dream-near" in {h["unit_id"] for h in held}
+    # under the cap, everything is shown — the bound only trims, never reorders
+    monkeypatch.setattr(dream, "FALSIFY_HELD_MAX", 50)
+    assert len(dream._held_for_falsify(store, t, [_candidate()])) == 8
+
+
+# --------------------------------------------------------------------------- #
 # Real model — the one test that spends quota
 # --------------------------------------------------------------------------- #
 @pytest.mark.slow

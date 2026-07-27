@@ -49,6 +49,7 @@ def search_history(
     rejected loudly.
     """
     import search
+    ensure_cluster()      # tool entry provisions (hybrid_search deliberately doesn't)
     try:
         results = search.hybrid_search(
             query, topk=limit, source=source, project=project, model=model,

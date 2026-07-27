@@ -100,19 +100,43 @@ def test_lang_detection():
     assert search._lang("你好世界") == "zh"
 
 
+def _facets(**over):
+    f = dict.fromkeys(search.FACET_SOURCES)
+    f.update(over)
+    return f
+
+
 def test_validate_facets_rejects_source_mismatch():
     with pytest.raises(ValueError):
-        search._validate_facets("claude_ai", project=None, model=None,
-                                repo="clync", worktree=None, branch=None)
+        search._validate_facets("claude_ai", _facets(repo="clync"))
     with pytest.raises(ValueError):
-        search._validate_facets("claude_code", project="Work", model=None,
-                                repo=None, worktree=None, branch=None)
+        search._validate_facets("claude_code", _facets(project="Work"))
     with pytest.raises(ValueError):
-        search._validate_facets("bogus", project=None, model=None,
-                                repo=None, worktree=None, branch=None)
+        search._validate_facets("bogus", _facets())
     # a valid combination does not raise
-    search._validate_facets("claude_code", project=None, model=None,
-                            repo="clync", worktree=None, branch="main")
+    search._validate_facets("claude_code", _facets(repo="clync", branch="main"))
+
+
+def test_validate_facets_covers_every_facet_the_where_builder_knows():
+    """The regression: `session` reached the WHERE builder but not the
+    hand-enumerated guard, so source='dream' + session=... (and claude_ai +
+    session=...) validated fine and then ANDed an unsatisfiable predicate —
+    a silent, confident empty result. The guard and the builder now read ONE
+    registry, so every registered facet is guarded for every source."""
+    with pytest.raises(ValueError, match="session"):
+        search._validate_facets("dream", _facets(session="clync-main"))
+    with pytest.raises(ValueError, match="session"):
+        search._validate_facets("claude_ai", _facets(session="clync-main"))
+    search._validate_facets("claude_code", _facets(session="clync-main"))
+
+
+def test_an_unregistered_facet_fails_loud_in_guard_and_builder():
+    """A facet added to the WHERE builder without registering it in FACET_SOURCES
+    must fail on the first call, never silently skip validation."""
+    with pytest.raises(ValueError, match="not registered"):
+        search._validate_facets("all", _facets(sprocket="x"))
+    with pytest.raises(ValueError, match="not registered"):
+        search._facet_where("all", _facets(sprocket="x"), None, None, {})
 
 
 def test_pg_db_name_rejects_injection_at_import():
