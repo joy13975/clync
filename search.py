@@ -405,18 +405,32 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
                   branch: str | None = None, session: str | None = None,
                   since: str | None = None, until: str | None = None,
                   sort: str = "relevance", lang: str | None = None,
-                  collapse_units: bool = True) -> list[dict]:
+                  exclude_attempted: str | None = None,
+                  min_dense_sim: float | None = None) -> list[dict]:
     """Faceted hybrid search. With a `query`, ranks by fused dense+sparse RRF +
-    typed-metadata boost, collapsed to one best chunk per unit. With an EMPTY
-    query, degrades to a metadata browse (units matching the facets, newest first).
-    A facet contradicting `source` fails loud.
+    typed-metadata boost, collapsed to one best chunk per unit — rows ALWAYS
+    have unit semantics, so the `topk` budget spans DISTINCT units and can
+    never be consumed by one unit's chunks. With an
+    EMPTY query, degrades to a metadata browse (units matching the facets,
+    newest first). A facet contradicting `source` fails loud.
 
-    `collapse_units=False` keeps EVERY matched chunk instead of one per unit.
-    The dream dig's exclusion record is per transcript RANGE (a unit is mined
-    window by window, not wholesale), so its candidate selection must see every
-    hit position a unit matched at — collapsed retrieval structurally hides all
-    but the best one, which is how one dug window used to retire a whole
-    conversation. Search surfaces (CLI/MCP) keep the collapsed default.
+    `exclude_attempted` (a dream topic_id) is the dream dig's exclusion,
+    applied HERE — in the SQL WHERE, before the ANN shortlists and the topk
+    cut — because this boundary owns both the budget and the exclusion: a
+    chunk whose `msg_idx` falls inside one of the topic's already-rendered
+    `dream_attempted` ranges never occupies a shortlist or result slot, so
+    the collapsed row per unit is that unit's best UNREAD hit, and an empty
+    result genuinely means no unread hit anywhere. (The previous shape —
+    uncollapsed rows trimmed to topk chunks, then range-filtered in Python —
+    let one verbose unit consume the whole budget and made the backfill
+    misread a saturated window as an exhausted pool.) Positionless chunks
+    are excluded too: a hit that cannot be positioned cannot be dug.
+
+    `min_dense_sim` is the relevance floor, likewise applied in SQL before the
+    collapse and the cut: RRF scores are rank-only (topk rows always come back,
+    so they cannot express "nothing here matches"), and a below-floor chunk is
+    retrieval filler that must neither occupy a result slot nor keep its unit
+    in a dig pool. Filtering it in Python after the cut re-creates both.
 
     Read-only, and deliberately does NOT provision the store: provisioning takes
     DDL locks, and a read that takes DDL locks deadlocks against its own caller's
@@ -426,6 +440,10 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     _validate_facets(source, facets)
 
     if not query.strip() or sort == "recency":
+        if exclude_attempted or min_dense_sim is not None:
+            raise ValueError(
+                "exclude_attempted / min_dense_sim require a relevance-ranked "
+                "content query; browse mode has no hit positions or vectors")
         return _browse(topk, source, facets, since, until, query=query)
 
     (qd,), (qs,) = _embed([query], max_length=512)
@@ -440,6 +458,14 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
     where = _facet_where(source, facets, since, until, params)
     if lang:
         where = (where + (" AND " if where else "WHERE ") + "lang = %(lang)s")
+    if exclude_attempted:
+        params["xatopic"] = exclude_attempted
+        where = (where + (" AND " if where else "WHERE ")
+                 + "msg_idx IS NOT NULL AND NOT EXISTS ("
+                   "SELECT 1 FROM dream_attempted a "
+                   "WHERE a.topic_id = %(xatopic)s "
+                   "AND a.unit_id = chunks.unit_id "
+                   "AND chunks.msg_idx BETWEEN a.from_idx AND a.to_idx)")
 
     ctes = [f"""d AS (
         SELECT chunk_id, row_number() OVER (ORDER BY dense <=> %(qd)s::vector) rnk
@@ -466,11 +492,13 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
         FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)""")
     cols = ("unit_id, unit_name, source, lang, text,"
             " msg_idx, chunk_idx, score, dense_sim")
+    floor = ""
+    if min_dense_sim is not None:
+        params["minsim"] = min_dense_sim
+        floor = " WHERE dense_sim >= %(minsim)s"
     sql = ("WITH " + ",\n".join(ctes)
-           + (f"\nSELECT DISTINCT ON (unit_id) {cols}"
-              "\nFROM scored ORDER BY unit_id, score DESC"
-              if collapse_units else
-              f"\nSELECT {cols}\nFROM scored ORDER BY score DESC"))
+           + f"\nSELECT DISTINCT ON (unit_id) {cols}"
+             f"\nFROM scored{floor} ORDER BY unit_id, score DESC")
     with connect_pg() as pg:
         rows = pg.execute(sql, params).fetchall()
     results = [_row_to_result(r) for r in rows]

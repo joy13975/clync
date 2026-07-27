@@ -117,14 +117,18 @@ WATERMARK_KEY = "dream_last_run_at"   # meta key: high-water mark of the nightly
 DIG_MIN_UNITS = 3                # dig a topic once this many units are pending...
 DIG_MAX_DEFER_DAYS = 7           # ...or this long since its oldest pending unit
 QUOTE_MIN_CHARS = 25             # minimum quote length that can identify a message
-# Relevance floor for the recall insight tier, on BGE-M3 dense cosine similarity
-# (RRF scores are rank-only and always return topk rows, so they cannot express
-# "nothing matches"). Calibrated 2026-07-26 on the live store's dream units:
-# on-topic queries put their best hits at 0.51-0.63; off-topic probes top out at
-# 0.41 ("best way to knit a sweater") and 0.31 ("zucchini sourdough hydration").
-# Below the floor the tier is EMPTY and coverage says so — never a confident
-# list of unrelated claims.
-RECALL_MIN_SIM = 0.45
+# Relevance floor on BGE-M3 dense cosine similarity (RRF scores are rank-only
+# and always return topk rows, so they cannot express "nothing matches"),
+# applied by retrieval itself (`hybrid_search(min_dense_sim=...)`) for BOTH
+# dream consumers: the recall insight tier (below the floor the tier is EMPTY
+# and coverage says so — never a confident list of unrelated claims) and the
+# dig's candidate pool (below the floor a chunk is not a "hit", so it must not
+# keep its unit in the pool — without it the backfill would grind through
+# every unit's off-topic remainder before honestly reporting exhaustion).
+# Calibrated 2026-07-26 on the live store's dream units: on-topic queries put
+# their best hits at 0.51-0.63; off-topic probes top out at 0.41 ("best way to
+# knit a sweater") and 0.31 ("zucchini sourdough hydration").
+MIN_DENSE_SIM = 0.45
 
 
 class DreamError(RuntimeError):
@@ -1520,8 +1524,9 @@ def record_attempt(con, topic_id: str, ranges: list[tuple[str, int, int]]) -> No
     for this topic and the call has RETURNED — regardless of what the gates later
     reject. This is the ONE place progress is written (the attempt rows AND
     `last_dig_at` move together), and every consumer of "already mined / when was
-    this dug" derives from it: `candidates`' per-hit exclusion, `run_backfill`'s
-    resumability, `recall`'s coverage tier. Deriving any of them from
+    this dug" derives from it: retrieval's SQL-side per-hit exclusion
+    (`hybrid_search(exclude_attempted=...)`), `run_backfill`'s resumability,
+    `recall`'s coverage tier. Deriving any of them from
     `dream_evidence` conflates *mined* with *yielded* — the gates reject whole
     batches by design, and a fully-rejected batch must still count as read or it
     is re-bought forever.
@@ -1570,7 +1575,6 @@ def attempted_ranges(con, topic_id: str) -> dict[str, list[tuple[int, int]]]:
 
 
 def candidates(con, topic: dict, *, since: str | None = None,
-               attempted: dict[str, list[tuple[int, int]]] | None = None,
                limit: int = DIG_BATCH_UNITS, per_query: int = 10) -> list[dict]:
     """Candidate SEEDS for a topic, via the EXISTING hybrid index — the dig reuses
     `search.hybrid_search` rather than growing a second retrieval path.
@@ -1582,27 +1586,27 @@ def candidates(con, topic: dict, *, since: str | None = None,
     surfaced); the kept position is the one from that unit's BEST-scoring probe hit,
     because that is the passage the topic was most strongly found in.
 
-    `since` gives the fresh slate. `attempted` is the range record from
-    `attempted_ranges`: a hit whose position falls inside an already-rendered
-    range is skipped PER HIT, never per unit — so a long conversation dug at one
-    window is re-selected at its next unread on-topic position, and it leaves
-    the pool only once its recorded ranges cover its hits. That requires
-    retrieval to surface EVERY hit position (`collapse_units=False`): the search
-    surfaces' one-best-chunk-per-unit collapse would structurally hide every
-    position but the first, re-creating whole-unit retirement."""
+    `since` gives the fresh slate. The already-rendered-range exclusion lives in
+    RETRIEVAL (`exclude_attempted`, SQL-side against `dream_attempted`), not
+    here: retrieval owns both the topk budget and the exclusion, so each probe
+    query returns its topk best UNREAD hits — one per unit — and an empty union
+    means genuinely nothing unread anywhere. Exclusion is per RANGE, never per
+    unit: a long conversation dug at one window is re-selected at its next
+    unread on-topic position, and it leaves the pool only once its recorded
+    ranges cover its hits. A "hit" is a chunk at or above `MIN_DENSE_SIM`,
+    enforced on the same call: RRF ranks are rank-only, so without the floor
+    every unit would stay in the pool until its off-topic remainder was read
+    too. (Filtering the ranges here in Python, AFTER the topk cut — as this
+    function once did — let one verbose unit's chunks consume the whole budget
+    and turned a saturated retrieval window into a false "pool exhausted".)"""
     import search
-    attempted = attempted or {}
     total: dict[str, float] = {}
     best: dict[str, tuple[float, int]] = {}
     for q in topic["probe_queries"]:
         for r in search.hybrid_search(q, topk=per_query, source="all", since=since,
-                                      collapse_units=False):
+                                      exclude_attempted=topic["topic_id"],
+                                      min_dense_sim=MIN_DENSE_SIM):
             uid = r["unit_id"]
-            if r["msg_idx"] is None:
-                continue
-            if any(lo <= r["msg_idx"] <= hi
-                   for lo, hi in attempted.get(uid, ())):
-                continue
             total[uid] = total.get(uid, 0.0) + r["score"]
             if uid not in best or r["score"] > best[uid][0]:
                 best[uid] = (r["score"], r["msg_idx"])
@@ -1830,13 +1834,14 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
     no_match = False
     if query.strip():
         # RRF scores are rank-only (they cannot say "nothing here is relevant"),
-        # so the floor is on the dense cosine similarity hybrid_search now
-        # reports. Below the floor a hit is retrieval filler, and returning it
-        # as the user's position on the query is attribution pollution — the
-        # exact failure the stance machinery exists to prevent.
+        # so the floor is on dense cosine similarity, applied by retrieval
+        # itself BEFORE its topk cut (a below-floor row must not eat a slot).
+        # Below the floor a hit is retrieval filler, and returning it as the
+        # user's position on the query is attribution pollution — the exact
+        # failure the stance machinery exists to prevent.
         ids = [r["unit_id"] for r in
-               search.hybrid_search(query, topk=limit * 4, source=DREAM_SOURCE)
-               if (r.get("dense_sim") or 0.0) >= RECALL_MIN_SIM]
+               search.hybrid_search(query, topk=limit * 4, source=DREAM_SOURCE,
+                                    min_dense_sim=MIN_DENSE_SIM)]
         no_match = not ids
     where = ["i.status = %(status)s"] if not as_of else [
         # Window-only PLUS not-retracted: supersession always closes the window
@@ -2265,9 +2270,7 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
                 if not budget.take(3):
                     report["stopped_early"] = "max-calls reached"
                     break
-                batch = candidates(con, t,
-                                   attempted=attempted_ranges(con, t["topic_id"]),
-                                   limit=DIG_BATCH_UNITS)
+                batch = candidates(con, t, limit=DIG_BATCH_UNITS)
                 if not batch:
                     break               # this topic's candidate pool is exhausted
                 rounds.append(dig(con, t, batch))

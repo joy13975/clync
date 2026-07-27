@@ -1282,8 +1282,11 @@ def _two_hit_unit(con, unit_id="wide", n=60, hits=(10, 50)):
     per-unit attempt record cannot represent. The two hit texts are distinct
     (identical texts embed identically, and the topk cut then breaks the tie
     arbitrarily) but both carry the probe's vocabulary."""
-    hit_text = {hits[0]: "root cause of the failure at the producer",
-                hits[1]: "the root cause lives where the contract is owned"}
+    # Texts stay ABOVE dream.MIN_DENSE_SIM under the hashed-BOW stub (short,
+    # query-dense); the routine turns share no query vocabulary and fall below
+    # it — which is what lets the unit retire once its genuine hits are covered.
+    hit_text = {hits[0]: "root cause of failure at producer",
+                hits[1]: "root cause lives where contract is owned"}
     con.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,msg_count,"
                 "synced_at) VALUES (%s,'cc_session','claude_code','wide',now(),%s,now())",
                 (unit_id, n))
@@ -1317,9 +1320,7 @@ def test_one_window_does_not_retire_a_units_other_on_topic_positions(
     dream.record_attempt(store, "t1",
                          [("wide", first - dream.WINDOW_BEFORE,
                            first + dream.WINDOW_AFTER)])
-    s1 = dream.candidates(store, t,
-                          attempted=dream.attempted_ranges(store, "t1"),
-                          per_query=2)
+    s1 = dream.candidates(store, t, per_query=2)
     other = 50 if first == 10 else 10
     assert [(s["unit_id"], s["msg_idx"]) for s in s1
             if s["unit_id"] == "wide"] == [("wide", other)]
@@ -1328,14 +1329,66 @@ def test_one_window_does_not_retire_a_units_other_on_topic_positions(
     dream.record_attempt(store, "t1",
                          [("wide", other - dream.WINDOW_BEFORE,
                            other + dream.WINDOW_AFTER)])
-    s2 = dream.candidates(store, t,
-                          attempted=dream.attempted_ranges(store, "t1"),
-                          per_query=2)
+    s2 = dream.candidates(store, t, per_query=2)
     assert all(s["unit_id"] != "wide" for s in s2), s2
 
     # ...and recall's coverage states the unrendered remainder from the record
     cov = dream.recall(store, "", topic_id="t1")["coverage"]
     assert any("retrieval windows only" in c for c in cov), cov
+
+
+def test_a_verbose_unit_cannot_monopolize_the_candidate_pool(
+        store, pg_test_db, mock_embed):
+    """Regression (review round 3): retrieval trimmed to topk CHUNKS before the
+    attempted-range exclusion ran in Python, so one long conversation that is
+    on-topic throughout occupied every slot — every other on-topic unit was
+    structurally unreachable, and once the top chunks all fell inside recorded
+    ranges the backfill misread its saturated window as an exhausted pool.
+    Exclusion now lives in retrieval's SQL WHERE and rows are collapsed to one
+    best UNREAD hit per unit BEFORE the cut, so topk spans distinct units and
+    an empty pool genuinely means no unread hit anywhere."""
+    con = store
+    n = 40
+    con.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,msg_count,"
+                "synced_at) VALUES ('verbose','cc_session','claude_code','verbose',"
+                "now(),%s,now())", (n,))
+    for i in range(n):    # on-topic at EVERY message
+        con.execute(
+            "INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+            "VALUES ('verbose',%s,%s,%s,%s,'2026-01-01')",
+            (f"m{i}", i, "user" if i % 2 == 0 else "assistant",
+             f"root cause discussion continues at turn {i}"))
+    shorts = {f"short{k}" for k in range(5)}
+    for k, uid in enumerate(sorted(shorts)):
+        con.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,"
+                    "msg_count,synced_at) VALUES (%s,'cc_session','claude_code',%s,"
+                    "now(),1,now())", (uid, uid))
+        con.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+                    "VALUES (%s,'m0',0,'user',%s,'2026-01-01')",
+                    (uid, f"root cause angle number {k}"))
+    con.commit()
+    _reindex()
+    t = dream.get_topic(store, "t1")
+
+    # one probe query's budget spans DISTINCT units, not one unit's chunks
+    s0 = dream.candidates(store, t, per_query=10, limit=10)
+    assert shorts | {"verbose", "u1"} <= {s["unit_id"] for s in s0}, s0
+
+    # hand-walk the backfill loop: the pool must not report exhausted while any
+    # unit still has an unread hit — every unit gets visited before it empties
+    seen: set[str] = set()
+    for _ in range(30):
+        batch = dream.candidates(store, t, per_query=10, limit=10)
+        if not batch:
+            break
+        for s in batch:
+            seen.add(s["unit_id"])
+            dream.record_attempt(store, "t1", [
+                (s["unit_id"], s["msg_idx"] - dream.WINDOW_BEFORE,
+                 s["msg_idx"] + dream.WINDOW_AFTER)])
+    else:
+        pytest.fail("candidate pool never drained")
+    assert shorts | {"verbose", "u1"} <= seen, seen
 
 
 def test_an_empty_rendering_records_no_attempt(store):
