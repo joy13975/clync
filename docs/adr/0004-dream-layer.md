@@ -16,6 +16,31 @@
     same held-insight list. A ripe topic costs 3 calls, down from 5.
   The cost model in D9 and the topic-status vocabulary in D3 were corrected by
   measurement during the original build; they describe what the code does.
+- **Revised 2026-07-28**, from a real `/clync` call that the layer could not answer:
+  - **A rebuild snapshots before it drops.** Insights cost model calls under a
+    rate-limited subscription, so "derived" does not mean "cheap to replace" the way
+    an embedding does. `clync migrate` now copies the dream tables to dated,
+    constraint-free `*_bakYYYYMMDD` tables (GC'd after 183 days) first. `CREATE TABLE
+    AS SELECT`, never a RENAME: a renamed table keeps its `ON DELETE CASCADE` keys
+    and would silently empty itself when a source conversation was deleted — a backup
+    that rots while looking present. Verified on the real store: a schema change that
+    would have destroyed 20 insights preserved all 20.
+  - **Every insight must state what it RULES OUT** (`dream_insights.rules_out`,
+    enforced mechanically in gate 3). A rule that forbids nothing is a truism, and a
+    truism is not a weaker insight — it is the wreckage of a real one. Measured cause:
+    the dreamer flattened "test the behaviour an invariant describes, never a
+    hardcoded value that merely restates config" into "encode design invariants as
+    tests", and the falsifier then correctly killed the flattened version for being
+    generic. The knowledge was lost at DISTILL time, so the gate belongs there.
+  - **Questions asked of the layer are logged and fed back** (`dream_queries`). A real
+    question is exogenous signal; probe queries otherwise grow only from what the
+    distiller proposes, a closed loop feeding on its own vocabulary. A question that
+    returned NO insight becomes a probe query on its derived topic, so the next dig
+    hunts it in the raw transcripts. The composed ANSWER is never stored as an
+    insight: it never passed the grounding gate, and storing it would make the layer
+    read its own output. The question decides where to dig; the evidence still decides
+    what is true. A question matching no topic is reported as a new-topic candidate —
+    the operator's call, not a silent insert.
 - **Date:** 2026-07-26 (revised 2026-07-27)
 - **Scope:** A third content layer in clync's store: *derived knowledge* distilled
   from the raw transcripts of both existing sources, plus the retrieval surface

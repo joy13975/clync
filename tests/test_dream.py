@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -80,7 +81,9 @@ REFMAP = {"a#0": ("u1", "m1"), "a#1": ("u1", "m2")}
 
 def _candidate(**over):
     c = {"statement": "Fix bugs at the layer that should have prevented them.",
-         "elaboration": "Root-cause rule.", "stance": "user_asserted",
+         "elaboration": "Root-cause rule.",
+         "rules_out": "patching the layer where the bug merely surfaced",
+         "stance": "user_asserted",
          "evidence": [{"ref": "a#0", "quote": "Fix bugs at the layer that should have prevented"}]}
     c.update(over)
     return c
@@ -451,13 +454,36 @@ def test_a_falsify_corrected_stance_is_rechecked_mechanically():
 # --------------------------------------------------------------------------- #
 # Gate 3 — substance
 # --------------------------------------------------------------------------- #
+def _sub(stance, **over):
+    c = {"stance": stance, "statement": "Fix bugs at the preventing layer.",
+         "rules_out": "patching where the bug merely surfaced"}
+    c.update(over)
+    return c
+
+
 def test_substance_gate_admits_a_single_source_only_when_user_asserted():
     one = [{"src_unit_id": "u1", "src_msg_id": "m1"}]
     two = [{"src_unit_id": "u1", "src_msg_id": "m1"},
            {"src_unit_id": "u2", "src_msg_id": "m9"}]
-    assert dream.passes_substance({"stance": "user_asserted"}, one)
-    assert not dream.passes_substance({"stance": "claude_proposed"}, one)
-    assert dream.passes_substance({"stance": "claude_proposed"}, two)
+    assert dream.passes_substance(_sub("user_asserted"), one)
+    assert not dream.passes_substance(_sub("claude_proposed"), one)
+    assert dream.passes_substance(_sub("claude_proposed"), two)
+
+
+def test_substance_gate_rejects_a_claim_that_forbids_nothing(store):
+    """A rule with no negative case is a truism, and a truism is not a weaker insight
+    — it is the wreckage of a real one. Measured cause: the dreamer flattened "test
+    the behaviour an invariant describes, never a hardcoded value that restates
+    config" into "encode design invariants as tests", and falsify then correctly
+    killed the flattened version for being generic. The sharp claim was lost at
+    DISTILL time, so the gate belongs on `rules_out`, mechanically."""
+    one = [{"src_unit_id": "u1", "src_msg_id": "m1"}]
+    assert not dream.passes_substance(_sub("user_asserted", rules_out=""), one)
+    assert not dream.passes_substance(_sub("user_asserted", rules_out="bad code"), one)
+    # Echoing the statement back names no wrong-way at all.
+    assert not dream.passes_substance(
+        _sub("user_asserted", rules_out="Fix bugs at the preventing layer."), one)
+    assert dream.passes_substance(_sub("user_asserted"), one)
 
 
 # --------------------------------------------------------------------------- #
@@ -598,9 +624,10 @@ def _held(con, statement="An existing claim.", unit_id="dream-held1"):
     con.execute("INSERT INTO units (unit_id,kind,source,title,synced_at) "
                 "VALUES (%s,%s,'dream',%s,now())", (unit_id, dream.KIND_INSIGHT, statement))
     con.execute(
-        "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
+        "INSERT INTO dream_insights (unit_id,topic_id,statement,rules_out,stance,status,"
         "support_count,contested,valid_from,first_seen_at,last_seen_at,distilled_at,"
-        "model,evidence_sig) VALUES (%s,'t1',%s,'user_asserted','active',1,false,"
+        "model,evidence_sig) VALUES (%s,'t1',%s,'rules out the lazy alternative',"
+        "'user_asserted','active',1,false,"
         "'2026-01-01','2026-01-01','2026-01-01','2026-01-01','opus','sig')",
         (unit_id, statement))
     con.commit()
@@ -1051,6 +1078,7 @@ def _triage_all(unit_ids, topic="t1"):
 def _distill_one(ref="a#0", statement="Fix bugs at the preventing layer."):
     """`ref` is a label render_windows() emitted: slot letter + message index."""
     return {"insights": [{"statement": statement, "elaboration": "e",
+                          "rules_out": "guessing instead of citing the transcript",
                           "stance": "user_asserted",
                           "evidence": [{"ref": ref, "quote": "Fix bugs at the layer that should have prevented"}]}],
             "probe_queries_to_add": [], "read_requests": []}
@@ -1549,10 +1577,11 @@ def _insert_insight(store, uid, statement, when="2026-01-01"):
     ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
     dream._write_unit(store, uid, dream.KIND_INSIGHT, statement, statement, ts, ts)
     store.execute(
-        "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
+        "INSERT INTO dream_insights (unit_id,topic_id,statement,rules_out,stance,status,"
         "support_count,contested,valid_from,first_seen_at,last_seen_at,"
         "distilled_at,model,evidence_sig) VALUES "
-        "(%s,'t1',%s,'user_asserted','active',1,false,%s,%s,%s,%s,'opus','sig')",
+        "(%s,'t1',%s,'rules out the lazy alternative','user_asserted','active',1,"
+        "false,%s,%s,%s,%s,'opus','sig')",
         (uid, statement, when, when, when, when))
     store.commit()
 
@@ -1589,3 +1618,103 @@ def test_real_worker_returns_validated_structured_output():
                                    system="You answer tersely.")
     assert isinstance(out.get("answer"), str) and out["answer"]
     assert usage.get("output_tokens", 0) > 0
+
+
+# --------------------------------------------------------------------------- #
+# Rebuild snapshots — "derived" does not mean "cheap to replace"
+# --------------------------------------------------------------------------- #
+def test_a_rebuild_snapshots_the_insights_it_is_about_to_drop(store):
+    """Insights cost model calls under a rate-limited subscription, so dropping them
+    outright was wrong: when a read path once destroyed 24 of them, the only surviving
+    baseline was scraped out of a session transcript. A rebuild copies first."""
+    _persist_one(store)
+    store.execute("ALTER TABLE dream_insights ADD COLUMN drifted int")  # force stale
+    store.commit()
+
+    dream.ensure_dream_schema(rebuild=True)
+
+    snaps = dict(dream.list_snapshots(store))
+    assert snaps, "a rebuild that drops paid-for insights must leave a copy"
+    assert any(n.startswith("dream_insights_bak") and c == 1 for n, c in snaps.items())
+    # Insights ARE units rows; a snapshot without them holds orphan statements.
+    assert any(n.startswith("dream_units_bak") and c == 1 for n, c in snaps.items())
+    assert store.execute("SELECT count(*) n FROM dream_insights").fetchone()["n"] == 0
+
+
+def test_a_snapshot_carries_no_constraints_so_it_cannot_rot(store):
+    """`CREATE TABLE AS SELECT`, never a RENAME: a renamed table keeps its ON DELETE
+    CASCADE foreign keys, so deleting a source conversation would silently empty the
+    backup — a backup that rots while still looking present."""
+    _persist_one(store)
+    store.execute("ALTER TABLE dream_insights ADD COLUMN drifted int")
+    store.commit()
+    dream.ensure_dream_schema(rebuild=True)
+    snap = next(n for n, _ in dream.list_snapshots(store)
+                if n.startswith("dream_evidence_bak"))
+    assert store.execute(
+        "SELECT count(*) AS n FROM information_schema.table_constraints "
+        "WHERE table_name=%s AND constraint_type IN ('FOREIGN KEY','PRIMARY KEY')",
+        (snap,)).fetchone()["n"] == 0
+
+    # And deleting the source unit leaves the snapshot intact.
+    before = store.execute(f'SELECT count(*) AS n FROM "{snap}"').fetchone()["n"]
+    store.execute("DELETE FROM units WHERE unit_id='u1'")
+    store.commit()
+    assert store.execute(f'SELECT count(*) AS n FROM "{snap}"').fetchone()["n"] == before
+
+
+def test_snapshots_older_than_the_keep_window_are_collected(store):
+    old = f"dream_insights_bak{(datetime.now(timezone.utc) - timedelta(days=dream.SNAPSHOT_KEEP_DAYS + 5)).strftime('%Y%m%d')}"
+    store.execute(f'CREATE TABLE "{old}" (x int)')
+    store.commit()
+    dream.snapshot_dream_tables(store)                 # runs the GC
+    assert old not in dict(dream.list_snapshots(store))
+
+
+def test_nothing_is_snapshotted_when_there_is_nothing_to_lose(store):
+    """An empty snapshot is litter that makes the real ones harder to find."""
+    assert dream.snapshot_dream_tables(store) == []
+    assert dream.list_snapshots(store) == []
+
+
+# --------------------------------------------------------------------------- #
+# The question log — a real question is exogenous signal; charters are not
+# --------------------------------------------------------------------------- #
+def test_an_unanswered_question_becomes_a_probe_query_on_its_topic(store):
+    """Measured on a real /clync call: the question had NO topic covering it and the
+    two hand-written charters that answered were irrelevant. So a question the layer
+    could not answer is the best dig seed available — it names the gap in the reader's
+    own words. The ANSWER is never stored as an insight: that text never passed the
+    grounding gate, and storing it would make the layer read its own output."""
+    dream.recall(store, "what is my view on tests involving hardcoded values")
+    q = dream.unanswered_queries(store)
+    assert len(q) == 1
+
+    # No topic was derivable (nothing distilled yet) -> a NEW-topic candidate, which
+    # is the operator's call, never a silent insert.
+    out = dream.feed_back_queries(store)
+    assert out["fed"] == {} and len(out["topic_candidates"]) == 1
+    assert dream.unanswered_queries(store), "an orphan question is kept, not consumed"
+
+    # Once it HAS a topic, it is fed to that topic's probe queries and consumed.
+    store.execute("UPDATE dream_queries SET topic_id='t1'")
+    store.commit()
+    out = dream.feed_back_queries(store)
+    assert list(out["fed"]) == ["t1"]
+    assert "what is my view on tests involving hardcoded values" in \
+        dream.get_topic(store, "t1")["probe_queries"]
+    assert dream.unanswered_queries(store) == [], "consumed, so never fed twice"
+
+
+def test_an_answered_question_is_not_fed_back(store, pg_test_db, mock_embed):
+    """Only a question the layer FAILED to answer is signal about a gap."""
+    _persist_one(store)
+    pg_test_db.build_index()
+    dream.recall(store, "bugs layer prevented")
+    assert dream.unanswered_queries(store) == []
+
+
+def test_a_historical_read_is_not_logged_as_a_gap(store):
+    """`as_of` asks what was true THEN, so it says nothing about what to distil now."""
+    dream.recall(store, "anything at all", as_of="2026-01-01")
+    assert store.execute("SELECT count(*) n FROM dream_queries").fetchone()["n"] == 0

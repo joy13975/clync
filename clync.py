@@ -1065,6 +1065,16 @@ def cmd_migrate(args) -> int:
               + (f"  ({lost} row(s) dropped; re-derive with "
                  f"{'clync index' if t == 'chunks' else 'clync dream backfill'})"
                  if lost > 0 else "  (unchanged)"))
+    # Dropped insights cost model calls to re-derive, so the rebuild copies them
+    # first. Print what survived: a backup the operator cannot see is a backup they
+    # cannot rely on.
+    import dream
+    with connect_pg() as con:
+        snaps = dream.list_snapshots(con)
+    if snaps:
+        print(f"\nsnapshots (inert copies, GC'd after {dream.SNAPSHOT_KEEP_DAYS} days):")
+        for name, n in snaps:
+            print(f"  {name}: {n} row(s)")
     print("schema migrated. Search and dream schemas now match the shipped layout.")
     return 0
 
@@ -1215,6 +1225,17 @@ def _print_dream_report(report: dict) -> None:
               f"(nothing renderable): {', '.join(report['skipped_empty'])}")
     if report.get("topics_touched"):
         print(f"topics      : {', '.join(report['topics_touched'])}")
+    # What a real reader asked and this layer could not answer. Those words are the
+    # best probe queries available — better than a charter guess — so say when they
+    # were fed back, and name the ones that matched no topic at all: those are new
+    # topic candidates, which is the operator's call, not a silent insert.
+    for tid, qs in (report.get("questions_fed") or {}).items():
+        print(f"questions   : fed {len(qs)} unanswered question(s) into '{tid}' "
+              f"as probe queries: {'; '.join(q[:60] for q in qs)}")
+    if report.get("topic_candidates"):
+        print(f"! {len(report['topic_candidates'])} unanswered question(s) match NO "
+              f"topic — candidates for a new one (`clync dream topics`): "
+              f"{'; '.join(q[:60] for q in report['topic_candidates'])}")
     if "queued" in report:
         print(f"queued      : {report['queued']} (topic, unit) assignment(s) for digging")
     for tid, digs in report.get("digs", {}).items():

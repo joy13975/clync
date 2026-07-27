@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import unicodedata
 import uuid
@@ -167,6 +168,7 @@ CREATE TABLE IF NOT EXISTS dream_insights (
     unit_id       text PRIMARY KEY REFERENCES units(unit_id) ON DELETE CASCADE,
     topic_id      text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
     statement     text NOT NULL,
+    rules_out     text NOT NULL,          -- what the claim FORBIDS (see gate 3)
     stance        text NOT NULL,
     status        text NOT NULL,
     superseded_by text REFERENCES units(unit_id) ON DELETE SET NULL,
@@ -242,6 +244,22 @@ CREATE TABLE IF NOT EXISTS dream_pending (
 -- budget expired, while recall's coverage tier called a dug topic "never been
 -- dug". Ranges are kept merged and disjoint per (topic, unit) — see
 -- record_attempt — so (topic_id, unit_id, from_idx) identifies a row.
+-- Every question actually ASKED of this layer. A real question is exogenous signal
+-- and the hand-written charters are not: probe queries otherwise grow only from what
+-- the distiller itself proposes, which is a closed loop feeding on its own
+-- vocabulary. Measured on a real /clync call: the question ("my view on tests
+-- involving hardcodes") had NO topic covering it, and the two charters that answered
+-- were both irrelevant. So a question that came back with no insight is the highest
+-- value dig seed there is — it names a gap in the user's own words.
+CREATE TABLE IF NOT EXISTS dream_queries (
+    query_id     text PRIMARY KEY,
+    query        text NOT NULL,
+    topic_id     text REFERENCES dream_topics(topic_id) ON DELETE SET NULL,
+    insight_hits int NOT NULL,             -- 0 => the layer could not answer it
+    consumed     boolean NOT NULL,         -- fed to a topic's probe queries yet?
+    asked_at     timestamptz NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dream_attempted (
     topic_id  text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
     unit_id   text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
@@ -278,7 +296,71 @@ def _declared_cols(table: str) -> set[str]:
 # The shapes the guard checks. `dream_topics` is deliberately absent: it is
 # hand-edited config, never rebuilt.
 _GUARDED_TABLES = ("dream_insights", "dream_evidence", "dream_pending",
-                   "dream_attempted")
+                   "dream_attempted", "dream_queries")
+
+
+# A rebuild is the most expensive operation in the store: insights cost model calls
+# under a rate-limited subscription, so "derived" does NOT mean "cheap to replace"
+# the way an embedding does. Dropping them outright was wrong, and this layer has the
+# receipt: when a read path destroyed 24 live insights, the only surviving baseline
+# was a reconstruction scraped out of a session transcript. So a rebuild copies first.
+#
+# `CREATE TABLE AS SELECT` deliberately: it carries no constraints, so the copy is
+# INERT — a renamed table would keep its `ON DELETE CASCADE` foreign keys and quietly
+# lose backup rows whenever a source conversation was deleted, which is a backup that
+# rots while looking fine. Insights are also `units` rows, so the unit half is copied
+# too; without it the snapshot holds statements whose unit rows are gone.
+SNAPSHOT_KEEP_DAYS = 183
+_SNAPSHOT_TABLES = ("dream_insights", "dream_evidence", "dream_attempted")
+_SNAPSHOT_RE = re.compile(r"^dream_(?:insights|evidence|attempted|units)_bak(\d{8})$")
+
+
+def snapshot_dream_tables(con) -> list[str]:
+    """Copy the dream tables to dated, constraint-free `*_bakYYYYMMDD` tables before
+    a rebuild drops them, and garbage-collect copies older than SNAPSHOT_KEEP_DAYS.
+    Returns the tables written. Nothing is copied when there is nothing to lose —
+    an empty snapshot is litter that makes the real ones harder to find."""
+    have = con.execute("SELECT count(*) AS n FROM dream_insights").fetchone()["n"]
+    made: list[str] = []
+    if have:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        for t in _SNAPSHOT_TABLES:
+            snap = f"{t}_bak{stamp}"
+            con.execute(f'DROP TABLE IF EXISTS "{snap}"')   # same-day re-run overwrites
+            con.execute(f'CREATE TABLE "{snap}" AS SELECT * FROM {t}')
+            made.append(snap)
+        snap = f"dream_units_bak{stamp}"
+        con.execute(f'DROP TABLE IF EXISTS "{snap}"')
+        con.execute(f'CREATE TABLE "{snap}" AS SELECT * FROM units WHERE kind = %s',
+                    (KIND_INSIGHT,))
+        made.append(snap)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)
+              ).strftime("%Y%m%d")
+    for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name LIKE 'dream_%%_bak%%'"
+            ).fetchall():
+        m = _SNAPSHOT_RE.match(r["table_name"])
+        if m and m.group(1) < cutoff:
+            con.execute(f'DROP TABLE IF EXISTS "{r["table_name"]}"')
+    con.commit()
+    return made
+
+
+def list_snapshots(con) -> list[tuple[str, int]]:
+    """Existing snapshot tables, newest first, with their row counts — so the
+    operator can SEE what a rebuild preserved instead of taking it on faith. This
+    module prints nothing; the CLI renders it (`clync migrate`, `clync dream status`)."""
+    out = []
+    for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='public' AND table_name LIKE 'dream_%%_bak%%' "
+            "ORDER BY table_name DESC").fetchall():
+        if _SNAPSHOT_RE.match(r["table_name"]):
+            n = con.execute(
+                f'SELECT count(*) AS n FROM "{r["table_name"]}"').fetchone()["n"]
+            out.append((r["table_name"], n))
+    return out
 
 
 def ensure_dream_schema(*, rebuild: bool = False) -> None:
@@ -307,10 +389,12 @@ def ensure_dream_schema(*, rebuild: bool = False) -> None:
         if stale:
             require_rebuild(rebuild, layer=f"dream ({', '.join(stale)})",
                             cost="every distilled insight (re-digging spends quota)")
+            snapshot_dream_tables(con)
             con.execute("DROP TABLE IF EXISTS dream_evidence")
             con.execute("DROP TABLE IF EXISTS dream_insights")
             con.execute("DROP TABLE IF EXISTS dream_pending")
             con.execute("DROP TABLE IF EXISTS dream_attempted")
+            con.execute("DROP TABLE IF EXISTS dream_queries")
             # last_dig_at is derived progress state (it is set with the attempt
             # record), so it goes with the attempts: keeping it would make
             # coverage say "dug at T" about a layer whose digs were just erased.
@@ -874,6 +958,16 @@ _DISTILL_SYSTEM = (
     "is an event, not knowledge. 'Write good code' is too generic to be knowledge. "
     "'Fix bugs at the layer that should have prevented them, not where they surfaced' "
     "is knowledge. Respect the charter's OUT clause strictly.\n"
+    "3a. EVERY insight MUST fill `rules_out`: the concrete thing this claim forbids — "
+    "the wrong way it distinguishes itself from. This is not decoration, it is the "
+    "test for whether you have a claim at all: a rule that forbids nothing is a "
+    "truism, and a truism is how you LOSE the real knowledge that was in front of "
+    "you. Keep the discriminating half attached. 'Encode design invariants as tests' "
+    "forbids nothing and is worthless; 'test the BEHAVIOUR an invariant describes, "
+    "never a hardcoded value that merely restates the config' rules out "
+    "assert-the-constant tests and is worth storing. If you cannot name what a claim "
+    "rules out, you have paraphrased the transcript into a platitude — go back to the "
+    "quote and state the sharper claim it actually supports, or DROP it.\n"
     "4. Do not invent. If the transcripts carry nothing durable for this topic, return "
     "an empty list. An empty list is a valid, useful answer.\n"
     "5. You are shown a WINDOW around the passage that matched the search, not the "
@@ -895,6 +989,16 @@ _DISTILL_SCHEMA = {
                 "properties": {
                     "statement": {"type": "string"},
                     "elaboration": {"type": "string"},
+                    # What the claim FORBIDS. A rule with no negative case is a
+                    # truism, and a truism is how real knowledge gets lost: the
+                    # dreamer flattens "test the behaviour an invariant describes,
+                    # never a hardcoded value that merely restates config" down to
+                    # "encode invariants as tests", and the falsifier then correctly
+                    # kills the flattened corpse for being too generic. Naming the
+                    # wrong-way keeps the discriminating half of the claim attached
+                    # to it, and it is a test the dreamer can apply to ITSELF before
+                    # a falsify call is ever spent.
+                    "rules_out": {"type": "string"},
                     "stance": {"type": "string", "enum": list(STANCES)},
                     "evidence": {
                         "type": "array",
@@ -909,7 +1013,8 @@ _DISTILL_SCHEMA = {
                         },
                     },
                 },
-                "required": ["statement", "elaboration", "stance", "evidence"],
+                "required": ["statement", "elaboration", "rules_out", "stance",
+                             "evidence"],
                 "additionalProperties": False,
             },
         },
@@ -1309,11 +1414,28 @@ def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = 
 # --------------------------------------------------------------------------- #
 # Gate 3: substance — mechanical
 # --------------------------------------------------------------------------- #
+RULES_OUT_MIN_CHARS = 20
+
+
 def passes_substance(candidate: dict, evidence: list[dict]) -> bool:
     """Blocks single-mention noise without discarding a clearly-stated one-off
-    principle: >=2 distinct source units, OR the user asserted it outright."""
-    return (len({e["src_unit_id"] for e in evidence}) >= 2
-            or candidate["stance"] == "user_asserted")
+    principle: >=2 distinct source units, OR the user asserted it outright.
+
+    AND the claim must forbid something. A rule with no negative case is a truism,
+    and a truism is not a weaker insight — it is the WRECKAGE of a real one, because
+    the way knowledge gets lost here is the dreamer paraphrasing a sharp point into a
+    platitude ("test the behaviour an invariant describes, never a hardcoded value
+    that restates config" -> "encode invariants as tests") which the falsifier then
+    correctly kills for being generic. Checked mechanically, not by another model
+    opinion: `rules_out` must be present, long enough to name something, and must not
+    merely echo the statement back."""
+    if not (len({e["src_unit_id"] for e in evidence}) >= 2
+            or candidate["stance"] == "user_asserted"):
+        return False
+    ro = (candidate.get("rules_out") or "").strip()
+    if len(ro) < RULES_OUT_MIN_CHARS:
+        return False
+    return ro.casefold() != candidate["statement"].strip().casefold()
 
 
 # --------------------------------------------------------------------------- #
@@ -1453,11 +1575,13 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
                     f"[{topic['topic_id']}] ({c['stance']}) {c['statement']}",
                     f"({c['stance']}) {c['elaboration']}", lo, hi)
         con.execute(
-            "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
+            "INSERT INTO dream_insights (unit_id,topic_id,statement,rules_out,stance,"
+            "status,"
             "support_count,contested,valid_from,valid_until,first_seen_at,last_seen_at,"
             "distilled_at,model,evidence_sig) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s)",
-            (new_id, topic["topic_id"], c["statement"], c["stance"], STATUS_ACTIVE,
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s)",
+            (new_id, topic["topic_id"], c["statement"],
+             (c.get("rules_out") or "").strip(), c["stance"], STATUS_ACTIVE,
              len({e["src_unit_id"] for e in ev}),
              c.get("verdict") == "contested", hi, lo, hi, now, WORKER_MODEL,
              _evidence_sig(ev)))
@@ -1878,8 +2002,58 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
                    "does not cover it (raw transcript hits below are NOT distilled)")
     if not topic:
         cov.append("no topic matched this query — showing raw transcript results only")
+    # Log the QUESTION. Cheap (one row, no model call) and it is the only exogenous
+    # signal this layer gets about what is worth distilling — see `dream_queries`.
+    # Historical reads (`as_of`) are excluded: they ask what was true THEN, so they
+    # say nothing about what should be distilled now.
+    if query.strip() and as_of is None:
+        con.execute(
+            "INSERT INTO dream_queries (query_id,query,topic_id,insight_hits,"
+            "consumed,asked_at) VALUES (%s,%s,%s,%s,false,%s)",
+            (f"q-{uuid.uuid4().hex[:16]}", query.strip(),
+             topic["topic_id"] if topic else None, len(insights), _now()))
+        con.commit()
     return {"topic": topic, "insights": insights, "raw": raw,
             "coverage": cov, "as_of": as_of, "include_raw": include_raw}
+
+
+def unanswered_queries(con, *, limit: int = 50) -> list[dict]:
+    """Questions this layer could NOT answer, newest first, not yet fed back.
+
+    `insight_hits = 0` is the signal: someone asked and the distilled layer had
+    nothing. Those words are a better probe query than anything a charter author or
+    the distiller would think to write, because they are what a real reader actually
+    typed."""
+    return con.execute(
+        "SELECT query_id, query, topic_id FROM dream_queries "
+        "WHERE consumed = false AND insight_hits = 0 "
+        "ORDER BY asked_at DESC LIMIT %s", (limit,)).fetchall()
+
+
+def feed_back_queries(con) -> dict:
+    """Turn unanswered questions into probe queries on the topic they were derived
+    to, so the NEXT dig hunts them in the raw transcripts.
+
+    The insight is never written from the answer a reading agent composed — that text
+    never passed the grounding gate, and storing it would make the layer read its own
+    output (the one invariant this layer must not break). The question only decides
+    WHERE to dig; the evidence still decides what is true.
+
+    A question that matched no topic is left unconsumed and reported: it is a
+    candidate for a NEW topic, which is a decision for the operator, not a silent
+    insert."""
+    fed: dict[str, list[str]] = {}
+    orphans: list[str] = []
+    for r in unanswered_queries(con):
+        if not r["topic_id"]:
+            orphans.append(r["query"])
+            continue
+        add_probe_queries(con, r["topic_id"], [r["query"]])
+        fed.setdefault(r["topic_id"], []).append(r["query"])
+        con.execute("UPDATE dream_queries SET consumed = true WHERE query_id = %s",
+                    (r["query_id"],))
+    con.commit()
+    return {"fed": fed, "topic_candidates": orphans}
 
 
 def format_recall(result: dict, *, requested_topic: str | None = None,
@@ -1908,6 +2082,10 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
     for i in result["insights"]:
         out.append(f"  {i['statement']}  "
                    f"{_stance_label(i['stance'], i['support_count'])}")
+        # The claim's negative case is half its content — a reader who sees only the
+        # positive half re-derives the platitude the gate exists to reject.
+        if i.get("rules_out"):
+            out.append(f"      rules out: {i['rules_out']}")
         if include_evidence:
             for e in i.get("evidence", []):
                 out.append(f"      {e['src_unit_id']}:{e['src_msg_id']}  "
@@ -2092,6 +2270,9 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     # Yesterday's source deletions must be reconciled before tonight's digs read
     # the held insights (falsify's dedup input) or write beside stale rows.
     reconcile_evidence(con)
+    # Questions the layer could not answer become probe queries BEFORE selection, so
+    # tonight's dig already hunts what someone asked for today. Free: no model call.
+    report_queries = feed_back_queries(con)
     # The new watermark is snapshotted BEFORE selection, and it is what every
     # success path writes. Writing end-of-run _now() instead would open a window
     # the length of the pass (minutes of Opus calls): a unit synced in between
@@ -2101,6 +2282,8 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     report: dict = {"mode": "incremental", "changed": 0, "skipped_empty": [],
                     "topics_touched": [], "queued": 0, "digs": {},
                     "calls": 0, "deferred": [],
+                    "questions_fed": report_queries["fed"],
+                    "topic_candidates": report_queries["topic_candidates"],
                     "stopped_early": None}
     watermark = get_meta(con, WATERMARK_KEY)
     if not watermark:

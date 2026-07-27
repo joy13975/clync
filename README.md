@@ -158,6 +158,14 @@ raw transcripts, and rendering a per-topic **digest** from them on read.
 - **Nothing is deleted.** A changed position closes the old insight's validity
   window and links the supersession, which is what `dream recall --as-of`
   reads — positions held at a given date, not just now.
+- **Questions are signal.** Every query put to the recall surface is logged
+  (`dream_queries`). One that came back with no insight becomes a probe query on its
+  topic, so the next dig hunts it in the raw transcripts; one that matched no topic at
+  all is reported as a new-topic candidate. The composed answer is never stored as an
+  insight — that would make the layer read its own output.
+- **`clync migrate` snapshots before it drops.** Insights cost model calls, so a
+  rebuild copies the dream tables to dated, constraint-free `*_bakYYYYMMDD` tables
+  (garbage-collected after 183 days) and prints what it preserved.
 - **Non-circular by construction.** `source=all`/`search_transcripts` still means
   raw-only (`claude_ai` + `claude_code`); dreams are reachable only via
   `source=dream` or the recall surfaces. The dig cannot retrieve its own output,
