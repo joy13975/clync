@@ -405,8 +405,17 @@ the SSOT-preserving choice: `search.py` already iterates all units, so insights
 get BGE-M3 dense+sparse indexing, facets, and `get_conversation` with no second
 retrieval path.
 
+**Revised 2026-07-27.** `dream_digest` is gone with the `consolidate` call (D2):
+the digest is rendered from insight rows at query time, and `ensure_dream_schema`
+deletes any `kind='dream_digest'` unit left behind. `dream_evidence.src_msg_id`
+and `quote` are `NOT NULL` — an evidence row that cannot name its message or
+reproduce its quote cannot be re-checked by the gate that admitted it, so it is
+not a row. `dream_insights.contested` is listed below. **`DREAM_SCHEMA` in
+`dream.py` is the SSOT**; this block is illustrative and a divergence between the
+two is a bug in this document.
+
 ```sql
--- units gains: kind ∈ {…, 'dream_insight', 'dream_digest'}
+-- units gains: kind ∈ {…, 'dream_insight'}
 --              source ∈ {claude_ai, claude_code, 'dream'}
 
 CREATE TABLE dream_topics (
@@ -428,6 +437,7 @@ CREATE TABLE dream_insights (
     superseded_by text REFERENCES units(unit_id),
     superseded_kind text,                -- 'refine' | 'contradict' (why superseded)
     support_count int NOT NULL,          -- derived: distinct cited source units
+    contested     boolean NOT NULL,      -- a contradicting insight also holds
     valid_from    timestamptz NOT NULL,  -- bi-temporal: when the position held
     valid_until   timestamptz,           -- NULL = still current
     first_seen_at timestamptz NOT NULL,  -- when evidence was authored
@@ -440,8 +450,8 @@ CREATE TABLE dream_insights (
 CREATE TABLE dream_evidence (
     unit_id     text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE, -- the insight
     src_unit_id text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE, -- the transcript
-    src_msg_id  text,
-    quote       text,                    -- must verify against messages.text
+    src_msg_id  text NOT NULL,
+    quote       text NOT NULL,           -- must verify against messages.text
     PRIMARY KEY (unit_id, src_unit_id, src_msg_id)
 );
 

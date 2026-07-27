@@ -1073,7 +1073,21 @@ def _distill_one(ref="a#0", statement="Fix bugs at the preventing layer."):
     return {"insights": [{"statement": statement, "elaboration": "e",
                           "stance": "user_asserted",
                           "evidence": [{"ref": ref, "quote": "Fix bugs at the layer that should have prevented"}]}],
-            "probe_queries_to_add": []}
+            "probe_queries_to_add": [], "read_requests": []}
+
+
+def _attempted_ranges(con, topic_id) -> dict[str, list[tuple[int, int]]]:
+    """The attempt record, per unit: the merged transcript ranges already rendered to
+    the distiller for this topic — independent of whether any insight survived the
+    gates. Production reads this table two ways, neither of them per-unit: retrieval
+    excludes ranges in SQL (`hybrid_search(exclude_attempted=...)`) and `recall`
+    aggregates coverage. This per-unit view exists only to assert on here."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for r in con.execute(
+            "SELECT unit_id, from_idx, to_idx FROM dream_attempted "
+            "WHERE topic_id=%s ORDER BY unit_id, from_idx", (topic_id,)).fetchall():
+        out.setdefault(r["unit_id"], []).append((r["from_idx"], r["to_idx"]))
+    return out
 
 
 _UPHELD = {"verdicts": [{"index": 0, "verdict": "upheld",
@@ -1239,7 +1253,7 @@ def test_a_fully_rejected_dig_still_records_the_attempt(store, stub_worker,
     stub_worker.append(_EMPTY_DISTILL)
     dream.dig(store, t, [{"unit_id": "u1", "msg_idx": 0}])
     # ...and the record is the RANGE actually rendered, not a bare unit mark
-    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
+    assert _attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
     assert dream.get_topic(store, "t1")["last_dig_at"] is not None
     cov = dream.recall(store, "", topic_id="t1")["coverage"]
     assert not any("never been dug" in c for c in cov)
@@ -1256,7 +1270,7 @@ def test_backfill_excludes_attempted_ranges_so_a_rejected_batch_is_never_rebough
     assert not stub_worker, "the same batch was dug more than once"
     assert len(r["digs"]["t1"]) == 1
     assert r["stopped_early"] is None             # pool exhausted, not budget
-    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
+    assert _attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
     # a later invocation resumes past the attempted ranges at zero model calls
     r2 = dream.run_backfill(store, topic_id="t1", max_calls=30)
     assert r2["digs"] == {} and r2["calls"] == 0
@@ -1272,13 +1286,13 @@ def test_a_throttled_call_leaves_no_phantom_attempt(store, stub_worker,
     stub_worker.append(RuntimeError("upstream says: rate limit exceeded"))
     with pytest.raises(dream.DreamThrottled):
         dream.run_backfill(store, topic_id="t1", max_calls=30)
-    assert dream.attempted_ranges(store, "t1") == {}, "attempt recorded for a call that never ran"
+    assert _attempted_ranges(store, "t1") == {}, "attempt recorded for a call that never ran"
     assert dream.get_topic(store, "t1")["last_dig_at"] is None
     # resuming re-selects the SAME batch and actually distills it this time
     stub_worker.append(_EMPTY_DISTILL)
     r = dream.run_backfill(store, topic_id="t1", max_calls=30)
     assert len(r["digs"]["t1"]) == 1
-    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
+    assert _attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
 
 
 def _two_hit_unit(con, unit_id="wide", n=60, hits=(10, 50)):
@@ -1397,7 +1411,7 @@ def test_a_verbose_unit_cannot_monopolize_the_candidate_pool(
 
 def test_an_empty_rendering_records_no_attempt(store):
     dream.record_attempt(store, "t1", [])
-    assert dream.attempted_ranges(store, "t1") == {}
+    assert _attempted_ranges(store, "t1") == {}
     assert dream.get_topic(store, "t1")["last_dig_at"] is None
 
 
@@ -1408,7 +1422,7 @@ def test_a_derived_schema_rebuild_erases_the_progress_record_too(store):
     store.execute("ALTER TABLE dream_insights ADD COLUMN legacy int")
     store.commit()
     dream.ensure_dream_schema(rebuild=True)
-    assert dream.attempted_ranges(store, "t1") == {}
+    assert _attempted_ranges(store, "t1") == {}
     assert dream.get_topic(store, "t1")["last_dig_at"] is None
 
 

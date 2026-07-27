@@ -663,7 +663,9 @@ def render_windows(con, seeds: list[dict], expansions: list[dict] | None = None
                 f"WHERE m.unit_id=%s AND m.idx BETWEEN %s AND %s "
                 f"AND {_TEXT} IS NOT NULL AND {_TEXT} != '' ORDER BY m.idx",
                 (unit_id, lo, hi)).fetchall()
-            quotable = [r for r in rows if (r["t"] or "").strip()]
+            # The query already excludes NULL and '', so only whitespace-only text
+            # can still get through — that is what this drops.
+            quotable = [r for r in rows if r["t"].strip()]
             # The size cap is spent OUTWARD FROM THE MATCH, never from the start of
             # the range. Spending it from the start lets a wide requested expansion
             # evict the matched message itself — which is precisely the render-the-
@@ -993,10 +995,14 @@ def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
         # retire material that was never read (see record_attempt).
         record_attempt(con, topic["topic_id"],
                        _rendered_ranges(round_refmap, slots))
-        if out.get("probe_queries_to_add"):
+        # All three keys are `required` in the schema the worker validates against, so
+        # they are indexed, not `.get`-defaulted: an absent key means the validated
+        # contract was broken, and defaulting it to empty would report that as "the
+        # dreamer had nothing to add" — silently, for as long as the break lasted.
+        if out["probe_queries_to_add"]:
             add_probe_queries(con, topic["topic_id"], out["probe_queries_to_add"])
         found += out["insights"]
-        reqs = out.get("read_requests") or []
+        reqs = out["read_requests"]
         if not reqs or round_no >= MAX_NAV_ROUNDS:
             # Requests arriving in the FINAL round cannot be served. Say so rather
             # than dropping them: it is the signal that MAX_NAV_ROUNDS is too low.
@@ -1567,19 +1573,6 @@ def record_attempt(con, topic_id: str, ranges: list[tuple[str, int, int]]) -> No
     con.execute("UPDATE dream_topics SET last_dig_at=%s WHERE topic_id=%s",
                 (_now(), topic_id))
     con.commit()
-
-
-def attempted_ranges(con, topic_id: str) -> dict[str, list[tuple[int, int]]]:
-    """The attempt record, per unit: the merged transcript ranges already rendered
-    to the distiller for this topic — independent of whether any insight survived
-    the gates. A retrieval hit inside one of these ranges was already read; a hit
-    outside them is unmined material, whatever the unit."""
-    out: dict[str, list[tuple[int, int]]] = {}
-    for r in con.execute(
-            "SELECT unit_id, from_idx, to_idx FROM dream_attempted "
-            "WHERE topic_id=%s ORDER BY unit_id, from_idx", (topic_id,)).fetchall():
-        out.setdefault(r["unit_id"], []).append((r["from_idx"], r["to_idx"]))
-    return out
 
 
 def candidates(con, topic: dict, *, since: str | None = None,
