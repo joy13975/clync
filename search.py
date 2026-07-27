@@ -404,11 +404,19 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
                   repo: str | None = None, worktree: str | None = None,
                   branch: str | None = None, session: str | None = None,
                   since: str | None = None, until: str | None = None,
-                  sort: str = "relevance", lang: str | None = None) -> list[dict]:
+                  sort: str = "relevance", lang: str | None = None,
+                  collapse_units: bool = True) -> list[dict]:
     """Faceted hybrid search. With a `query`, ranks by fused dense+sparse RRF +
     typed-metadata boost, collapsed to one best chunk per unit. With an EMPTY
     query, degrades to a metadata browse (units matching the facets, newest first).
     A facet contradicting `source` fails loud.
+
+    `collapse_units=False` keeps EVERY matched chunk instead of one per unit.
+    The dream dig's exclusion record is per transcript RANGE (a unit is mined
+    window by window, not wholesale), so its candidate selection must see every
+    hit position a unit matched at — collapsed retrieval structurally hides all
+    but the best one, which is how one dug window used to retire a whole
+    conversation. Search surfaces (CLI/MCP) keep the collapsed default.
 
     Read-only, and deliberately does NOT provision the store: provisioning takes
     DDL locks, and a read that takes DDL locks deadlocks against its own caller's
@@ -456,10 +464,13 @@ def hybrid_search(query: str = "", topk: int = TOPK, *, source: str = "all",
                                           / (86400.0*180)) END
                    + CASE WHEN c.lang = %(qlang)s THEN 0.05 ELSE 0 END) AS score
         FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)""")
+    cols = ("unit_id, unit_name, source, lang, text,"
+            " msg_idx, chunk_idx, score, dense_sim")
     sql = ("WITH " + ",\n".join(ctes)
-           + "\nSELECT DISTINCT ON (unit_id) unit_id, unit_name, source, lang, text,"
-             " msg_idx, chunk_idx, score, dense_sim"
-             "\nFROM scored ORDER BY unit_id, score DESC")
+           + (f"\nSELECT DISTINCT ON (unit_id) {cols}"
+              "\nFROM scored ORDER BY unit_id, score DESC"
+              if collapse_units else
+              f"\nSELECT {cols}\nFROM scored ORDER BY score DESC"))
     with connect_pg() as pg:
         rows = pg.execute(sql, params).fetchall()
     results = [_row_to_result(r) for r in rows]

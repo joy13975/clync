@@ -56,14 +56,18 @@ def _reindex():
 
 @pytest.fixture
 def stub_worker(monkeypatch):
-    """Replace the model call with a queue of canned structured outputs."""
+    """Replace the model call with a queue of canned structured outputs. A queued
+    EXCEPTION is raised instead of returned — how a test stages a throttled call."""
     outputs: list[dict] = []
 
     def _fake(prompt, schema, *, system, effort=None, model=dream.WORKER_MODEL,
               timeout=900):
         if not outputs:
             raise AssertionError("stub_worker ran out of queued outputs")
-        return outputs.pop(0), {"input_tokens": 1, "output_tokens": 2}
+        out = outputs.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out, {"input_tokens": 1, "output_tokens": 2}
 
     monkeypatch.setattr(dream, "_run_worker", _fake)
     return outputs
@@ -1230,14 +1234,15 @@ def test_a_fully_rejected_dig_still_records_the_attempt(store, stub_worker,
     t = dream.get_topic(store, "t1")
     stub_worker.append(_EMPTY_DISTILL)
     dream.dig(store, t, [{"unit_id": "u1", "msg_idx": 0}])
-    assert dream.attempted_units(store, "t1") == {"u1"}
+    # ...and the record is the RANGE actually rendered, not a bare unit mark
+    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
     assert dream.get_topic(store, "t1")["last_dig_at"] is not None
     cov = dream.recall(store, "", topic_id="t1")["coverage"]
     assert not any("never been dug" in c for c in cov)
     assert any("no insights" in c for c in cov)   # honest, and distinct from undug
 
 
-def test_backfill_excludes_attempted_units_so_a_rejected_batch_is_never_rebought(
+def test_backfill_excludes_attempted_ranges_so_a_rejected_batch_is_never_rebought(
         store, stub_worker, pg_test_db, mock_embed):
     """The re-dig loop: `candidates` is deterministic for a fixed index, so
     excluding only CITED units re-selected a fully-rejected batch at the same rank
@@ -1247,26 +1252,106 @@ def test_backfill_excludes_attempted_units_so_a_rejected_batch_is_never_rebought
     assert not stub_worker, "the same batch was dug more than once"
     assert len(r["digs"]["t1"]) == 1
     assert r["stopped_early"] is None             # pool exhausted, not budget
-    assert dream.attempted_units(store, "t1") == {"u1"}
-    # a later invocation resumes past the attempted unit at zero model calls
+    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
+    # a later invocation resumes past the attempted ranges at zero model calls
     r2 = dream.run_backfill(store, topic_id="t1", max_calls=30)
     assert r2["digs"] == {} and r2["calls"] == 0
 
 
-def test_an_empty_seed_batch_records_no_attempt(store):
+def test_a_throttled_call_leaves_no_phantom_attempt(store, stub_worker,
+                                                    pg_test_db, mock_embed):
+    """The attempt row is written only after the model call RETURNS. Written
+    before it (as it once was), a throttled first call — the layer's one
+    documented resumable failure — permanently excluded its whole batch from
+    backfill without a single message ever having been distilled, while
+    coverage showed the topic freshly dug with no gap."""
+    stub_worker.append(RuntimeError("upstream says: rate limit exceeded"))
+    with pytest.raises(dream.DreamThrottled):
+        dream.run_backfill(store, topic_id="t1", max_calls=30)
+    assert dream.attempted_ranges(store, "t1") == {}, "attempt recorded for a call that never ran"
+    assert dream.get_topic(store, "t1")["last_dig_at"] is None
+    # resuming re-selects the SAME batch and actually distills it this time
+    stub_worker.append(_EMPTY_DISTILL)
+    r = dream.run_backfill(store, topic_id="t1", max_calls=30)
+    assert len(r["digs"]["t1"]) == 1
+    assert dream.attempted_ranges(store, "t1") == {"u1": [(0, 1)]}
+
+
+def _two_hit_unit(con, unit_id="wide", n=60, hits=(10, 50)):
+    """A long unit that is on-topic at TWO distant positions — the shape a
+    per-unit attempt record cannot represent. The two hit texts are distinct
+    (identical texts embed identically, and the topk cut then breaks the tie
+    arbitrarily) but both carry the probe's vocabulary."""
+    hit_text = {hits[0]: "root cause of the failure at the producer",
+                hits[1]: "the root cause lives where the contract is owned"}
+    con.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,msg_count,"
+                "synced_at) VALUES (%s,'cc_session','claude_code','wide',now(),%s,now())",
+                (unit_id, n))
+    for i in range(n):
+        con.execute(
+            "INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,'2026-01-01')",
+            (unit_id, f"m{i}", i, "user" if i % 2 == 0 else "assistant",
+             hit_text.get(i, f"routine turn {i} regarding neutral matters")))
+    con.commit()
+    _reindex()
+
+
+def test_one_window_does_not_retire_a_units_other_on_topic_positions(
+        store, pg_test_db, mock_embed):
+    """A dig reads a ~15-message window around one retrieval hit, so a unit-level
+    attempt record marked a whole conversation mined on the strength of that
+    window and nothing could ever revisit the rest. Exclusion is per HIT: the
+    unit re-enters the pool at its next unread position, and it retires only
+    when the recorded ranges cover its hits."""
+    _two_hit_unit(store, hits=(10, 50))
+    t = dream.get_topic(store, "t1")
+
+    # per_query=2 keeps wide's pool to exactly its two genuine hits
+    s0 = dream.candidates(store, t, per_query=2)
+    assert s0[0]["unit_id"] == "wide", "the two-hit unit must rank first"
+    first = s0[0]["msg_idx"]
+    assert first in (10, 50)
+
+    # the first dig's window covers only that hit -> the OTHER hit stays minable
+    dream.record_attempt(store, "t1",
+                         [("wide", first - dream.WINDOW_BEFORE,
+                           first + dream.WINDOW_AFTER)])
+    s1 = dream.candidates(store, t,
+                          attempted=dream.attempted_ranges(store, "t1"),
+                          per_query=2)
+    other = 50 if first == 10 else 10
+    assert [(s["unit_id"], s["msg_idx"]) for s in s1
+            if s["unit_id"] == "wide"] == [("wide", other)]
+
+    # once the ranges cover both hits, the unit finally retires
+    dream.record_attempt(store, "t1",
+                         [("wide", other - dream.WINDOW_BEFORE,
+                           other + dream.WINDOW_AFTER)])
+    s2 = dream.candidates(store, t,
+                          attempted=dream.attempted_ranges(store, "t1"),
+                          per_query=2)
+    assert all(s["unit_id"] != "wide" for s in s2), s2
+
+    # ...and recall's coverage states the unrendered remainder from the record
+    cov = dream.recall(store, "", topic_id="t1")["coverage"]
+    assert any("retrieval windows only" in c for c in cov), cov
+
+
+def test_an_empty_rendering_records_no_attempt(store):
     dream.record_attempt(store, "t1", [])
-    assert dream.attempted_units(store, "t1") == set()
+    assert dream.attempted_ranges(store, "t1") == {}
     assert dream.get_topic(store, "t1")["last_dig_at"] is None
 
 
 def test_a_derived_schema_rebuild_erases_the_progress_record_too(store):
     """last_dig_at is derived progress state (written with the attempt record);
     surviving a rebuild would make coverage claim digs that were just erased."""
-    dream.record_attempt(store, "t1", ["u1"])
+    dream.record_attempt(store, "t1", [("u1", 0, 1)])
     store.execute("ALTER TABLE dream_insights ADD COLUMN legacy int")
     store.commit()
     dream.ensure_dream_schema(rebuild=True)
-    assert dream.attempted_units(store, "t1") == set()
+    assert dream.attempted_ranges(store, "t1") == {}
     assert dream.get_topic(store, "t1")["last_dig_at"] is None
 
 

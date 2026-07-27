@@ -285,10 +285,10 @@ substantive reasoning.
 #### Bulk (explicit, one-time-ish) — `dream backfill`
 
 The *deep slate*: unrestricted `sort=relevance` retrieval per probe query, minus
-units already in the topic's ATTEMPT record (`dream_attempted`, written the
-moment a batch is handed to the distiller), walked in batches until the topic's
-candidate pool is exhausted. Never runs on the nightly schedule. Invoked
-deliberately, capped by `--max-calls`, resumable from `dream_attempted`.
+the transcript RANGES already in the topic's ATTEMPT record (`dream_attempted`),
+walked in batches until the topic's candidate pool is exhausted. Never runs on
+the nightly schedule. Invoked deliberately, capped by `--max-calls`, resumable
+from `dream_attempted`.
 
 Progress deliberately derives from the **attempt**, never from what survived the
 gates: the gates reject whole batches by design (10 of 14, 7 of 27 measured), so
@@ -296,6 +296,18 @@ inferring "already mined" from `dream_evidence` re-selected every fully-rejected
 batch at the same rank and re-dug it until the budget expired. The same record
 sets `dream_topics.last_dig_at`, so recall's coverage tier reports "never been
 dug" only when that is literally true.
+
+The attempt record is exactly the work performed, no more. It is written only
+AFTER a distill call returns — a throttled or crashed call read nothing, and a
+pre-written row would exclude its batch from every later backfill while coverage
+reported it dug. And it is scoped to the (unit, from_idx, to_idx) ranges the
+call was actually shown, never the whole unit: a dig reads a ~15-message window
+around one retrieval hit, and marking the unit mined on that basis would retire
+a 20k-message conversation off 0.1% of it — the exact "dug across all of
+history" property this mode exists for. Exclusion is therefore per HIT (a hit
+inside a recorded range is skipped; one outside re-enters the pool even in a
+unit already dug elsewhere), a unit retires only when its ranges cover its hits,
+and recall's coverage tier states the unrendered remainder from the same record.
 
 `dream backfill` is also the right tool after adding a new topic or materially
 rewriting a charter — those are the only recurring reasons to re-sweep history.
@@ -450,11 +462,13 @@ CREATE TABLE dream_pending (             -- triaged, awaiting a dig (see D9)
     PRIMARY KEY (topic_id, unit_id)
 );
 
-CREATE TABLE dream_attempted (           -- the ATTEMPT record (see D4, bulk mode)
+CREATE TABLE dream_attempted (           -- the ATTEMPT record (see D4, bulk mode):
     topic_id  text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
     unit_id   text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
+    from_idx  int NOT NULL,              -- the ranges actually rendered to the
+    to_idx    int NOT NULL,              -- distiller, written after the call returns
     dug_at    timestamptz NOT NULL,
-    PRIMARY KEY (topic_id, unit_id)
+    PRIMARY KEY (topic_id, unit_id, from_idx)
 );
 ```
 

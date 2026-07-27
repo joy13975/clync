@@ -212,18 +212,29 @@ CREATE TABLE IF NOT EXISTS dream_pending (
     PRIMARY KEY (topic_id, unit_id)
 );
 
--- The ATTEMPT record: every (topic, unit) pair ever handed to the distiller,
--- written at the moment of handoff — NOT derived from what survived the gates.
--- Progress and coverage must derive from the attempt: the gates reject heavily
--- by design (10 of 14, 7 of 27 measured), so "no insight survived" is an
--- ordinary outcome, and inferring "never mined" from dream_evidence made
--- backfill re-dig the same fully-rejected batch until the budget expired, while
--- recall's coverage tier called a dug topic "never been dug".
+-- The ATTEMPT record: the exact transcript RANGES ever rendered to the distiller,
+-- per (topic, unit) — NOT derived from what survived the gates, and NOT written
+-- before the work happened. It must record exactly the work performed, no more:
+--   * written only AFTER a distill call returns (a throttled/crashed call read
+--     nothing, and a row for it would exclude the batch from backfill forever
+--     while coverage reported it dug);
+--   * scoped to the rendered ranges, never the whole unit (a dig reads a
+--     ~15-message window around one retrieval hit — one window must not retire
+--     a 20k-message conversation).
+-- Progress and coverage must derive from the attempt rather than the yield: the
+-- gates reject heavily by design (10 of 14, 7 of 27 measured), so "no insight
+-- survived" is an ordinary outcome, and inferring "never mined" from
+-- dream_evidence made backfill re-dig the same fully-rejected batch until the
+-- budget expired, while recall's coverage tier called a dug topic "never been
+-- dug". Ranges are kept merged and disjoint per (topic, unit) — see
+-- record_attempt — so (topic_id, unit_id, from_idx) identifies a row.
 CREATE TABLE IF NOT EXISTS dream_attempted (
     topic_id  text NOT NULL REFERENCES dream_topics(topic_id) ON DELETE CASCADE,
     unit_id   text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
+    from_idx  int NOT NULL,
+    to_idx    int NOT NULL,
     dug_at    timestamptz NOT NULL,
-    PRIMARY KEY (topic_id, unit_id)
+    PRIMARY KEY (topic_id, unit_id, from_idx)
 );
 """
 
@@ -965,6 +976,11 @@ def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
                     _distill_prompt(topic, bodies, len(seeds), held=found,
                                     round_note=note),
                     _DISTILL_SCHEMA, system=_DISTILL_SYSTEM)
+        # The attempt is recorded from what THIS call was actually shown, only
+        # once the call has RETURNED: recorded before it, a throttled call would
+        # retire material that was never read (see record_attempt).
+        record_attempt(con, topic["topic_id"],
+                       _rendered_ranges(round_refmap, slots))
         if out.get("probe_queries_to_add"):
             add_probe_queries(con, topic["topic_id"], out["probe_queries_to_add"])
         found += out["insights"]
@@ -1484,48 +1500,78 @@ def reconcile_evidence(con) -> dict:
 # --------------------------------------------------------------------------- #
 # The dig — retrieval-driven, over the WHOLE corpus (no lookback window)
 # --------------------------------------------------------------------------- #
-def cited_units(con, topic_id: str) -> set[str]:
-    """Source units this topic has already drawn evidence from."""
-    return {r["src_unit_id"] for r in con.execute(
-        "SELECT DISTINCT e.src_unit_id FROM dream_evidence e "
-        "JOIN dream_insights i USING(unit_id) WHERE i.topic_id=%s",
-        (topic_id,)).fetchall()}
+def _rendered_ranges(refmap: dict[str, tuple[str, str]],
+                     slots: dict[str, str]) -> list[tuple[str, int, int]]:
+    """The (unit_id, from_idx, to_idx) spans a rendering ACTUALLY contained,
+    derived from the refs it emitted — the exact messages shown, not the ranges
+    requested. The two differ: a message dropped for size inside a requested
+    range was NOT shown, and must stay minable rather than be recorded as read."""
+    by_slot: dict[str, list[tuple[int, int]]] = {}
+    for ref in refmap:
+        slot, idx = ref.split("#", 1)
+        by_slot.setdefault(slot, []).append((int(idx), int(idx)))
+    return [(slots[slot], lo, hi)
+            for slot, spans in by_slot.items()
+            for lo, hi in _merge(spans)]
 
 
-def record_attempt(con, topic_id: str, unit_ids: list[str]) -> None:
-    """Record the ATTEMPT: these units are being handed to the distiller for this
-    topic, NOW — regardless of what the gates later reject. This is the ONE place
-    progress is written (the attempt rows AND `last_dig_at` move together), and
-    every consumer of "already mined / when was this dug" reads it: `run_backfill`'s
-    exclusion set, `recall`'s coverage tier, the resumability contract. Deriving
-    either from `dream_evidence` conflates *mined* with *yielded* — the gates
-    reject whole batches by design, and a fully-rejected batch must still count as
-    dug or it is re-bought forever. Committed before the model call: the quota is
-    about to be spent whether or not the call succeeds. An EMPTY batch records
-    nothing — no units were handed over, so no attempt happened."""
-    if not unit_ids:
+def record_attempt(con, topic_id: str, ranges: list[tuple[str, int, int]]) -> None:
+    """Record the ATTEMPT: these transcript ranges were rendered to the distiller
+    for this topic and the call has RETURNED — regardless of what the gates later
+    reject. This is the ONE place progress is written (the attempt rows AND
+    `last_dig_at` move together), and every consumer of "already mined / when was
+    this dug" derives from it: `candidates`' per-hit exclusion, `run_backfill`'s
+    resumability, `recall`'s coverage tier. Deriving any of them from
+    `dream_evidence` conflates *mined* with *yielded* — the gates reject whole
+    batches by design, and a fully-rejected batch must still count as read or it
+    is re-bought forever.
+
+    The record is exactly the work performed, no more:
+      * written AFTER the model call returns, never before it — a throttled or
+        crashed call read nothing, and a pre-written row would exclude its batch
+        from every later backfill while coverage reported it dug;
+      * scoped to the RANGES rendered, never the whole unit — one ~15-message
+        window must not retire a 20k-message conversation.
+    Ranges for a (topic, unit) are kept MERGED and disjoint, so exclusion checks
+    and coverage sums never double-count a re-rendered window. An EMPTY list
+    records nothing — nothing was rendered, so no attempt happened."""
+    if not ranges:
         return
-    for unit_id in unit_ids:
-        con.execute(
-            "INSERT INTO dream_attempted (topic_id, unit_id, dug_at) "
-            "VALUES (%s,%s,%s) ON CONFLICT (topic_id, unit_id) "
-            "DO UPDATE SET dug_at=EXCLUDED.dug_at", (topic_id, unit_id, _now()))
+    by_unit: dict[str, list[tuple[int, int]]] = {}
+    for unit_id, lo, hi in ranges:
+        by_unit.setdefault(unit_id, []).append((lo, hi))
+    for unit_id, spans in by_unit.items():
+        existing = [(r["from_idx"], r["to_idx"]) for r in con.execute(
+            "SELECT from_idx, to_idx FROM dream_attempted "
+            "WHERE topic_id=%s AND unit_id=%s", (topic_id, unit_id)).fetchall()]
+        con.execute("DELETE FROM dream_attempted WHERE topic_id=%s AND unit_id=%s",
+                    (topic_id, unit_id))
+        for lo, hi in _merge(existing + spans):
+            con.execute(
+                "INSERT INTO dream_attempted "
+                "(topic_id, unit_id, from_idx, to_idx, dug_at) "
+                "VALUES (%s,%s,%s,%s,%s)", (topic_id, unit_id, lo, hi, _now()))
     con.execute("UPDATE dream_topics SET last_dig_at=%s WHERE topic_id=%s",
                 (_now(), topic_id))
     con.commit()
 
 
-def attempted_units(con, topic_id: str) -> set[str]:
-    """Source units already handed to the distiller for this topic — the attempt
-    record, independent of whether any insight survived the gates."""
-    return {r["unit_id"] for r in con.execute(
-        "SELECT unit_id FROM dream_attempted WHERE topic_id=%s",
-        (topic_id,)).fetchall()}
+def attempted_ranges(con, topic_id: str) -> dict[str, list[tuple[int, int]]]:
+    """The attempt record, per unit: the merged transcript ranges already rendered
+    to the distiller for this topic — independent of whether any insight survived
+    the gates. A retrieval hit inside one of these ranges was already read; a hit
+    outside them is unmined material, whatever the unit."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for r in con.execute(
+            "SELECT unit_id, from_idx, to_idx FROM dream_attempted "
+            "WHERE topic_id=%s ORDER BY unit_id, from_idx", (topic_id,)).fetchall():
+        out.setdefault(r["unit_id"], []).append((r["from_idx"], r["to_idx"]))
+    return out
 
 
 def candidates(con, topic: dict, *, since: str | None = None,
-               exclude: set[str] | None = None, limit: int = DIG_BATCH_UNITS,
-               per_query: int = 10) -> list[dict]:
+               attempted: dict[str, list[tuple[int, int]]] | None = None,
+               limit: int = DIG_BATCH_UNITS, per_query: int = 10) -> list[dict]:
     """Candidate SEEDS for a topic, via the EXISTING hybrid index — the dig reuses
     `search.hybrid_search` rather than growing a second retrieval path.
 
@@ -1535,15 +1581,27 @@ def candidates(con, topic: dict, *, since: str | None = None,
     score (a unit several probes agree on is more on-topic than one a single query
     surfaced); the kept position is the one from that unit's BEST-scoring probe hit,
     because that is the passage the topic was most strongly found in.
-    `since` gives the fresh slate; `exclude` skips already-mined units."""
+
+    `since` gives the fresh slate. `attempted` is the range record from
+    `attempted_ranges`: a hit whose position falls inside an already-rendered
+    range is skipped PER HIT, never per unit — so a long conversation dug at one
+    window is re-selected at its next unread on-topic position, and it leaves
+    the pool only once its recorded ranges cover its hits. That requires
+    retrieval to surface EVERY hit position (`collapse_units=False`): the search
+    surfaces' one-best-chunk-per-unit collapse would structurally hide every
+    position but the first, re-creating whole-unit retirement."""
     import search
-    exclude = exclude or set()
+    attempted = attempted or {}
     total: dict[str, float] = {}
     best: dict[str, tuple[float, int]] = {}
     for q in topic["probe_queries"]:
-        for r in search.hybrid_search(q, topk=per_query, source="all", since=since):
+        for r in search.hybrid_search(q, topk=per_query, source="all", since=since,
+                                      collapse_units=False):
             uid = r["unit_id"]
-            if uid in exclude or r["msg_idx"] is None:
+            if r["msg_idx"] is None:
+                continue
+            if any(lo <= r["msg_idx"] <= hi
+                   for lo, hi in attempted.get(uid, ())):
                 continue
             total[uid] = total.get(uid, 0.0) + r["score"]
             if uid not in best or r["score"] > best[uid][0]:
@@ -1597,7 +1655,9 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
     report = {"units": len(seeds), "candidates": 0, "rejected_grounding": 0,
               "rejected_falsify": 0, "rejected_substance": 0, "written": {},
               "rejections": [], "notes": []}
-    record_attempt(con, topic["topic_id"], [s["unit_id"] for s in seeds])
+    # Progress is recorded inside `distill`, after each model call returns — see
+    # record_attempt. Recording it here, before the call, wrote an attempt row
+    # for work a throttled call never performed.
     raw, refmap = distill(con, topic, seeds, report["notes"])
     report["candidates"] = len(raw)
     if not raw:
@@ -1842,6 +1902,30 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
                        f"({topic['last_dig_at'].date().isoformat()}) — not yet distilled")
     elif topic:
         cov.append(f"topic '{topic['topic_id']}' has never been dug")
+    if topic:
+        # Derived from the SAME attempt record the dig's exclusion uses: a dig
+        # reads retrieval windows, not whole conversations, so "dug" must never
+        # read as "read in full" — the unrendered remainder is a real gap.
+        read = con.execute(
+            "SELECT count(DISTINCT unit_id) AS units, "
+            "coalesce(sum(to_idx - from_idx + 1), 0) AS msgs "
+            "FROM dream_attempted WHERE topic_id=%s",
+            (topic["topic_id"],)).fetchone()
+        if read["units"]:
+            # Renderable messages only (same emptiness predicate as chunking):
+            # tool-output husks can never be rendered or hit, and counting them
+            # would report a gap that no amount of digging could close.
+            total_msgs = con.execute(
+                "SELECT count(*) AS n FROM messages WHERE unit_id IN "
+                "(SELECT DISTINCT unit_id FROM dream_attempted WHERE topic_id=%s) "
+                "AND btrim(coalesce(embed_text, text, '')) <> ''",
+                (topic["topic_id"],)).fetchone()["n"]
+            if read["msgs"] < total_msgs:
+                cov.append(
+                    f"the {read['units']} dug unit(s) were read in retrieval "
+                    f"windows only — {read['msgs']} of their {total_msgs} "
+                    f"messages rendered; the remainder is not distilled "
+                    f"(`clync dream backfill` revisits it)")
     if no_match:
         cov.append("no distilled insight matches this query — the knowledge base "
                    "does not cover it (raw transcript hits below are NOT distilled)")
@@ -2154,13 +2238,17 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
 
 def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
     """The bulk pass — EXPLICIT only, never scheduled. Walks the deep slate:
-    unrestricted relevance retrieval per probe query, minus units this topic has
-    already ATTEMPTED (plus any cited before the attempt record existed), in
+    unrestricted relevance retrieval per probe query, minus the transcript RANGES
+    this topic has already rendered to the distiller (`dream_attempted`), in
     batches until the budget runs out.
 
-    Resumable by construction: progress lives in `dream_attempted` (written the
-    moment a batch is handed to the distiller — see `record_attempt`), so the next
-    invocation continues where this one stopped. It must NOT live in
+    Resumable by construction: progress lives in `dream_attempted`, written by
+    `distill` only AFTER each model call returns — a throttled or crashed call
+    leaves no attempt row, so the next invocation re-selects the same batch
+    instead of permanently skipping work that never happened. Exclusion is per
+    RANGE, not per unit (see `candidates`): a hit at an unread position re-enters
+    the pool even in a unit already dug elsewhere, and a unit leaves the pool
+    only when its recorded ranges cover its hits. Progress must NOT live in
     `dream_evidence`: that records what survived the gates, and a fully-rejected
     batch (ordinary — the gates reject heavily by design) would be re-selected at
     the same rank and re-dug on every invocation, forever."""
@@ -2177,8 +2265,9 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
                 if not budget.take(3):
                     report["stopped_early"] = "max-calls reached"
                     break
-                mined = attempted_units(con, t["topic_id"]) | cited_units(con, t["topic_id"])
-                batch = candidates(con, t, exclude=mined, limit=DIG_BATCH_UNITS)
+                batch = candidates(con, t,
+                                   attempted=attempted_ranges(con, t["topic_id"]),
+                                   limit=DIG_BATCH_UNITS)
                 if not batch:
                     break               # this topic's candidate pool is exhausted
                 rounds.append(dig(con, t, batch))
