@@ -1203,7 +1203,7 @@ def cmd_dream_backfill(args) -> int:
     return 0
 
 
-def _print_dream_report(report: dict) -> int:
+def _print_dream_report(report: dict) -> None:
     print(f"mode        : {report['mode']}")
     if "changed" in report:
         print(f"changed     : {report['changed']} unit(s) since watermark")
@@ -1242,12 +1242,11 @@ def _print_dream_report(report: dict) -> int:
               f"oldest={d['oldest']} (digs at {dream_thresholds()})")
     if report.get("note"):
         print(f"note        : {report['note']}")
-    return 0
 
 
 def dream_thresholds() -> str:
     import dream
-    return (f">={dream.DIG_MIN_UNITS} units or >{dream.DIG_MAX_DEFER_DAYS}d old")
+    return (f">={dream.DIG_MIN_UNITS} units or >={dream.DIG_MAX_DEFER_DAYS}d old")
 
 
 def cmd_dream_recall(args) -> int:
@@ -1323,8 +1322,6 @@ def cmd_doctor(args) -> int:
             nfile = _n("SELECT COUNT(*) n FROM files")
             ndl = _n("SELECT COUNT(*) n FROM files WHERE local_path IS NOT NULL")
             last = get_meta(con, "last_success")
-            import dream
-            dst = dream.status(con)
         finally:
             con.close()
         print(f"store       : {PG_DB}@localhost:{PG_PORT}\n"

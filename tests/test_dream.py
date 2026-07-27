@@ -77,7 +77,7 @@ REFMAP = {"a#0": ("u1", "m1"), "a#1": ("u1", "m2")}
 def _candidate(**over):
     c = {"statement": "Fix bugs at the layer that should have prevented them.",
          "elaboration": "Root-cause rule.", "stance": "user_asserted",
-         "evidence": [{"ref": "a#0", "quote": "Fix bugs at the layer"}]}
+         "evidence": [{"ref": "a#0", "quote": "Fix bugs at the layer that should have prevented"}]}
     c.update(over)
     return c
 
@@ -124,7 +124,7 @@ def test_stale_insight_shape_is_recreated_topics_survive_and_units_are_purged(st
     cols = {r["column_name"] for r in store.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name='dream_insights'").fetchall()}
-    assert cols == dream._INSIGHT_COLS
+    assert cols == dream._declared_cols("dream_insights")
     # hand-edited config survives; the derived units do NOT linger orphaned
     assert [t["topic_id"] for t in dream.topics(store)] == ["t1"]
     assert store.execute("SELECT count(*) n FROM units WHERE source='dream'"
@@ -376,15 +376,15 @@ def test_ground_accepts_a_verbatim_quote(store):
 
 
 def test_ground_accepts_whitespace_differences_only(store):
-    c = _candidate(evidence=[{"ref": "a#0", "quote": "  Fix   bugs\nat the layer  "}])
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "  Fix   bugs\nat the layer that should  have prevented "}])
     assert len(dream.ground(store, c, REFMAP)) == 1
 
 
 @pytest.mark.parametrize("evidence,match", [
     ([], "cites no evidence"),
-    ([{"ref": "e99", "quote": "Fix bugs"}], "never shown to the distiller"),
-    ([{"ref": "", "quote": "Fix bugs"}], "never shown to the distiller"),
-    ([{"ref": "a#0", "quote": "text that is absent"}], "not found verbatim"),
+    ([{"ref": "e99", "quote": "Fix bugs at the layer that should"}], "never shown to the distiller"),
+    ([{"ref": "", "quote": "Fix bugs at the layer that should"}], "never shown to the distiller"),
+    ([{"ref": "a#0", "quote": "a sentence that appears in no transcript"}], "not found verbatim"),
 ])
 def test_ground_rejects_ungrounded_candidates(store, evidence, match):
     with pytest.raises(dream.DreamError, match=match):
@@ -393,8 +393,8 @@ def test_ground_rejects_ungrounded_candidates(store, evidence, match):
 
 def test_ground_rejects_a_candidate_with_one_fabricated_reference(store):
     """Partly grounded is not grounded — it is untrustworthy."""
-    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer"},
-                             {"ref": "ghost", "quote": "Fix bugs at the layer"}])
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer that should have prevented"},
+                             {"ref": "ghost", "quote": "Fix bugs at the layer that should have prevented"}])
     with pytest.raises(dream.DreamError, match="never shown to the distiller"):
         dream.ground(store, c, REFMAP)
 
@@ -406,15 +406,15 @@ def test_ground_refuses_to_cite_derived_text(store):
     store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text) "
                   "VALUES ('dr1','m1',0,'dream','Fix bugs at the layer')")
     store.commit()
-    c = _candidate(evidence=[{"ref": "d1", "quote": "Fix bugs at the layer"}])
+    c = _candidate(evidence=[{"ref": "d1", "quote": "Fix bugs at the layer that should have prevented"}])
     with pytest.raises(dream.DreamError, match="non-raw unit"):
         dream.ground(store, c, {**REFMAP, "d1": ("dr1", "m1")})
 
 
 def test_ground_dedupes_two_quotes_from_one_message(store):
     """(src_unit, src_msg) is the citation key AND the evidence PK."""
-    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer"},
-                             {"ref": "a#0", "quote": "should have prevented"}])
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer that should have prevented"},
+                             {"ref": "a#0", "quote": "that should have prevented them"}])
     assert len(dream.ground(store, c, REFMAP)) == 1
 
 
@@ -422,11 +422,11 @@ def test_a_user_stance_must_cite_a_user_authored_turn(store):
     """The mechanical half of attribution: without it, the only things between an
     assistant turn and a 'user_asserted' insight are two LLM opinions — and
     passes_substance waives the two-source bar on exactly that stance."""
-    c = _candidate(evidence=[{"ref": "a#1", "quote": "root-cause rule"}])
+    c = _candidate(evidence=[{"ref": "a#1", "quote": "that is the root-cause rule"}])
     with pytest.raises(dream.DreamError, match="no user-authored turn"):
         dream.ground(store, c, REFMAP)                # e2 -> m2, an assistant turn
     ok = _candidate(stance="claude_proposed",
-                    evidence=[{"ref": "a#1", "quote": "root-cause rule"}])
+                    evidence=[{"ref": "a#1", "quote": "that is the root-cause rule"}])
     assert len(dream.ground(store, ok, REFMAP)) == 1  # non-user stance: fine
 
 
@@ -538,6 +538,32 @@ def test_triage_fails_loud_on_an_omitted_unit(store, stub_worker):
         {"unit_id": "u1", "topic_ids": [], "reason": "r"}]})
     with pytest.raises(dream.DreamError, match="no verdict for offered"):
         dream.triage(store, ["u1", "u2"])
+
+
+def test_model_text_is_stripped_of_control_characters(store, stub_worker):
+    """Postgres rejects NUL in a `text` column outright, so an unstripped one aborts
+    the dig inside `persist` — after the quota is already spent. Other C0 controls
+    survive into stored statements, corrupting the rendered digest and skewing the
+    whitespace-normalised quote match. Tabs and newlines are real content, kept."""
+    stub_worker.append({"insights": [{"statement": "A\x00 claim\x07 here",
+                                      "elaboration": "tab\tand\nnewline kept",
+                                      "stance": "user_asserted", "evidence": []}],
+                        "probe_queries_to_add": [], "read_requests": []})
+    got, _ = dream.distill(store, dream.get_topic(store, "t1"),
+                           [{"unit_id": "u1", "msg_idx": 0}])
+    assert got[0]["statement"] == "A claim here"
+    assert got[0]["elaboration"] == "tab\tand\nnewline kept"
+
+
+def test_a_quote_too_short_to_identify_a_message_is_rejected(store):
+    """The gate had a prefix CAP but no minimum, so a two-word "quote" grounded an
+    arbitrary claim: any real message contains "Postgres" or "cache", so the citation
+    resolved, the substance gate was waived for user_asserted, and `--evidence`
+    printed the fragment as though it proved the claim."""
+    c = _candidate(statement="The user prefers Postgres over SQLite.",
+                   evidence=[{"ref": "a#0", "quote": "Fix bugs"}])
+    with pytest.raises(dream.DreamError, match="too short to ground"):
+        dream.ground(store, c, REFMAP)
 
 
 # --------------------------------------------------------------------------- #
@@ -661,7 +687,7 @@ def test_reinforce_support_count_is_derived_from_distinct_cited_units(store):
     assert len(rows) == 1 and rows[0]["support_count"] == 1   # ONE distinct source
 
     _add_units(store, 1, start=90)            # u90 — a genuinely new source unit
-    c2 = _candidate(evidence=[{"ref": "e9", "quote": "Fix bugs at the layer"}])
+    c2 = _candidate(evidence=[{"ref": "e9", "quote": "Fix bugs at the layer that should have prevented"}])
     c2["_evidence"] = dream.ground(store, c2, {**REFMAP, "e9": ("u90", "m1")})
     c2.update({"action": "reinforce", "target_id": first["unit_id"]})
     dream.persist(store, t, [c2])
@@ -717,6 +743,45 @@ def test_as_of_after_a_refine_returns_exactly_one_row(store):
     assert [i["statement"] for i in got] == ["Sharper wording of the same position."]
 
 
+def test_two_survivors_cannot_supersede_the_same_held_insight(store):
+    """A dig that splits one held claim into two sharper atoms used to send both as
+    `refine` on the same target: the second overwrote `superseded_by`, orphaning the
+    first replacement, and the digest read "was A, now N2" while N1 sat in Settled as
+    if independently established. With two `contradict`s, both stayed active and the
+    digest presented contradictory claims as simultaneously current. A target can be
+    superseded once; later claimants land as independent new rows."""
+    target = _held(store, statement="One broad claim.")
+    ev = [{"src_unit_id": "u1", "src_msg_id": "m1", "quote": "q", "sender": "user"}]
+    decided = [{**_candidate(statement="Sharper atom one."), "_evidence": ev,
+                "verdict": "upheld", "action": "refine", "target_id": target},
+               {**_candidate(statement="Sharper atom two."), "_evidence": ev,
+                "verdict": "upheld", "action": "refine", "target_id": target}]
+    stats = dream.persist(store, dream.get_topic(store, "t1"), decided)
+
+    assert stats["refine"] == 1 and stats["duplicate_target"] == 1
+    assert stats["new"] == 1
+    # exactly one row points at the target, and nothing is orphaned
+    n = store.execute("SELECT count(*) AS n FROM dream_insights WHERE superseded_by="
+                      "(SELECT superseded_by FROM dream_insights WHERE unit_id=%s)",
+                      (target,)).fetchone()["n"]
+    assert n == 1
+    assert store.execute("SELECT status FROM dream_insights WHERE unit_id=%s",
+                         (target,)).fetchone()["status"] == dream.STATUS_SUPERSEDED
+
+
+def test_deleting_a_source_conversation_takes_its_evidence_with_it(store):
+    """The user deletes a claude.ai conversation; the next sync removes its unit. The
+    quotes drawn from it used to survive, so `dream recall --evidence` went on
+    reprinting verbatim text from the deleted conversation, and the claim could no
+    longer be re-checked by the gate that produced it."""
+    _persist_one(store)
+    assert store.execute("SELECT count(*) AS n FROM dream_evidence").fetchone()["n"] > 0
+    store.execute("DELETE FROM units WHERE unit_id='u1'")     # the source, as sync does
+    store.commit()
+    assert store.execute("SELECT count(*) AS n FROM dream_evidence "
+                         "WHERE src_unit_id='u1'").fetchone()["n"] == 0
+
+
 def test_older_contradicting_evidence_never_inverts_the_timeline(store):
     """Backfill retrieval is relevance-ranked, so mining a 2024 chat after a 2026
     one is routine. Superseding backwards would give the current position an
@@ -733,6 +798,7 @@ def test_older_contradicting_evidence_never_inverts_the_timeline(store):
     c.update({"action": "contradict", "target_id": cur["unit_id"]})
     stats = dream.persist(store, t, [c])
     assert stats == {"new": 1, "reinforce": 0, "refine": 0, "contradict": 0,
+                     "duplicate_target": 0,
                      "out_of_order": 1}
     kept = store.execute("SELECT * FROM dream_insights WHERE unit_id=%s",
                          (cur["unit_id"],)).fetchone()
@@ -762,6 +828,19 @@ def test_raw_facets_are_rejected_for_the_dream_source(pg_test_db):
 # --------------------------------------------------------------------------- #
 # Recall — tiers, loud gaps, bi-temporal
 # --------------------------------------------------------------------------- #
+def test_recall_rejects_uninterpretable_as_of_and_limit_with_advice(store):
+    """The caller is usually a model, and a docstring saying "ISO date" invites
+    `as_of='last week'`. Unvalidated it reached the bind and surfaced as psycopg's
+    InvalidDatetimeFormat, which the MCP tool's handler cannot turn into a
+    correction. It now fails with the correction."""
+    for bad in ("last week", "2026-13-45", ""):
+        with pytest.raises(dream.DreamError, match="ISO date"):
+            dream.recall(store, "x", topic_id="t1", as_of=bad)
+    for bad in (0, -1, "8"):
+        with pytest.raises(dream.DreamError, match="positive integer"):
+            dream.recall(store, "x", topic_id="t1", limit=bad)
+
+
 def test_recall_states_coverage_gaps_loudly(store):
     r = dream.recall(store, "anything", topic_id="t1")
     assert any("no insights" in c for c in r["coverage"])
@@ -985,7 +1064,7 @@ def _distill_one(ref="a#0", statement="Fix bugs at the preventing layer."):
     """`ref` is a label render_windows() emitted: slot letter + message index."""
     return {"insights": [{"statement": statement, "elaboration": "e",
                           "stance": "user_asserted",
-                          "evidence": [{"ref": ref, "quote": "Fix bugs at the layer"}]}],
+                          "evidence": [{"ref": ref, "quote": "Fix bugs at the layer that should have prevented"}]}],
             "probe_queries_to_add": []}
 
 
@@ -1030,7 +1109,8 @@ def test_a_ripe_backlog_digs_and_reports_actual_calls(store, stub_worker,
     assert r["calls"] == store.execute(
         "SELECT count(*) n FROM dream_queue").fetchone()["n"]
     assert r["digs"]["t1"]["written"] == {"new": 1, "reinforce": 0, "refine": 0,
-                                          "contradict": 0, "out_of_order": 0}
+                                          "contradict": 0, "out_of_order": 0,
+                                          "duplicate_target": 0}
     assert not stub_worker, f"{len(stub_worker)} stub output(s) went unused"
 
 

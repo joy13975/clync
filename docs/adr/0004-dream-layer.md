@@ -392,7 +392,10 @@ existing query changes meaning.
 
 ### D9. Pacing: budget-governed, resumable, loud on throttle
 
-- `dream run [--topic T] [--max-calls N]` — the **incremental** mode (D4).
+- `dream run [--max-calls N]` — the **incremental** mode (D4). No `--topic`: the
+  nightly pass digs whatever triage flagged, and restricting that to one topic
+  would leave the other topics' pending units queued behind an advanced
+  watermark. Use `dream backfill --topic T` to work one topic deliberately.
   Enqueues and drains the triage-gated nightly work, then stops. It **cannot**
   enqueue deep-slate items; that separation is enforced in code, not by a default
   flag value, so backfill can never leak into the scheduled run.

@@ -34,10 +34,11 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from clync import (RAW_SOURCES, _json, _now, connect_pg, get_meta,
+from clync import (DEFAULT_TOPK, RAW_SOURCES, _json, _now, connect_pg, get_meta,
                    require_rebuild, set_meta, sql_statements)
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +57,10 @@ STANCES = ("user_asserted", "user_endorsed", "user_rejected",
            "co_derived", "claude_proposed")
 TRUSTED_STANCES = ("user_asserted", "user_endorsed")
 
+# The insight lifecycle vocabulary. Used through these names everywhere, including
+# inside SQL — a literal 'active' in one query is how a rename silently starts
+# reporting zero instead of failing. RETRACTED is reachable only by hand (there is
+# no automatic retraction): recall excludes it, which is the point of having it.
 STATUS_ACTIVE, STATUS_SUPERSEDED, STATUS_RETRACTED = "active", "superseded", "retracted"
 
 # `RAW_SOURCES` (imported from clync — one definition, ADR 0003) is what the dig
@@ -96,7 +101,7 @@ PROBE_QUERIES_MAX = 20
 MAX_NAV_ROUNDS = 1               # rounds of requested expansion per dig
 # Nightly digs are batched ACROSS nights. Measured on the real corpus: six changed
 # units triaged into four topics, and digging every flagged topic immediately cost
-# ~16 calls for one ordinary day — several times the intended nightly budget, since
+# 14 calls for one ordinary day — several times the intended nightly budget, since
 # cost scales with TOPICS TOUCHED, not units changed. So a topic waits until it has
 # accumulated enough pending units to be worth a dig, or until it has waited too
 # long. Nothing is lost by waiting: `dream_pending` holds the assignments.
@@ -104,6 +109,7 @@ WATERMARK_KEY = "dream_last_run_at"   # meta key: high-water mark of the nightly
 DIG_MIN_UNITS = 3                # dig a topic once this many units are pending...
 DIG_MAX_DEFER_DAYS = 7           # ...or this long since its oldest pending unit
 QUOTE_MATCH_CHARS = 60           # prefix of a quote that must appear verbatim
+QUOTE_MIN_CHARS = 25             # ...and the minimum that can identify a message
 # Relevance floor for the recall insight tier, on BGE-M3 dense cosine similarity
 # (RRF scores are rank-only and always return topk rows, so they cannot express
 # "nothing matches"). Calibrated 2026-07-26 on the live store's dream units:
@@ -159,7 +165,13 @@ CREATE INDEX IF NOT EXISTS idx_dream_ins_stance ON dream_insights(stance);
 
 CREATE TABLE IF NOT EXISTS dream_evidence (
     unit_id     text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
-    src_unit_id text NOT NULL,
+    -- The SOURCE unit cascades too. Without it, deleting a claude.ai conversation
+    -- (the user's own deletion, synced through) left the insight active, indexed and
+    -- searchable, and `dream recall --evidence` went on reprinting verbatim text from
+    -- the conversation that was deleted. An insight whose grounding no longer exists
+    -- cannot be re-checked by the gate that produced it, so its evidence goes with
+    -- the source; `support_count` is re-derived from the surviving rows.
+    src_unit_id text NOT NULL REFERENCES units(unit_id) ON DELETE CASCADE,
     src_msg_id  text NOT NULL,
     quote       text NOT NULL,
     PRIMARY KEY (unit_id, src_unit_id, src_msg_id)
@@ -196,11 +208,29 @@ CREATE TABLE IF NOT EXISTS dream_pending (
 # The column set `dream_insights` must have. A mismatch means the shipped schema
 # moved on, and `CREATE TABLE IF NOT EXISTS` would silently keep the old shape
 # until the first INSERT/SELECT blew up somewhere unrelated.
-_INSIGHT_COLS = {
-    "unit_id", "topic_id", "statement", "stance", "status", "superseded_by",
-    "superseded_kind", "support_count", "contested", "valid_from", "valid_until",
-    "first_seen_at", "last_seen_at", "distilled_at", "model", "evidence_sig",
-}
+def _declared_cols(table: str) -> set[str]:
+    """The column names DREAM_SCHEMA declares for `table`. DERIVED from the DDL, not
+    a second hand-maintained list: a copy that falls behind the DDL makes the
+    stale-shape check permanently true, and every provisioning call then wants to
+    rebuild the layer. One source of truth, so the two cannot disagree."""
+    body = DREAM_SCHEMA.split(f"CREATE TABLE IF NOT EXISTS {table} (", 1)[1]
+    body = body.split(");", 1)[0]
+    cols = set()
+    for line in body.splitlines():
+        line = line.split("--", 1)[0].strip()
+        if not line or line.upper().startswith(("PRIMARY KEY", "FOREIGN KEY",
+                                               "UNIQUE", "CHECK", "CONSTRAINT")):
+            continue
+        cols.add(line.split()[0])
+    if not cols:
+        raise DreamError(f"could not read the declared columns of {table!r} "
+                         f"from DREAM_SCHEMA")
+    return cols
+
+
+# The shapes the guard checks. `dream_topics` is deliberately absent: it is
+# hand-edited config, never rebuilt.
+_GUARDED_TABLES = ("dream_insights", "dream_evidence", "dream_pending")
 
 
 def ensure_dream_schema(*, rebuild: bool = False) -> None:
@@ -215,11 +245,19 @@ def ensure_dream_schema(*, rebuild: bool = False) -> None:
     `clync.require_rebuild`). `dream_topics` is spared either way: charters and
     probe queries are hand-edited config, not derived."""
     with connect_pg() as con:
-        have = {r["column_name"] for r in con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name='dream_insights'").fetchall()}
-        if have and have != _INSIGHT_COLS:
-            require_rebuild(rebuild, layer="dream",
+        # EVERY derived table, not just dream_insights. A column added to
+        # dream_evidence used to slip past a dream_insights-only check and then fail
+        # deep inside a dig with "column does not exist" — the exact failure the
+        # guard exists to prevent, one table over.
+        stale = []
+        for table in _GUARDED_TABLES:
+            have = {r["column_name"] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name=%s", (table,)).fetchall()}
+            if have and have != _declared_cols(table):
+                stale.append(table)
+        if stale:
+            require_rebuild(rebuild, layer=f"dream ({', '.join(stale)})",
                             cost="every distilled insight (re-digging spends quota)")
             con.execute("DROP TABLE IF EXISTS dream_evidence")
             con.execute("DROP TABLE IF EXISTS dream_insights")
@@ -652,7 +690,25 @@ def _call(con, kind: str, payload: dict, topic_id: str | None,
         _finish(con, item_id, "failed", error=str(e)[:4000])
         raise
     _finish(con, item_id, "done", usage=usage)
-    return out
+    return _sanitise(out)
+
+
+def _sanitise(value):
+    """Strip NUL and other C0 control characters from every string the model returned.
+
+    Postgres rejects NUL in `text` outright, so an unstripped one aborts the dig deep
+    inside `persist` — after the quota was already spent — and other control
+    characters survive into stored statements where they corrupt the rendered digest
+    and skew the whitespace-normalised quote match. Tabs and newlines are legitimate
+    transcript content and are kept."""
+    if isinstance(value, str):
+        return "".join(ch for ch in value
+                       if ch in "\t\n" or unicodedata.category(ch) != "Cc")
+    if isinstance(value, dict):
+        return {k: _sanitise(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitise(v) for v in value]
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -923,7 +979,12 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
       * the `ref` label must be one the distiller was actually shown (`refmap`);
       * the message it resolves to must EXIST and belong to a RAW source — citing a
         dream unit would make the layer circular;
-      * the quote must appear VERBATIM (whitespace-normalised) in that message.
+      * the quote's first `QUOTE_MATCH_CHARS` must occur in that message under
+        case-folding and whitespace collapse — a substring test, not byte equality,
+        so "verbatim" here means "the model did not paraphrase", not "identical
+        bytes";
+      * and it must be at least `QUOTE_MIN_CHARS` long, or it identifies no
+        particular message and grounds nothing.
     Every citation must resolve. A candidate with one bad reference is not partly
     grounded, it is untrustworthy."""
     ev = candidate.get("evidence") or []
@@ -958,7 +1019,17 @@ def ground(con, candidate: dict, refmap: dict[str, tuple[str, str]]) -> list[dic
         e = {"src_unit_id": src_unit_id, "src_msg_id": src_msg_id,
              "quote": raw["quote"], "sender": row["sender"]}
         needle = _norm(e["quote"])[:QUOTE_MATCH_CHARS]
-        if not needle or needle not in _norm(row["t"]):
+        # A minimum, not just a cap. Any real message contains "postgres" or "cache",
+        # so a two-word "quote" would ground an arbitrary claim while printing under
+        # --evidence as if it proved it. Short quotes are rejected, not silently
+        # accepted: a citation that cannot distinguish one message from another is
+        # not a citation.
+        if len(needle) < QUOTE_MIN_CHARS:
+            raise DreamError(
+                f"quote is too short to ground anything ({len(needle)} < "
+                f"{QUOTE_MIN_CHARS} chars) for ({e['src_unit_id']}, "
+                f"{e['src_msg_id']}): {e['quote'][:80]!r}")
+        if needle not in _norm(row["t"]):
             raise DreamError(
                 f"quote not found verbatim in ({e['src_unit_id']}, {e['src_msg_id']}): "
                 f"{e['quote'][:80]!r}")
@@ -1185,7 +1256,8 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
     Reads each candidate's verified evidence from `_evidence` (attached by the
     grounding gate) — never from a caller-supplied parallel structure."""
     stats = {"new": 0, "reinforce": 0, "refine": 0, "contradict": 0,
-             "out_of_order": 0}
+             "out_of_order": 0, "duplicate_target": 0}
+    superseded_this_run: set[str] = set()
     now = datetime.now(timezone.utc)
     for c in decided:
         ev = c["_evidence"]
@@ -1210,6 +1282,16 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
                 (c["target_id"], hi, _evidence_sig(ev), c["target_id"]))
             stats["reinforce"] += 1
             continue
+
+        if action in ("refine", "contradict") and c["target_id"] in superseded_this_run:
+            # Two survivors targeting the SAME held insight: the second overwrote
+            # `superseded_by`, orphaning the first replacement — the digest then read
+            # "was A, now N2" while N1 sat in Settled as if independently established,
+            # and for two `contradict`s both stayed active, presenting contradictory
+            # claims as simultaneously current. The target can only be superseded
+            # once, so subsequent claimants land as independent new rows.
+            action = "new"
+            stats["duplicate_target"] += 1
 
         if action in ("refine", "contradict"):
             # Chronology gate: superseding demands the NEW evidence not predate the
@@ -1269,6 +1351,7 @@ def persist(con, topic: dict, decided: list[dict]) -> dict:
                 "UPDATE dream_insights SET status=%s, superseded_by=%s, "
                 "superseded_kind=%s, valid_until=%s WHERE unit_id=%s",
                 (STATUS_SUPERSEDED, new_id, action, hi, c["target_id"]))
+            superseded_this_run.add(c["target_id"])
         stats[action] += 1
     con.commit()
     return stats
@@ -1490,7 +1573,8 @@ def render_digest(con, topic_id: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Recall — the dream-first surface (explicit tiers, loud coverage gaps)
 # --------------------------------------------------------------------------- #
-def recall(con, query: str = "", *, topic_id: str | None = None, limit: int = 8,
+def recall(con, query: str = "", *, topic_id: str | None = None,
+           limit: int = DEFAULT_TOPK,
            as_of: str | None = None, include_evidence: bool = False) -> dict:
     """Dream-first recall. Returns explicit TIERS, never one blended ranking:
 
@@ -1507,6 +1591,20 @@ def recall(con, query: str = "", *, topic_id: str | None = None, limit: int = 8,
     `as_of` reads the bi-temporal history — the positions held at that date, rather
     than the current ones."""
     import search
+    # Validate the two caller-supplied values HERE rather than letting them reach a
+    # bind. The caller is usually a model, and "ISO date" in a docstring invites
+    # `as_of='last week'`: unvalidated, that surfaced as psycopg's
+    # InvalidDatetimeFormat, which the MCP tool cannot turn into advice. Fail with
+    # the correction instead.
+    if as_of is not None:
+        try:
+            datetime.fromisoformat(as_of)
+        except (TypeError, ValueError) as e:
+            raise DreamError(
+                f"as_of must be an ISO date or datetime (e.g. '2026-07-01'), "
+                f"got {as_of!r}") from e
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise DreamError(f"limit must be a positive integer, got {limit!r}")
     topic = get_topic(con, topic_id) if topic_id else None
 
     # --- insight tier: semantic retrieval restricted to dream units, then ranked
@@ -1752,7 +1850,7 @@ def _ripe_topics(con) -> dict[str, list[str]]:
     rows = con.execute(
         "SELECT p.topic_id, count(*) AS n, min(p.queued_at) AS oldest "
         "FROM dream_pending p JOIN dream_topics t USING(topic_id) "
-        "WHERE t.status='active' GROUP BY p.topic_id").fetchall()
+        "WHERE t.status=%s GROUP BY p.topic_id", (STATUS_ACTIVE,)).fetchall()
     cutoff = datetime.now(timezone.utc) - timedelta(days=DIG_MAX_DEFER_DAYS)
     ripe = [r["topic_id"] for r in rows
             if r["n"] >= DIG_MIN_UNITS or r["oldest"] <= cutoff]
@@ -1936,11 +2034,12 @@ def status(con) -> dict:
     """Health + coverage for `clync doctor` / `clync dream status`."""
     rows = con.execute(
         "SELECT t.topic_id, t.status, t.last_dig_at, "
-        "count(i.unit_id) FILTER (WHERE i.status='active')     AS active, "
-        "count(i.unit_id) FILTER (WHERE i.status='superseded') AS superseded, "
+        "count(i.unit_id) FILTER (WHERE i.status=%(active)s)     AS active, "
+        "count(i.unit_id) FILTER (WHERE i.status=%(superseded)s) AS superseded, "
         "count(i.unit_id) FILTER (WHERE i.contested)           AS contested "
         "FROM dream_topics t LEFT JOIN dream_insights i USING(topic_id) "
-        "GROUP BY t.topic_id, t.status, t.last_dig_at ORDER BY t.topic_id").fetchall()
+        "GROUP BY t.topic_id, t.status, t.last_dig_at ORDER BY t.topic_id",
+        {"active": STATUS_ACTIVE, "superseded": STATUS_SUPERSEDED}).fetchall()
     # No `digest` field: the digest is rendered from the active insights at read
     # time, so its presence IS `active > 0`. Reporting it separately would be two
     # names for one fact — and the kind that drifts once someone changes one of them.

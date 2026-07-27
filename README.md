@@ -183,9 +183,12 @@ Two separate passes, with cost profiles two orders of magnitude apart:
   mine existing history.
 - **`dream backfill [--topic T] [--max-calls N]`** — the bulk pass. Explicit
   only, never scheduled. This is what mines the existing history and is where
-  the real cost lives (on the order of 100-200 calls for a full first pass
-  across all topics). Resumable: a capped run picks up where it stopped,
-  because progress lives in the evidence table.
+  the real cost lives: on the order of 100-200 calls for a full first pass
+  across all topics, against a **`--max-calls` default of 30**, so the plain
+  command deliberately stops early and prints `stopped_early: max-calls
+  reached`. That is not a failure — repeat it (or pass a larger `--max-calls`)
+  until it stops reporting `stopped_early`. Resumable by construction: progress
+  lives in the evidence table, so a capped run picks up where it stopped.
 
 `dream recall "<query>" [--topic T] [--limit N] [--as-of ISO] [--evidence]`
 does dream-first tiered retrieval from the shell: TOPIC / COVERAGE / DIGEST /

@@ -78,21 +78,17 @@ def recall_knowledge(query: str = "", topic: str | None = None,
     is "what do I think about X" / "what's my position on X" / "summarize my
     knowledge on X"; keep `search_history` for "where did I discuss X".
 
-    Output is tiered, never one blended ranking:
-      - COVERAGE: explicit gaps — topics never dug, or with raw activity newer than
-        the last dig. Always stated; a thin digest presented as complete is worse
-        than an honest "not distilled yet".
-      - DIGEST: the topic's current synthesized position, if one has been written.
-      - INSIGHTS: atomic claims with stance (e.g. user_asserted vs claude_proposed)
-        and citation count; pass include_evidence=True to also print the quoted
-        source text backing each one.
-      - RAW: a small drill-down of raw transcript hits, clearly separated from the
-        distilled tiers above.
+    Output is tiered and labelled (COVERAGE / DIGEST / INSIGHTS / RAW), never one
+    blended ranking. Read the labels: COVERAGE states what is NOT distilled and must
+    be relayed, and RAW hits are undistilled transcript, not the user's position. The
+    `clync` skill carries the full reading guidance — it is not repeated here,
+    because two copies of one instruction is where instructions drift.
 
     topic: restrict to one topic id (see `clync dream topics` for ids); omitted =>
       best-effort match from the query.
-    as_of: ISO date — reads the bi-temporal history, i.e. the position(s) held AT
-      that date rather than the current ones.
+    limit: positive integer.
+    as_of: ISO date (e.g. "2026-07-01") — reads the bi-temporal history, i.e. the
+      position(s) held AT that date rather than the current ones.
     """
     import dream
     ensure_cluster()
@@ -100,7 +96,11 @@ def recall_knowledge(query: str = "", topic: str | None = None,
     try:
         result = dream.recall(con, query, topic_id=topic, limit=limit, as_of=as_of,
                               include_evidence=include_evidence)
-    except ValueError as e:
+    # A bad topic id or an unparseable as_of is CORRECTABLE input, and the caller is a
+    # model: it must get the same "here is what is wrong" string the sibling tool
+    # returns for a bad facet, not an opaque exception. `ValueError` alone caught
+    # neither of the two errors actually reachable here.
+    except (ValueError, dream.DreamError) as e:
         return f"Invalid query: {e}"
     finally:
         con.close()
