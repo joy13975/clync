@@ -70,7 +70,7 @@ REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate
 DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
 # SSOT for the `source` facet values (CLI argparse choices + search validation).
 # `all` deliberately means RAW ONLY (claude_ai + claude_code). The Dream layer
-# (ADR 0004) is reachable via source='dream' or the dream-first `recall_knowledge`
+# (ADR 0004) is reachable via source='dream' or the combined `search_history`
 # surface, never by accident: that keeps every pre-existing query's meaning intact
 # AND makes non-circularity the default — the dig cannot retrieve its own output.
 VALID_SOURCES = ("all", "claude_ai", "claude_code", "dream")
@@ -1251,7 +1251,7 @@ def dream_thresholds() -> str:
 
 
 def cmd_dream_recall(args) -> int:
-    """Dream-first recall: tiered coverage / digest / insights / raw output."""
+    """Recall: coverage / insights / raw transcript sections."""
     import dream
     ensure_cluster()
     con = connect()
@@ -1645,7 +1645,7 @@ def main() -> int:
                     help="cap model calls this run (default: 30)")
     sp.set_defaults(func=cmd_dream_backfill)
 
-    sp = dsub.add_parser("recall", help="dream-first recall: digest -> insights -> raw")
+    sp = dsub.add_parser("recall", help="recall: insights + raw transcripts, in labelled sections")
     sp.add_argument("query", nargs="?", default="", help="natural-language query")
     sp.add_argument("--topic", help="restrict to one topic id")
     sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)

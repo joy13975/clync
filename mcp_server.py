@@ -19,7 +19,7 @@ mcp = FastMCP("clync")
 
 
 @mcp.tool()
-def search_history(
+def search_transcripts(
     query: str = "",
     source: str = "all",
     project: str | None = None,
@@ -33,14 +33,16 @@ def search_history(
     sort: str = "relevance",
     limit: int = DEFAULT_TOPK,
 ) -> str:
-    """Faceted hybrid semantic + lexical search across the user's own history —
-    both claude.ai chats and local Claude Code sessions.
+    """RAW TRANSCRIPTS ONLY, with facets — the drill-down for episode questions
+    ("which session", "in that repo", "back in June"). For a normal question use
+    `search_history` instead: it searches transcripts AND the user's distilled
+    positions in one call, so it cannot miss the half you did not ask for.
 
     query: natural-language query (NOT an FTS expression). Empty => a recency
       browse of the units matching the facets.
     source: "all" (default) | "claude_ai" | "claude_code" | "dream". "all" means
       the two RAW sources only; distilled dream units are returned only when
-      asked for by name (prefer recall_knowledge for those).
+      asked for by name (prefer `search_insights` for those).
     claude.ai facets: project (a project name/uuid, or "any" = in some project,
       "none" = not in a project), model.
     Claude Code facets: repo (e.g. "clync"), worktree, branch, session (name or id).
@@ -71,32 +73,59 @@ def search_history(
 
 
 @mcp.tool()
-def recall_knowledge(query: str = "", topic: str | None = None,
-                     limit: int = DEFAULT_TOPK, as_of: str | None = None,
-                     include_evidence: bool = False) -> str:
-    """Dream-first recall: the user's own DISTILLED knowledge on a topic — what they
-    THINK, not just where they said it. Use this (not `search_history`) when the ask
-    is "what do I think about X" / "what's my position on X" / "summarize my
-    knowledge on X"; keep `search_history` for "where did I discuss X".
+def search_history(query: str = "", topic: str | None = None,
+                   limit: int = DEFAULT_TOPK, as_of: str | None = None,
+                   include_evidence: bool = True) -> str:
+    """THE DEFAULT for any question about the user's own past — searches BOTH layers
+    in one call: their DISTILLED positions (what they concluded) and their RAW
+    transcripts (what was actually said, in claude.ai chats and Claude Code
+    sessions). Use it for "what do I think about X", "what did I decide about Y",
+    "where did I discuss Z", and anything in between — you do not have to classify
+    the question first, which is the point.
 
-    Output is tiered and labelled (COVERAGE / DIGEST / INSIGHTS / RAW), never one
-    blended ranking. Read the labels: COVERAGE states what is NOT distilled and must
-    be relayed, and RAW hits are undistilled transcript, not the user's position. The
-    `clync` skill carries the full reading guidance — it is not repeated here,
-    because two copies of one instruction is where instructions drift.
+    Output is labelled sections (COVERAGE / INSIGHTS / RAW TRANSCRIPTS), never one
+    blended ranking, because a distilled claim and a transcript chunk are not ranked
+    on comparable scores. Read the labels: COVERAGE states what is NOT distilled and
+    must be relayed rather than silently omitted, and RAW hits are undistilled
+    transcript, NOT the user's settled position. Insights carry a stance tag — the
+    user's own assertion is not the same as something Claude once proposed.
 
-    topic: restrict to one topic id (see `clync dream topics` for ids); omitted =>
-      best-effort match from the query.
-    limit: positive integer.
-    as_of: ISO date (e.g. "2026-07-01") — reads the bi-temporal history, i.e. the
-      position(s) held AT that date rather than the current ones.
+    Drill down only when this is not enough: `search_insights` for positions alone,
+    `search_transcripts` for faceted raw search (by repo, project, branch, date).
+
+    topic: restrict to one topic id (see `clync dream topics`); omitted => best-effort
+      match from the query.
+    as_of: ISO date (e.g. "2026-07-01") — the position(s) held AT that date rather
+      than the current ones.
     """
+    return _recall(query, topic, limit, as_of, include_evidence, include_raw=True)
+
+
+@mcp.tool()
+def search_insights(query: str = "", topic: str | None = None,
+                    limit: int = DEFAULT_TOPK, as_of: str | None = None,
+                    include_evidence: bool = True) -> str:
+    """DISTILLED POSITIONS ONLY — the drill-down for when `search_history` surfaced a
+    position and you want more of them without the transcript noise. Same claims,
+    same stance tags and citations, no RAW section.
+
+    Prefer `search_history` for a first query: skipping the transcripts means a
+    question the distilled layer does not cover yet returns nothing at all, and
+    COVERAGE is then the only thing telling you the gap is a gap.
+    """
+    return _recall(query, topic, limit, as_of, include_evidence, include_raw=False)
+
+
+def _recall(query, topic, limit, as_of, include_evidence, *, include_raw: bool) -> str:
+    """One body for both recall surfaces — they differ ONLY by include_raw, and two
+    copies of the error handling is where the two would drift."""
     import dream
     ensure_cluster()
     con = connect()
     try:
         result = dream.recall(con, query, topic_id=topic, limit=limit, as_of=as_of,
-                              include_evidence=include_evidence)
+                              include_evidence=include_evidence,
+                              include_raw=include_raw)
     # A bad topic id or an unparseable as_of is CORRECTABLE input, and the caller is a
     # model: it must get the same "here is what is wrong" string the sibling tool
     # returns for a bad facet, not an opaque exception. `ValueError` alone caught

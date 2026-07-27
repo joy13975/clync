@@ -15,7 +15,7 @@ This file is an index — the actual documentation lives in these:
 | [skill-ops/SKILL.md](skill-ops/SKILL.md) | The `clync-ops` skill — invoked to run/troubleshoot sync, index, search, doctor from the shell. |
 | `clync.py` (module docstring + `--help`) | Sync engine, cookie/Cloudflare handling, the contained Postgres store, CLI. |
 | `cc.py` (module docstring) | Local Claude Code session ingest: JSONL parsing, cleaning, metadata extraction. |
-| `mcp_server.py` (docstring) | The three MCP tools: `search_history` + `get_conversation` over the raw sources, `recall_knowledge` over the distilled Dream layer. |
+| `mcp_server.py` (docstring) | The MCP tools: `search_history` (default — distilled positions AND raw transcripts in one call), the `search_insights` / `search_transcripts` drill-downs, and `get_conversation`. |
 | `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, RRF-fused dense+sparse query. |
 | `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p` (no API billing). Two separate run modes: incremental nightly, explicit bulk backfill. |
 | [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004). |

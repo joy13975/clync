@@ -849,11 +849,45 @@ def test_recall_rejects_uninterpretable_as_of_and_limit_with_advice(store):
             dream.recall(store, "x", topic_id="t1", limit=bad)
 
 
+def test_recall_searches_both_layers_by_default_and_labels_them_separately(
+        store, pg_test_db, mock_embed):
+    """The default surface must not make the caller pick a layer: a real question is
+    usually both "what did I conclude" and "where did I conclude it". The two stay in
+    LABELLED sections rather than one ranking — an insight is scored over a
+    one-sentence claim and a chunk over transcript prose, so blending them would let
+    a stray tool log outrank a distilled position while calling both relevance."""
+    _persist_one(store)
+    pg_test_db.build_index()
+    r = dream.recall(store, "bugs layer prevented")
+    assert r["insights"], "the distilled layer must be searched"
+    assert r["include_raw"] is True
+    lines = "\n".join(dream.format_recall(r))
+    assert "INSIGHTS" in lines and "RAW TRANSCRIPTS" in lines
+    # And no digest: it was a verbatim second copy of the insights under a heading
+    # promising synthesis nobody performed.
+    assert "digest" not in r
+    assert "DIGEST" not in lines
+
+
+def test_insights_only_recall_pays_for_no_transcript_search(
+        store, pg_test_db, mock_embed):
+    """The drill-down exists so a caller wanting positions alone does not pay for a
+    raw search — and the RAW section must then be ABSENT, not an empty section that
+    reads as "no transcripts matched"."""
+    _persist_one(store)
+    pg_test_db.build_index()
+    r = dream.recall(store, "bugs layer prevented", include_raw=False)
+    assert r["raw"] == [] and r["include_raw"] is False
+    lines = "\n".join(dream.format_recall(r))
+    assert "INSIGHTS" in lines
+    assert "RAW TRANSCRIPTS" not in lines
+
+
 def test_recall_states_coverage_gaps_loudly(store):
     r = dream.recall(store, "anything", topic_id="t1")
     assert any("no insights" in c for c in r["coverage"])
     assert any("never been dug" in c for c in r["coverage"])
-    assert r["digest"] == [] and r["insights"] == []
+    assert r["insights"] == []
 
 
 def test_recall_warns_when_the_dig_is_stale(store):
@@ -925,60 +959,6 @@ def test_recall_ranks_trusted_stances_above_unadjudicated(store):
     _persist_one(store, statement="proposed one", stance="claude_proposed")
     got = [i["stance"] for i in dream.recall(store, "", topic_id="t1")["insights"]]
     assert got.index("user_asserted") < got.index("claude_proposed")
-
-
-# --------------------------------------------------------------------------- #
-# Digest — fixed sections, bullets never invented
-# --------------------------------------------------------------------------- #
-def test_digest_buckets_route_by_stance_and_contest(store):
-    _persist_one(store, statement="settled one", stance="user_asserted")
-    _persist_one(store, statement="rejected one", stance="user_rejected")
-    _persist_one(store, statement="unadjudicated one", stance="claude_proposed")
-    b = dream._digest_buckets(store, "t1")
-    assert [r["statement"] for r in b["settled"]] == ["settled one"]
-    assert [r["statement"] for r in b["rejected"]] == ["rejected one"]
-    assert [r["statement"] for r in b["open"]] == ["unadjudicated one"]
-
-
-def test_digest_changed_bucket_keys_on_contradict_never_refine(store):
-    """A refine is the SAME position in better words — reporting it under
-    'Changed positions' with a date asserts a change of mind that never
-    happened. Only a recorded contradict-supersession lands there."""
-    t = dream.get_topic(store, "t1")
-    old = _persist_one(store)
-
-    refined = _candidate(statement="Same position, sharper wording.")
-    refined["_evidence"] = dream.ground(store, refined, REFMAP)
-    refined.update({"action": "refine", "target_id": old["unit_id"]})
-    dream.persist(store, t, [refined])
-    assert dream._digest_buckets(store, "t1")["changed"] == []
-
-    mid = store.execute("SELECT unit_id FROM dream_insights WHERE status=%s",
-                        (dream.STATUS_ACTIVE,)).fetchone()
-    flipped = _candidate(statement="Actually, the opposite position.")
-    flipped["_evidence"] = dream.ground(store, flipped, REFMAP)
-    flipped.update({"action": "contradict", "target_id": mid["unit_id"]})
-    dream.persist(store, t, [flipped])
-    changed = dream._digest_buckets(store, "t1")["changed"]
-    assert [r["statement"] for r in changed] == ["Actually, the opposite position."]
-    assert changed[0]["superseded_statement"] == "Same position, sharper wording."
-
-
-def test_digest_is_rendered_from_rows_with_no_model_call_at_all(store):
-    """The digest was a model call that wrote connective prose around bullets code had
-    already assembled — the only ungrounded text in the store, precomputed for a
-    question nobody had asked. It is now rendered from the rows at read time, so
-    there is nothing to invent and nothing to go stale. `stub_worker` is deliberately
-    absent: a model call here would raise for want of a stub."""
-    _persist_one(store, statement="the only real claim")
-    lines = dream.render_digest(store, "t1")
-    assert any("the only real claim" in ln for ln in lines)
-    assert sum(ln.count("    - ") for ln in lines) == 1   # one bullet, from the DB
-    assert any("Settled" in ln for ln in lines)
-
-
-def test_digest_is_empty_for_a_topic_with_no_insights(store):
-    assert dream.render_digest(store, "t1") == []
 
 
 def test_a_retired_stored_digest_unit_is_cleaned_up(store):
@@ -1453,7 +1433,7 @@ def test_evidence_loss_recounts_support_and_removes_ungrounded_insights(store):
     store.execute("DELETE FROM units WHERE unit_id='u1'")    # the last grounding
     store.commit()
     r = dream.recall(store, "", topic_id="t1")               # recall reconciles
-    assert r["insights"] == [] and r["digest"] == []
+    assert r["insights"] == []
     assert store.execute("SELECT count(*) n FROM units WHERE unit_id=%s",
                          (first["unit_id"],)).fetchone()["n"] == 0
 

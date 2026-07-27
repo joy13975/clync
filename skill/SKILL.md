@@ -1,7 +1,7 @@
 ---
 name: clync
 description: Search, read, or recall the user's OWN past history and distilled positions across BOTH their claude.ai conversations (chat history from the claude.ai web/desktop app) AND their local Claude Code sessions (~/.claude/projects transcripts), synced locally by clync. Use when the user refers to something they discussed with Claude before — "what did I say about X", "find my chat about Y", "the conversation where we designed Z", "pull up my thread on …", "search my claude history", "did I already ask Claude about …", "what did I discuss in the clync repo", "my chat about X in project Y", "find that Claude Code session where I fixed…" — and ALSO when they ask what they think or have concluded: "what's my position on X", "what are my principles about Y", "how do I usually approach Z", "have I settled on X", "did I reject that approach before", "what do I know about X". NOT for web search.
-allowed-tools: mcp__clync__search_history, mcp__clync__recall_knowledge, mcp__clync__get_conversation, Bash
+allowed-tools: mcp__clync__search_history, mcp__clync__search_insights, mcp__clync__search_transcripts, mcp__clync__get_conversation, Bash
 ---
 
 clync keeps a local Postgres/pgvector mirror of the user's history from **two
@@ -10,18 +10,23 @@ top of those sits a **derived layer** of distilled positions (ADR 0004).
 Prefer the **MCP tools** (already registered); fall back to the `clync` CLI
 only if the tools are unavailable in this session.
 
-## Which tool — episode or position?
+## Which tool
 
-Two questions that sound alike need different tools. Get this right first:
+**Start with `search_history` for everything.** It searches BOTH layers in one call —
+the user's distilled positions (what they concluded) and their raw transcripts (what
+was actually said) — and returns them as labelled sections. You do not have to
+classify the question first, and that is deliberate: the old surface made you pick
+between a position tool and a transcript tool, and picking wrong returned "nothing
+found" for a question the other layer could answer.
 
-| The user is asking | Tool | Because |
-|---|---|---|
-| **Where/when did I discuss X?** — find a conversation, a snippet, a pasted doc, a session | `search_history` | They want the *episode*. Raw transcripts, cited by name. |
-| **What do I think about X?** — my position, principle, convention, "how do I usually…", "did I already decide/reject…" | `recall_knowledge` | They want the *conclusion*. Distilled claims, each grounded in real quotes and tagged with who held the position. |
+Reach for a narrower tool only to drill down after that first call:
 
-When both readings are live, run `recall_knowledge` first: it returns the raw tier
-too, so it answers the episode question as a side effect, whereas
-`search_history` cannot answer the position question at all.
+| Want | Tool |
+|---|---|
+| Anything, first query | `search_history` — both layers, labelled |
+| More positions, without transcript noise | `search_insights` |
+| Raw search narrowed by repo / project / branch / date | `search_transcripts` |
+| One conversation in full | `get_conversation` |
 
 Do NOT try to answer a "what do I think" question by reading raw transcripts
 yourself and summarizing. That is what the distilled layer already did, with a
@@ -50,7 +55,7 @@ count too: pasted-file text is indexed.
    user's phrasing implies:
    - `source`: `"all"` (default) | `"claude_ai"` | `"claude_code"` | `"dream"`.
      `"all"` means the two raw sources only — distilled insights come back only
-     via `source="dream"` (prefer `recall_knowledge` for those).
+     via `source="dream"` (prefer `search_insights` for those).
    - claude.ai only: `project` (name/uuid, or `"any"`/`"none"`), `model`.
    - Claude Code only: `repo`, `worktree`, `branch`, `session` (name or id).
    - Both: `since` / `until` (ISO dates), `sort` (`"relevance"` default |
@@ -59,13 +64,13 @@ count too: pasted-file text is indexed.
      pass `repo=` with `source="claude_ai"`.
 
    Example mappings: "what did I discuss in the clync repo" →
-   `search_history(query="", source="claude_code", repo="clync")`; "my chat
-   about X in project Y" → `search_history(query="X", source="claude_ai",
+   `search_transcripts(query="", source="claude_code", repo="clync")`; "my chat
+   about X in project Y" → `search_transcripts(query="X", source="claude_ai",
    project="Y")`; "that session on the feat-cc-sessions branch" →
-   `search_history(query="", source="claude_code", branch="feat-cc-sessions")`.
+   `search_transcripts(query="", source="claude_code", branch="feat-cc-sessions")`.
 
-2. **Recall a position** — `mcp__clync__recall_knowledge(query, topic=…,
-   limit=…, as_of=…, include_evidence=…)`. Returns explicit tiers, and you must
+2. **Positions only (drill-down)** — `mcp__clync__search_insights(query, topic=…,
+   limit=…, as_of=…, include_evidence=…)`. Returns labelled sections, and you must
    respect the distinction between them:
    - `TOPIC` — which topic answered. If it says `[derived …, not requested]`, the
      topic was inferred from what came back; if it looks wrong, the answer is
@@ -74,10 +79,7 @@ count too: pasted-file text is indexed.
      never been dug" or "12 units changed since it was last distilled" is the
      honest answer to a confident-sounding question; presenting a thin digest as
      the user's settled view is the failure mode this layer exists to avoid.
-   - `DIGEST` — the current position in fixed sections (Settled / Rejected
-     approaches / Changed positions / Open). Rendered from the insight rows printed
-     beneath it at read time, so it can never disagree with them and contains no
-     ungrounded prose.
+     There is deliberately no summary/digest section — only grounded claims.
    - `INSIGHTS` — atomic claims, each with a **stance**. Attribute correctly:
      `user_asserted`/`user_endorsed` is the user's own position;
      `user_rejected` is something they turned down (report it AS rejected — it is

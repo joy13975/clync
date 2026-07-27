@@ -23,9 +23,10 @@ macOS + Chrome only.
 5. **Dream** — a third layer, derived rather than synced: `dream.py` distills
    topic-scoped knowledge (grounded, stance-tagged insights + structured
    digests) out of the raw transcripts. See [Dream layer](#dream-layer) below.
-6. **Query** — `mcp_server.py` exposes `search_history` (one faceted hybrid
-   search across both raw sources), `recall_knowledge` (dream-first recall over
-   the distilled layer), and `get_conversation` to Claude Code over stdio.
+6. **Query** — `mcp_server.py` exposes `search_history` (the default: one hybrid
+   search over BOTH the distilled layer and the raw sources, returned as labelled
+   sections), the two drill-downs `search_insights` / `search_transcripts`, and
+   `get_conversation` to Claude Code over stdio.
 
 **Fail-loud:** any auth/HTTP/schema error raises and exits non-zero. It never
 silently serves stale data. The scheduled run additionally fires a macOS
@@ -157,9 +158,9 @@ raw transcripts, and rendering a per-topic **digest** from them on read.
 - **Nothing is deleted.** A changed position closes the old insight's validity
   window and links the supersession, which is what `dream recall --as-of`
   reads — positions held at a given date, not just now.
-- **Non-circular by construction.** `source=all`/`search_history` still means
+- **Non-circular by construction.** `source=all`/`search_transcripts` still means
   raw-only (`claude_ai` + `claude_code`); dreams are reachable only via
-  `source=dream` or `recall_knowledge`. The dig cannot retrieve its own output,
+  `source=dream` or the recall surfaces. The dig cannot retrieve its own output,
   and the worker writes no session transcript, so the layer can never feed on
   itself.
 - **Coverage gaps are stated loudly, never hidden** — an un-dug or stale topic
@@ -194,9 +195,10 @@ Two separate passes, with cost profiles two orders of magnitude apart:
 does dream-first tiered retrieval from the shell: TOPIC / COVERAGE / DIGEST /
 INSIGHTS / RAW TRANSCRIPTS. `--as-of` reads the bi-temporal history (positions
 held at that date, not now); `--evidence` prints the quoted source text behind
-each insight. The same tiered retrieval is exposed to Claude Code as the
-`recall_knowledge` MCP tool (see below) — use it for "what do I think about X",
-and keep `search_history` for "where did I discuss X".
+each insight. The same retrieval is exposed to Claude Code as the `search_history`
+MCP tool (see below), which searches the distilled layer AND the raw transcripts in
+one call so the caller never has to classify the question first; `search_insights`
+and `search_transcripts` are the per-layer drill-downs.
 
 `dream status` reports the watermark, a per-topic table, model-usage totals by
 stage, and the failed-queue count; `clync doctor` includes a one-line dream

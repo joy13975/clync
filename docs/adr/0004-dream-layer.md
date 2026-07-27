@@ -7,10 +7,11 @@
   - **D4** — the dig read each unit's OPENING, not the passage retrieval had
     matched. 42 of 45 matches (93%) fell outside the rendered window. It now
     renders the hit plus surrounding turns, and the dreamer can request more.
-  - **D2** — the stored, model-written digest is deleted. It was the only
-    ungrounded text in the store, a precomputed answer to an unasked question, and
-    it had already gone stale in a way that made recall report "nothing distilled"
-    above a list of distilled insights. Rendered from the insight rows at read time.
+  - **D2** — the digest is deleted OUTRIGHT (model call 2026-07-27, then the
+    read-time renderer 2026-07-28). It was the only ungrounded text in the store, a
+    precomputed answer to an unasked question, and once rendered from the insight
+    rows it was simply those same rows printed twice in one response. The layer now
+    stores and renders exactly one thing: atomic, grounded insights.
   - **D1/D4** — `reconcile` is folded into `falsify`, which was already shown the
     same held-insight list. A ripe topic costs 3 calls, down from 5.
   The cost model in D9 and the topic-status vocabulary in D3 were corrected by
@@ -90,7 +91,7 @@ What the field currently does, and where this design deliberately diverges:
 | Bi-temporal validity; contradictions **close a validity window** instead of deleting | **Zep / Graphiti** | Adopt, at insight level. the user's positions evolve — "you used to think X; since May you think Y" is the valuable answer, not an overwrite. |
 | Every inference must trace to source or it is rejected | **Supermemory** | Adopt as a hard gate, not a guideline. |
 | Multi-signal promotion gates + phases, only the last phase writes durable memory, audit log | **OpenClaw dreaming** (`minScore .8`, `minRecallCount 3`, `minUniqueQueries 3`) | Adopt the gate concept; replace search-hit-count proxies with **real evidence signals** (distinct source units, time spread, stance). |
-| Recursive abstraction ladder | **RAPTOR** — but its own paper reports ~4% of summaries carry minor hallucinations, and hierarchical merging can amplify them | **Reject recursion.** Exactly two levels, digests always re-derived from *raw* evidence (D2). |
+| Recursive abstraction ladder | **RAPTOR** — but its own paper reports ~4% of summaries carry minor hallucinations, and hierarchical merging can amplify them | **Reject recursion.** Exactly ONE derived level: atomic insights from raw evidence, no summary-of-summaries at all (D2). |
 | Un-consolidated content still queryable; derived state catches up in background | **Supermemory** | Adopt, and make the coverage gap *loud* rather than silent (D8). |
 | Lookback window over recent files | OpenClaw (7 days), Supermemory (recent context) | **Reject the window.** We have a BGE-M3 hybrid index over the whole 25M-token corpus, so a topic can be dug across all of history, not just last week (D4). |
 
@@ -152,28 +153,28 @@ or a missing `structured_output` raises. There is no "skip this item and carry
 on" path — the item is marked `failed` with the raw error retained, the run
 aborts if failures exceed a threshold, and `clync doctor` surfaces it.
 
-### D2. One stored level, and a digest rendered at read time
+### D2. ONE level. Atomic insights, and nothing else.
 
-- **`dream_insight`** — one atomic claim, and the ONLY thing this layer stores.
-  "Prefer fixing at the layer that should have prevented the bug over the layer
-  where it surfaced." Carries statement, elaboration, stance, evidence, validity
-  window.
-- **The digest** — one per topic: the current state of the user's thinking on that
-  topic, in **fixed structured sections**, assembled from its *active* insight rows
-  by `dream.render_digest` **when it is asked for**. It is not stored and there is
-  no model call in it.
+- **`dream_insight`** — one atomic claim, and the ONLY thing this layer stores or
+  renders. "Prefer fixing at the layer that should have prevented the bug over the
+  layer where it surfaced." Carries statement, elaboration, stance, evidence,
+  validity window.
 
-  | section | contents |
-  |---|---|
-  | **Settled** | active insights, stance `user_asserted`/`user_endorsed`, with support count |
-  | **Rejected approaches** | active insights with stance `user_rejected` — what was argued against, and why |
-  | **Changed positions** | supersessions recorded as `contradict` (never `refine`): `old → new`, dated from the validity windows |
-  | **Open** | insights the falsification gate marked contested |
+**Revised 2026-07-27**, and again **2026-07-28**. This ADR originally specified a
+stored `dream_digest` unit, written by a `consolidate` model call that composed
+connective prose around bullets code had already assembled. The call was deleted
+first (three reasons below), leaving a digest *rendered* from insight rows at read
+time in fixed sections (Settled / Rejected / Changed / Open).
 
-**Revised 2026-07-27.** This ADR originally specified a stored `dream_digest`
-unit, written by a `consolidate` model call that composed connective prose around
-bullets code had already assembled. That call is deleted. Three reasons, in order
-of weight:
+**That renderer is now deleted too.** Every bullet in it was a verbatim copy of an
+insight printed directly beneath it in the same response — the same payload twice,
+under a heading that promised a synthesis nobody performed. The section grouping was
+the only thing it added, and grouping four buckets does not earn a tier, a name that
+says "digest", or a second printer of the same rows. Higher-level summarisation, if
+it is ever wanted, is a separate feature built deliberately — not the fossil of a
+deleted model call.
+
+The three reasons the model call went, in order of weight:
 
 1. **It was the only ungrounded text in the store.** Every other artifact traces
    to a verbatim quote through a mechanical gate. The digest's prose traced to
@@ -195,9 +196,8 @@ synthesis prose left behind would go on answering `search_history`.
 
 The non-recursion guarantee is unchanged and now trivially true: insights derive
 **only** from raw transcript evidence (`source='all'` means raw only, and the
-grounding gate rejects any citation to a non-raw unit), and the digest is a pure
-function of insight rows computed at read time. Derived text is never input to
-another derivation, so hallucination amplification is capped at one hop — the
+grounding gate rejects any citation to a non-raw unit), and there is no second
+derived level at all. Derived text is never input to another derivation, so hallucination amplification is capped at one hop — the
 specific failure RAPTOR measures, which a deeper ladder compounds.
 
 There is no level 3. Cross-topic synthesis, if ever wanted, is a query-time
@@ -407,8 +407,8 @@ the SSOT-preserving choice: `search.py` already iterates all units, so insights
 get BGE-M3 dense+sparse indexing, facets, and `get_conversation` with no second
 retrieval path.
 
-**Revised 2026-07-27.** `dream_digest` is gone with the `consolidate` call (D2):
-the digest is rendered from insight rows at query time, and `ensure_dream_schema`
+**Revised 2026-07-27/28.** `dream_digest` is gone with the `consolidate` call, and
+the read-time digest renderer with it (D2); `ensure_dream_schema`
 deletes any `kind='dream_digest'` unit left behind. `dream_evidence.src_msg_id`
 and `quote` are `NOT NULL` — an evidence row that cannot name its message or
 reproduce its quote cannot be re-checked by the gate that admitted it, so it is
@@ -498,13 +498,21 @@ is re-derived rather than silently resting on stale evidence.
 
 ### D8. Retrieval: an explicit dream-first surface, not a score fudge
 
-A new MCP tool alongside the existing two:
+**Revised 2026-07-28.** Originally a third tool (`recall_knowledge`) beside a
+raw-only `search_history`, which forced the CALLER to classify the question before
+it had the answer — and classifying wrong returned "nothing found" for a question
+the other layer covered. The surface is now:
 
 ```
-recall_knowledge(query|topic, limit, include_evidence, as_of)
+search_history(query|topic, limit, include_evidence, as_of)      # DEFAULT: both layers
+search_insights(query|topic, limit, include_evidence, as_of)     # positions only
+search_transcripts(query, source, facets..., sort, limit)        # raw only, faceted
 ```
 
-It returns **tiered, labelled** output:
+`search_history` runs both searches and returns **labelled sections** — never one
+blended ranking, because an insight is scored over a one-sentence claim and a chunk
+over transcript prose, so the scores are not commensurable and blending would let a
+stray tool log outrank a distilled position under the same word "relevance".
 
 1. the topic **digest** (if the query maps to a topic),
 2. matching **active insights**, each with stance, support count, and citations,
@@ -527,7 +535,7 @@ Two deliberate choices:
 
 Existing behaviour is preserved: `VALID_SOURCES` gains `'dream'`, but
 `source='all'` continues to mean *raw only*. Dreams are reachable via `source='dream'`
-or `recall_knowledge`. So the non-circularity filter is also the default, and no
+or the recall surfaces. So the non-circularity filter is also the default, and no
 existing query changes meaning.
 
 ### D9. Pacing: budget-governed, resumable, loud on throttle

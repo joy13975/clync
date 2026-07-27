@@ -1711,102 +1711,37 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
 # --------------------------------------------------------------------------- #
 # Consolidate — the topic digest (fixed sections; bullets never invented)
 # --------------------------------------------------------------------------- #
-# The four sections are FIXED and every bullet is a `dream_insights` row, rendered
-# by code — there is no model call in the digest at all, so it cannot invent
-# structure or claims. "Changed positions" exists only because supersession closes
-# windows instead of deleting (D6); "Rejected approaches" only because stance is
-# tracked (D5).
-DIGEST_SECTIONS = ("settled", "rejected", "changed", "open")
-
-
-def _digest_buckets(con, topic_id: str) -> dict[str, list[dict]]:
-    """Group a topic's insights into the four fixed sections. Purely mechanical."""
-    # "Changed positions" is keyed on the RECORDED supersession kind: only a
-    # `contradict` supersession is a change of mind. A `refine` also points here
-    # via superseded_by, but it is by contract the SAME position in better words —
-    # bucketing it as changed would assert a dated change that never happened.
-    rows = con.execute(
-        "SELECT i.*, s.statement AS superseded_statement FROM dream_insights i "
-        "LEFT JOIN dream_insights s "
-        "  ON s.superseded_by = i.unit_id AND s.superseded_kind = 'contradict' "
-        "WHERE i.topic_id=%s AND i.status=%s ORDER BY i.support_count DESC, i.valid_from",
-        (topic_id, STATUS_ACTIVE)).fetchall()
-    b: dict[str, list[dict]] = {s: [] for s in DIGEST_SECTIONS}
-    for r in rows:
-        if r["contested"]:
-            b["open"].append(r)
-        elif r["stance"] == "user_rejected":
-            b["rejected"].append(r)
-        elif r["stance"] in TRUSTED_STANCES:
-            b["settled"].append(r)
-        else:
-            b["open"].append(r)          # unadjudicated: not settled knowledge
-        if r["superseded_statement"]:
-            b["changed"].append(r)
-    return b
-
-
-_SECTION_TITLES = {"settled": "Settled", "rejected": "Rejected approaches",
-                   "changed": "Changed positions", "open": "Open / unadjudicated"}
-
-
 def _stance_label(stance: str, support_count: int) -> str:
-    """The one rendering of an insight's attribution+support suffix (digest
-    bullets AND recall lines) — two copies would drift the moment either gained
-    a field, and this label is what keeps `support_count` honest to the reader."""
+    """The one rendering of an insight's attribution+support suffix — this label is
+    what keeps `support_count` honest to the reader."""
     return f"[{stance}, {support_count} source(s)]"
-
-
-def render_digest(con, topic_id: str) -> list[str]:
-    """A topic's digest, rendered DETERMINISTICALLY from its insight rows, at the
-    moment it is asked for. Empty list when the topic has no insights.
-
-    This replaced a model call that wrote connective prose and stored the result as
-    its own `units` row. The call was deleted, not grounded, for three reasons: the
-    bullets were already assembled from insight rows in code, so the prose was the
-    ONLY ungrounded text anywhere in the store; it was a precomputed answer to a
-    question nobody had asked yet, and a reader holding the actual question
-    synthesizes better than a nightly guess; and a STORED summary of rows that keep
-    changing is a staleness bug waiting to happen. Rendering here removes an entire
-    derived artifact, a nightly call per changed topic, and that staleness window.
-    """
-    b = _digest_buckets(con, topic_id)
-    if not any(b.values()):
-        return []
-    out: list[str] = []
-    for section in DIGEST_SECTIONS:
-        if not b[section]:
-            continue
-        out.append(f"  {_SECTION_TITLES[section]}:")
-        for r in b[section]:
-            if section == "changed":
-                out.append(f"    - was: {r['superseded_statement']}")
-                out.append(f"      now: {r['statement']} "
-                           f"(changed {r['valid_from'].date().isoformat()})")
-            else:
-                out.append(f"    - {r['statement']} "
-                           f"{_stance_label(r['stance'], r['support_count'])} "
-                           f"(last seen {r['last_seen_at'].date().isoformat()})")
-    return out
 
 
 # --------------------------------------------------------------------------- #
 # Recall — the dream-first surface (explicit tiers, loud coverage gaps)
 # --------------------------------------------------------------------------- #
 def recall(con, query: str = "", *, topic_id: str | None = None,
-           limit: int = DEFAULT_TOPK,
+           limit: int = DEFAULT_TOPK, include_raw: bool = True,
            as_of: str | None = None, include_evidence: bool = False) -> dict:
-    """Dream-first recall. Returns explicit TIERS, never one blended ranking:
+    """Search the distilled layer and the raw transcripts TOGETHER, returned as
+    labelled sections rather than one blended ranking:
 
-        digest    -> the topic's synthesized current position (if any)
         insights  -> matching atomic claims, with stance + support + citations
-        raw       -> raw transcript hits, as clearly-marked drill-down
+        raw       -> matching raw transcript hits (omitted when include_raw=False)
         coverage  -> what is NOT distilled yet, stated LOUDLY
 
-    Tiering rather than a score boost is deliberate: a `dream_boost` multiplier
-    inside the ranking would silently interleave a distilled claim with a stray tool
-    log and present the result as relevance. The caller must be able to see which
-    tier an answer came from.
+    Both searches run by default: a real question is usually both "what did I
+    conclude" and "where did I conclude it", and a caller forced to pick one tool
+    first is a caller guessing. Sections rather than a score boost is likewise
+    deliberate: an insight is ranked over a one-sentence claim and a chunk over
+    transcript prose, so the two scores are not commensurable — blending them would
+    let a stray tool log outrank a distilled position while calling both
+    "relevance". The caller must be able to see which layer an answer came from.
+
+    There is deliberately NO digest/summary section. It used to exist and every
+    bullet in it was a verbatim copy of an insight printed directly below it — the
+    same payload twice, under a heading that promised synthesis nobody performed.
+    Higher-level summarisation, if it is ever wanted, is a separate feature.
 
     `as_of` reads the bi-temporal history — the positions held at that date, rather
     than the current ones."""
@@ -1887,14 +1822,18 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
                 "SELECT src_unit_id, src_msg_id, quote FROM dream_evidence "
                 "WHERE unit_id=%s", (i["unit_id"],)).fetchall()
 
-    # --- raw tier: drill-down only, never blended into the tiers above
-    raw = search.hybrid_search(query, topk=limit, source="all") if query.strip() else []
+    # --- raw tier: a SEPARATE section, never blended into the ranking above. Both
+    # searches always run for the default surface, because a question is usually
+    # both ("what did I decide, and where did I decide it"), and making the caller
+    # choose a tool is making it guess. `include_raw=False` backs the
+    # insights-only drill-down, which must not pay for a transcript search.
+    raw = (search.hybrid_search(query, topk=limit, source="all")
+           if include_raw and query.strip() else [])
 
-    # --- coverage: the gap is information the caller MUST have. A thin digest
-    # presented as authoritative is worse than an honest "not distilled yet".
+    # --- coverage: the gap is information the caller MUST have. Silence about what
+    # is NOT distilled reads as "nothing to know here".
     cov: list[str] = []
-    digest = render_digest(con, topic["topic_id"]) if topic else []
-    if topic and not digest:
+    if topic and not insights:
         cov.append(f"topic '{topic['topic_id']}' has no insights yet — nothing distilled")
     if topic and topic["last_dig_at"]:
         # Same eligibility predicate as the nightly selection (_changed_units):
@@ -1939,8 +1878,8 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
                    "does not cover it (raw transcript hits below are NOT distilled)")
     if not topic:
         cov.append("no topic matched this query — showing raw transcript results only")
-    return {"topic": topic, "digest": digest, "insights": insights, "raw": raw,
-            "coverage": cov, "as_of": as_of}
+    return {"topic": topic, "insights": insights, "raw": raw,
+            "coverage": cov, "as_of": as_of, "include_raw": include_raw}
 
 
 def format_recall(result: dict, *, requested_topic: str | None = None,
@@ -1963,12 +1902,7 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
     out.append("\nCOVERAGE:")
     out += [f"  ! {c}" for c in result["coverage"]] or ["  (no gaps)"]
 
-    # Rendered from the insight rows printed below it, at read time — so the digest
-    # can never disagree with them, and nothing here is ungrounded prose.
-    out.append("\nDIGEST (rendered from the insights below):")
-    out += result["digest"] or ["  (none)"]
-
-    out.append("\nINSIGHTS:")
+    out.append("\nINSIGHTS (distilled, grounded in the quotes below):")
     if not result["insights"]:
         out.append("  (none)")
     for i in result["insights"]:
@@ -1979,6 +1913,8 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
                 out.append(f"      {e['src_unit_id']}:{e['src_msg_id']}  "
                            f"{e['quote'][:120]!r}")
 
+    if not result.get("include_raw", True):
+        return out                      # insights-only drill-down: no raw section at all
     out.append("\nRAW TRANSCRIPTS (not distilled):")
     if not result["raw"]:
         out.append("  (none)")
