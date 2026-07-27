@@ -136,10 +136,12 @@ AND forces a filesystem-wide `Read` schema into every call, scoped only by a
 permission denial rather than by absence. Rejected.
 
 Instead the dreamer returns `read_requests` in its structured output and **code**
-fulfils them, re-rendering and re-invoking (`MAX_NAV_ROUNDS`, currently two
-rounds — one bound on every real dig measured, 3/3, so it truncated the feature
-rather than bounding a rare case; unserved requests are reported, which keeps the
-budget auditable against the next measurement). Same capability, fewer parts: no
+fulfils them, re-rendering and re-invoking (`MAX_NAV_ROUNDS`, currently two —
+i.e. two asks can be served. One bound on every real dig measured, 3/3: the first
+ask was served but the informed follow-up, made after seeing the wider window, was
+always refused. Two serves that. It does not end the tail — a large transcript
+always invites another ask — so this is a deliberate budget, and unserved requests
+are reported to keep it auditable). Same capability, fewer parts: no
 MCP process, no second tool surface, no
 new trust boundary, prefill unchanged, and reads are scoped to raw sources *by
 construction* and logged because code performs them. The purity property above

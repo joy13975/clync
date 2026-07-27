@@ -106,14 +106,16 @@ PROBE_QUERIES_MAX = 20
 # already holds): those are the only ones a restate/refine/contradict decision can
 # be about, so the cap costs discrimination nothing where it matters.
 FALSIFY_HELD_MAX = 40
-# Rounds of requested expansion per dig. Was 1, and 1 BOUND ON EVERY REAL DIG
-# measured (3/3, 2-3 requests unserved each, with substantive reasons — "a#3102 is
-# cut off mid-table and the actual recommendations are beyond the cap"). A cap that
-# always binds does not bound a rare case, it truncates the feature: the dreamer
-# asks for the rest of a table it can see it is missing, and never gets it. 2 is the
-# smallest value at which a request can actually be served, and navigation still
-# only costs a call when the dreamer asks for one. The unserved count stays
-# reported, so this value remains auditable against the next measurement.
+# Rounds of requested expansion per dig: the loop runs `MAX_NAV_ROUNDS + 1` calls, so
+# N is how many asks can be SERVED. Was 1, and 1 bound on every real dig measured
+# (3/3, 2-3 requests unserved each, with substantive reasons — "a#3102 is cut off
+# mid-table and the actual recommendations are beyond the cap"). At 1 the first ask
+# was served but the FOLLOW-UP ask — the one made after seeing the wider window, i.e.
+# the informed one — was always refused. 2 serves that. It does not end the tail: at 2
+# a dig still reported 3 unserved, because a large transcript will always invite
+# another ask, which makes this a deliberate budget rather than a bug to chase.
+# Navigation only costs a call when the dreamer asks, and the unserved count stays
+# reported, so the value remains auditable against the next measurement.
 MAX_NAV_ROUNDS = 2
 # Nightly digs are batched ACROSS nights. Measured on the real corpus: six changed
 # units triaged into four topics, and digging every flagged topic immediately cost
