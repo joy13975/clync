@@ -1227,6 +1227,11 @@ def _print_dream_report(report: dict) -> int:
             # charter and prompt quality, and it is useless as a bare number.
             for r in d.get("rejections", []):
                 print(f"      - {r}")
+            # Whatever the dig CAPPED or could not serve — an unserved read request,
+            # a unit it could not position. Cheap-looking output must never hide
+            # work that was silently skipped.
+            for n in d.get("notes", []):
+                print(f"      ! {n}")
     if report.get("consolidated"):
         print(f"consolidated: {', '.join(report['consolidated'])}")
     print(f"calls       : {report['calls']}")

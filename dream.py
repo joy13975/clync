@@ -70,8 +70,28 @@ STATUS_ACTIVE, STATUS_SUPERSEDED, STATUS_RETRACTED = "active", "superseded", "re
 USER_SENDERS = ("human", "user")
 
 TRIAGE_SKELETON_CHARS = 1200     # per unit, for the batched triage call
-CONDENSE_CHARS = 6000            # per unit, for a distill call
 DIG_BATCH_UNITS = 6              # candidate units per distill call
+# The dreamer is shown the RETRIEVAL HIT plus the turns around it, because that is
+# the part of the unit the topic was actually found in. It used to be shown the
+# unit's opening — `ORDER BY idx` up to a char budget — which measured on the real
+# corpus (45 query/unit pairs, units >= 40 messages) put 44/45 = 98% of matches
+# OUTSIDE the rendered window: median match at idx 1039 against a median 23
+# messages rendered, worst case a 23,653-message unit matched at idx 20,927 and
+# rendered from idx 0..19. The layer was distilling conversation preambles.
+WINDOW_BEFORE = 6                # turns of lead-in before the matched message
+WINDOW_AFTER = 8                 # ...and after it (a conclusion tends to follow)
+MSG_CHARS = 1500                 # per-message cap inside a rendered range
+RANGE_CHARS = 6000               # per-range char budget
+RANGE_MSGS = 30                  # per-range message cap
+# A window is a guess whatever size it is, so the dreamer can ASK for more instead:
+# it returns `read_requests` and code fulfils them. Navigation lives in code rather
+# than in a tool because measured on this CLI, reaching an MCP tool requires a
+# non-empty built-in tool selection, which takes per-call prefill from ~2k to 5.4k
+# (or 85.7k with the default set) and puts a filesystem-wide `Read` schema in every
+# call. Code-driven reads cost nothing extra, are scoped to raw sources by
+# construction, and are logged because code performs them.
+MAX_EXPANSIONS = 6               # ranges the dreamer may request per round
+MAX_NAV_ROUNDS = 1               # rounds of requested expansion per dig
 # Nightly digs are batched ACROSS nights. Measured on the real corpus: six changed
 # units triaged into four topics, and digging every flagged topic immediately cost
 # ~16 calls for one ordinary day — several times the intended nightly budget, since
@@ -435,49 +455,130 @@ def skeleton(con, unit_id: str) -> str:
     return f"{_unit_header(u)}\n{body[:TRIAGE_SKELETON_CHARS]}"
 
 
-def condense(con, unit_ids: list[str]) -> tuple[str, dict[str, tuple[str, str]]]:
-    """Render a batch of transcripts for the distiller. Returns (text, refmap).
+def _slot(i: int) -> str:
+    """Per-dig transcript label. Short on purpose: it is half of every citation ref,
+    and a ref the model must copy has to be cheap to copy correctly."""
+    if i >= 26:
+        raise DreamError(f"more than 26 seed units in one dig ({i + 1}) — "
+                         f"slot labels are single letters")
+    return chr(ord("a") + i)
 
-    Every quotable message gets a SHORT label — `[e7 user]` — and `refmap` maps that
-    label back to the real `(unit_id, msg_id)`. The model never sees or copies a UUID.
 
-    This is deliberate, and it replaced copying `unit_id=… msg_id=…` pairs: measured
-    on a real dig, the model was shown the correct 36-char UUID and wrote back
-    `…ad4d227fceff` for `…ad4d277fceff` — one transposed digit. The grounding gate
-    correctly rejected it, which meant THREE genuinely-grounded insights (20% of that
-    dig) were thrown away over a copy error. Fuzzy-matching the id would have been the
-    wrong fix: the nearest id is not necessarily the cited one, and a mis-resolved
-    citation is worse than a rejected one. So the transcription burden is removed
-    instead — a 2-3 character token is copyable, and an unknown label still fails
-    loud."""
+def _merge(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Union overlapping/adjacent idx ranges, so a requested expansion that abuts the
+    seed window renders as one continuous passage instead of a repeated block."""
+    out: list[tuple[int, int]] = []
+    for lo, hi in sorted(ranges):
+        if out and lo <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def render_windows(con, seeds: list[dict], expansions: list[dict] | None = None
+                   ) -> tuple[str, dict[str, tuple[str, str]], dict[str, str]]:
+    """Render the retrieval hits for the distiller. Returns (text, refmap, slots).
+
+    Each seed is `{"unit_id", "msg_idx"}` from retrieval — a unit AND the position
+    the match was found at. It renders as that message plus `WINDOW_BEFORE` /
+    `WINDOW_AFTER` neighbouring turns, with the matched turn marked. `expansions`
+    are `{"slot", "from_idx", "to_idx"}` ranges the dreamer asked to read; they are
+    unioned with the seed window for that slot.
+
+    Every quotable message carries a ref of the form `a#1042` — its slot plus its
+    index in the unit. `refmap` maps that back to `(unit_id, msg_id)`, so the model
+    never sees or copies a UUID: shown the correct 36-char id, a real dig wrote back
+    `...ad4d227fceff` for `...ad4d277fceff` — one transposed digit — and the
+    grounding gate correctly discarded THREE genuinely-grounded insights (20% of the
+    dig) over a copy error. Fuzzy-matching the id would have been the wrong fix (the
+    nearest id is not necessarily the cited one, and a mis-resolved citation is worse
+    than a rejected one), so the transcription burden is removed instead. The ref is
+    also a RULE rather than a table — slot plus index resolves for any index — which
+    is what lets navigation address unread messages without the model handling ids.
+
+    Truncation is always announced in the text. A silently clipped window is how the
+    dreamer comes to believe it has read a passage it has not."""
+    slots: dict[str, str] = {}
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    hit_at: dict[str, int] = {}
+    for i, seed in enumerate(seeds):
+        slot = _slot(i)
+        slots[slot] = seed["unit_id"]
+        # A seed with no matched position can only come from a browse (no query), and
+        # the dig always queries. Fail rather than quietly re-centring on idx 0 —
+        # that is precisely the bug this rendering exists to remove.
+        if seed.get("msg_idx") is None:
+            raise DreamError(
+                f"seed for unit {seed['unit_id']!r} carries no msg_idx — refusing to "
+                f"render the unit's opening as if it were the match")
+        hit_at[slot] = seed["msg_idx"]
+        ranges[slot] = [(max(0, seed["msg_idx"] - WINDOW_BEFORE),
+                         seed["msg_idx"] + WINDOW_AFTER)]
+    for e in expansions or []:
+        if e["slot"] not in slots:
+            raise DreamError(f"read request names unknown transcript {e['slot']!r} "
+                             f"(known: {sorted(slots)})")
+        lo, hi = int(e["from_idx"]), int(e["to_idx"])
+        if hi < lo:
+            raise DreamError(f"read request for {e['slot']!r} has to_idx {hi} "
+                             f"before from_idx {lo}")
+        ranges[e["slot"]].append((max(0, lo), hi))
+
     refmap: dict[str, tuple[str, str]] = {}
-    parts, n = [], 0
-    for unit_id in unit_ids:
+    parts = []
+    for slot, unit_id in slots.items():
         u = con.execute("SELECT * FROM units WHERE unit_id=%s", (unit_id,)).fetchone()
         if not u:
             raise DreamError(f"no such unit: {unit_id!r}")
-        rows = con.execute(
-            f"SELECT m.msg_id, m.sender, {_TEXT} AS t FROM messages m "
-            f"WHERE m.unit_id=%s AND {_TEXT} IS NOT NULL AND {_TEXT} != '' "
-            "ORDER BY m.idx", (unit_id,)).fetchall()
-        segs, used = [], 0
-        for r in rows:
-            t = (r["t"] or "").strip()
-            if not t:
+        total = con.execute("SELECT count(*) AS n FROM messages WHERE unit_id=%s",
+                            (unit_id,)).fetchone()["n"]
+        blocks = []
+        for lo, hi in _merge(ranges[slot]):
+            rows = con.execute(
+                f"SELECT m.idx, m.msg_id, m.sender, {_TEXT} AS t FROM messages m "
+                f"WHERE m.unit_id=%s AND m.idx BETWEEN %s AND %s "
+                f"AND {_TEXT} IS NOT NULL AND {_TEXT} != '' ORDER BY m.idx",
+                (unit_id, lo, hi)).fetchall()
+            quotable = [r for r in rows if (r["t"] or "").strip()]
+            # The size cap is spent OUTWARD FROM THE MATCH, never from the start of
+            # the range. Spending it from the start lets a wide requested expansion
+            # evict the matched message itself — which is precisely the render-the-
+            # wrong-part failure this whole path exists to remove. Messages are
+            # selected by distance from the hit, then printed in reading order.
+            hit = hit_at[slot]
+            order = (sorted(quotable, key=lambda r: abs(r["idx"] - hit))
+                     if lo <= hit <= hi else quotable)
+            keep, used = [], 0
+            for r in order:
+                if len(keep) >= RANGE_MSGS or used >= RANGE_CHARS:
+                    break
+                keep.append(r)
+                used += len(r["t"])
+            dropped = len(quotable) - len(keep)
+            segs = []
+            for r in sorted(keep, key=lambda r: r["idx"]):
+                ref = f"{slot}#{r['idx']}"
+                mark = "   <-- retrieval match" if r["idx"] == hit else ""
+                segs.append(f"[{ref} {r['sender']}]{mark}\n{(r['t'] or '').strip()[:MSG_CHARS]}")
+                refmap[ref] = (unit_id, r["msg_id"])
+            if not segs:
                 continue
-            n += 1
-            ref = f"e{n}"
-            seg = f"[{ref} {r['sender']}]\n{t[:1500]}"
-            if used + len(seg) > CONDENSE_CHARS:
-                n -= 1
-                break
-            refmap[ref] = (unit_id, r["msg_id"])
-            segs.append(seg)
-            used += len(seg)
-        parts.append(f"{_unit_header(u)}\n\n" + "\n\n".join(segs))
+            head = f"-- {slot}: messages {lo}-{hi} of {total} --"
+            if dropped:
+                head += (f"\n[{dropped} message(s) in this range omitted for size — "
+                         f"request a narrower range to read them]")
+            blocks.append(head + "\n\n" + "\n\n".join(segs))
+        if not blocks:
+            continue
+        parts.append(f"TRANSCRIPT {slot} — {_unit_header(u)}\n"
+                     f"({total} messages; retrieval matched at message "
+                     f"{hit_at[slot]})\n\n" + "\n\n".join(blocks))
     if not refmap:
-        raise DreamError(f"nothing quotable in units {unit_ids} — refusing to distill")
-    return "\n\n---\n\n".join(parts), refmap
+        raise DreamError(
+            f"nothing quotable in the retrieved windows of {[s['unit_id'] for s in seeds]}"
+            f" — refusing to distill")
+    return "\n\n=====\n\n".join(parts), refmap, slots
 
 
 # --------------------------------------------------------------------------- #
@@ -628,7 +729,14 @@ _DISTILL_SYSTEM = (
     "'Fix bugs at the layer that should have prevented them, not where they surfaced' "
     "is knowledge. Respect the charter's OUT clause strictly.\n"
     "4. Do not invent. If the transcripts carry nothing durable for this topic, return "
-    "an empty list. An empty list is a valid, useful answer."
+    "an empty list. An empty list is a valid, useful answer.\n"
+    "5. You are shown a WINDOW around the passage that matched the search, not the "
+    "whole conversation — the header of each transcript says how many messages it "
+    "has and where the match was. When a window starts or ends mid-thread and you "
+    "need the rest to distill honestly, ask for it in `read_requests` (slot letter "
+    "plus an index range, and why) instead of guessing at what was said. Return the "
+    "insights you can already support in the SAME response; requested passages come "
+    "back in one follow-up round. Asking for nothing is fine when the windows suffice."
 )
 
 _DISTILL_SCHEMA = {
@@ -660,34 +768,91 @@ _DISTILL_SCHEMA = {
             },
         },
         "probe_queries_to_add": {"type": "array", "items": {"type": "string"}},
+        "read_requests": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "slot": {"type": "string"},
+                    "from_idx": {"type": "integer"},
+                    "to_idx": {"type": "integer"},
+                    "why": {"type": "string"},
+                },
+                "required": ["slot", "from_idx", "to_idx", "why"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["insights", "probe_queries_to_add"],
+    "required": ["insights", "probe_queries_to_add", "read_requests"],
     "additionalProperties": False,
 }
 
 
-def distill(con, topic: dict, unit_ids: list[str]
+def _distill_prompt(topic: dict, bodies: str, n: int, *, held: list[dict],
+                    round_note: str = "") -> str:
+    return (f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n=====\n\n"
+            f"TRANSCRIPT WINDOWS ({n})\n\n{bodies}\n\n=====\n"
+            + round_note
+            + (("ALREADY CAPTURED in this dig (do not repeat these):\n"
+                + "\n".join(f"  - {c['statement']}" for c in held) + "\n\n")
+               if held else "")
+            + "Distill this topic's durable knowledge from the windows above. Cite "
+              "each insight with the `ref` label of the message it came from (the "
+              "token in its [<slot>#<index> sender] marker) plus a verbatim quote "
+              "from that same message. Suggest any search phrases that would have "
+              "found this material but are not obvious from the topic name. Request "
+              "further passages only where a window genuinely cuts off what you need.")
+
+
+def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
             ) -> tuple[list[dict], dict[str, tuple[str, str]]]:
-    """One call per topic-batch -> (candidate insights, refmap). Candidates are
+    """Distill one topic-batch -> (candidate insights, refmap). Candidates are
     ungrounded and unverified; the refmap resolves their `ref` labels to real ids.
 
-    Also folds back any probe queries the distiller proposes, so vocabulary the
-    seed queries missed sharpens the NEXT dig's retrieval."""
-    if not unit_ids:
+    Each seed is a retrieval hit (unit + matched position), rendered as a window
+    around that position. The distiller may ask to read further ranges; code fulfils
+    the request and re-invokes with the wider rendering, up to `MAX_NAV_ROUNDS`. The
+    insights from each round are KEPT and unioned — a round is an addition, not a
+    do-over, so nothing already paid for is thrown away.
+
+    Also folds back any probe queries the distiller proposes, so vocabulary the seed
+    queries missed sharpens the NEXT dig's retrieval.
+
+    Anything CAPPED or UNSERVED is appended to `notes` when given, and reported. A
+    silently dropped read request reads as "the windows sufficed" when they did
+    not."""
+    if not seeds:
         return [], {}
-    bodies, refmap = condense(con, unit_ids)
-    prompt = (f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n=====\n\n"
-              f"TRANSCRIPTS ({len(unit_ids)})\n\n{bodies}\n\n=====\n"
-              f"Distill this topic's durable knowledge from the transcripts above. "
-              f"Cite each insight with the `ref` label of the message it came from (the "
-              f"token in its [e<N> sender] marker) plus a verbatim quote from that same "
-              f"message. Also suggest any search phrases that would have found "
-              f"this material but are not obvious from the topic name.")
-    out = _call(con, "distill", {"topic_id": topic["topic_id"], "unit_ids": unit_ids},
-                topic["topic_id"], prompt, _DISTILL_SCHEMA, system=_DISTILL_SYSTEM)
-    if out.get("probe_queries_to_add"):
-        add_probe_queries(con, topic["topic_id"], out["probe_queries_to_add"])
-    return out["insights"], refmap
+    expansions: list[dict] = []
+    found: list[dict] = []
+    refmap: dict[str, tuple[str, str]] = {}
+    for round_no in range(MAX_NAV_ROUNDS + 1):
+        bodies, refmap, slots = render_windows(con, seeds, expansions)
+        note = ("The passages you requested are now included below.\n\n"
+                if round_no else "")
+        out = _call(con, "distill",
+                    {"topic_id": topic["topic_id"], "round": round_no,
+                     "unit_ids": [s["unit_id"] for s in seeds]},
+                    topic["topic_id"],
+                    _distill_prompt(topic, bodies, len(seeds), held=found,
+                                    round_note=note),
+                    _DISTILL_SCHEMA, system=_DISTILL_SYSTEM)
+        if out.get("probe_queries_to_add"):
+            add_probe_queries(con, topic["topic_id"], out["probe_queries_to_add"])
+        found += out["insights"]
+        reqs = out.get("read_requests") or []
+        if not reqs or round_no >= MAX_NAV_ROUNDS:
+            # Requests arriving in the FINAL round cannot be served. Say so rather
+            # than dropping them: it is the signal that MAX_NAV_ROUNDS is too low.
+            if reqs and notes is not None:
+                notes.append(
+                    f"{len(reqs)} read request(s) unserved: no rounds left "
+                    f"(MAX_NAV_ROUNDS={MAX_NAV_ROUNDS}) — e.g. {reqs[0]['why'][:80]}")
+            break
+        if len(reqs) > MAX_EXPANSIONS and notes is not None:
+            notes.append(f"capped {len(reqs)} read requests to {MAX_EXPANSIONS}")
+        expansions = reqs[:MAX_EXPANSIONS]
+    return found, refmap
 
 
 # --------------------------------------------------------------------------- #
@@ -1114,33 +1279,79 @@ def cited_units(con, topic_id: str) -> set[str]:
 
 def candidates(con, topic: dict, *, since: str | None = None,
                exclude: set[str] | None = None, limit: int = DIG_BATCH_UNITS,
-               per_query: int = 10) -> list[str]:
-    """Candidate source units for a topic, via the EXISTING hybrid index — the dig
-    reuses `search.hybrid_search` rather than growing a second retrieval path.
+               per_query: int = 10) -> list[dict]:
+    """Candidate SEEDS for a topic, via the EXISTING hybrid index — the dig reuses
+    `search.hybrid_search` rather than growing a second retrieval path.
 
-    Unioned across the topic's probe queries and ranked by how many probes found a
-    unit (a unit several probes agree on is more on-topic than one a single query
-    surfaced). `since` gives the fresh slate; `exclude` skips already-mined units."""
+    A seed is `{"unit_id", "msg_idx", "score"}`: the unit AND the position the match
+    was found at, so the dig can render the matched passage instead of the unit's
+    opening. Units are unioned across the topic's probe queries and ranked by summed
+    score (a unit several probes agree on is more on-topic than one a single query
+    surfaced); the kept position is the one from that unit's BEST-scoring probe hit,
+    because that is the passage the topic was most strongly found in.
+    `since` gives the fresh slate; `exclude` skips already-mined units."""
     import search
     exclude = exclude or set()
-    hits: dict[str, float] = {}
+    total: dict[str, float] = {}
+    best: dict[str, tuple[float, int]] = {}
     for q in topic["probe_queries"]:
         for r in search.hybrid_search(q, topk=per_query, source="all", since=since):
-            if r["unit_id"] not in exclude:
-                hits[r["unit_id"]] = hits.get(r["unit_id"], 0.0) + r["score"]
-    return [u for u, _ in sorted(hits.items(), key=lambda kv: -kv[1])][:limit]
+            uid = r["unit_id"]
+            if uid in exclude or r["msg_idx"] is None:
+                continue
+            total[uid] = total.get(uid, 0.0) + r["score"]
+            if uid not in best or r["score"] > best[uid][0]:
+                best[uid] = (r["score"], r["msg_idx"])
+    ranked = sorted(total.items(), key=lambda kv: -kv[1])[:limit]
+    return [{"unit_id": u, "msg_idx": best[u][1], "score": sc} for u, sc in ranked]
 
 
-def dig(con, topic: dict, unit_ids: list[str]) -> dict:
+def seeds_for(con, topic: dict, unit_ids: list[str]) -> tuple[list[dict], list[str]]:
+    """Locate WHERE each already-assigned unit is relevant to this topic.
+
+    `dream_pending` stores unit ASSIGNMENTS (triage decided the unit touches the
+    topic); the position is a retrieval fact, so it is computed here at dig time
+    rather than stored. For each unit, the chunk nearest any of the topic's probe
+    queries gives the seed position — the same signal `candidates` gets straight
+    from `hybrid_search`.
+
+    Returns (seeds, unpositioned). A unit with no indexed chunk cannot be
+    positioned, and is RETURNED rather than silently centred on idx 0 or dropped:
+    the caller reports it and leaves it pending, so it is visible instead of lost."""
+    import search
+    if not unit_ids:
+        return [], []
+    dense, _ = search._embed(list(topic["probe_queries"]), max_length=512)
+    lits = [search._dense_literal(d) for d in dense]
+    seeds, unpositioned = [], []
+    for unit_id in unit_ids:
+        best: tuple[float, int] | None = None
+        for lit in lits:
+            r = con.execute(
+                "SELECT msg_idx, 1 - (dense <=> %s::vector) AS sim FROM chunks "
+                "WHERE unit_id=%s AND msg_idx IS NOT NULL "
+                "ORDER BY dense <=> %s::vector LIMIT 1", (lit, unit_id, lit)).fetchone()
+            if r and (best is None or r["sim"] > best[0]):
+                best = (float(r["sim"]), r["msg_idx"])
+        if best is None:
+            unpositioned.append(unit_id)
+        else:
+            seeds.append({"unit_id": unit_id, "msg_idx": best[1], "score": best[0]})
+    return seeds, unpositioned
+
+
+def dig(con, topic: dict, seeds: list[dict]) -> dict:
     """The full pipeline for one topic-batch: distill -> ground -> falsify ->
-    substance -> reconcile -> persist. Returns per-stage counts.
+    substance -> persist. Returns per-stage counts.
 
-    Rejections are COUNTED and reported, never silently absorbed: a high reject
-    rate is information about prompt or gate quality, not noise to hide."""
-    report = {"units": len(unit_ids), "candidates": 0, "rejected_grounding": 0,
+    `seeds` are retrieval hits (unit + matched position), from `candidates` or
+    `seeds_for`. Rejections are COUNTED and reported, never silently absorbed: a
+    high reject rate is information about prompt or gate quality, not noise to
+    hide."""
+    report = {"units": len(seeds), "candidates": 0, "rejected_grounding": 0,
               "rejected_falsify": 0, "rejected_substance": 0, "written": {},
-              "rejections": []}
-    raw, refmap = distill(con, topic, unit_ids)
+              "rejections": [], "notes": []}
+    raw, refmap = distill(con, topic, seeds, report["notes"])
     report["candidates"] = len(raw)
     if not raw:
         return report
@@ -1677,11 +1888,21 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
                 break
             batch = unit_ids[:DIG_BATCH_UNITS]
             t = get_topic(con, tid)
-            report["digs"][tid] = dig(con, t, batch)
+            # Triage assigned the units; retrieval says WHERE in each one this topic
+            # lives. A unit that cannot be positioned is reported and left pending —
+            # never rendered from idx 0, which is the bug this whole path exists to
+            # remove, and never dropped.
+            seeds, unpositioned = seeds_for(con, t, batch)
+            rep = dig(con, t, seeds)
+            if unpositioned:
+                rep["notes"].append(
+                    f"{len(unpositioned)} unit(s) not in the search index, left "
+                    f"pending: {', '.join(u[:8] for u in unpositioned)}")
+            report["digs"][tid] = rep
             # Only the units actually mined leave the queue. The rest stay pending and
             # are picked up next run, instead of being dropped by the batch cap after
             # the watermark has already moved past them.
-            _clear_pending(con, tid, batch)
+            _clear_pending(con, tid, [s["unit_id"] for s in seeds])
 
         for tid, rep in report["digs"].items():
             if not any(rep["written"].values()):

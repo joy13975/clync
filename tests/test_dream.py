@@ -22,9 +22,13 @@ import dream
 # Fixtures
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def store(pg_test_db, monkeypatch):
+def store(pg_test_db, mock_embed, monkeypatch):
     """Throwaway store with the dream schema + one seeded topic and a raw unit
-    whose messages can be legitimately cited."""
+    whose messages can be legitimately cited.
+
+    The content is INDEXED, because a dig is now positioned by retrieval: it reads
+    the window around the matched message, so `seeds_for` needs real chunks. The
+    embedder is the deterministic stub, so this stays fast."""
     con = clync.connect()
     con.execute("INSERT INTO units (unit_id,kind,source,title,created_at,updated_at,"
                 "msg_count,synced_at) VALUES ('u1','cc_session','claude_code','sess',"
@@ -38,8 +42,16 @@ def store(pg_test_db, monkeypatch):
                 "created_at) VALUES ('t1','Topic One','Charter text.',%s,'active',now())",
                 (clync._json(["root cause"]),))
     con.commit()
+    _reindex()
     yield con
     con.close()
+
+
+def _reindex():
+    """Refresh the vector index after seeding raw content. A dig positions itself
+    from `chunks`, so unindexed content is invisible to it."""
+    import search
+    search.build_index(full=False)
 
 
 @pytest.fixture
@@ -57,15 +69,15 @@ def stub_worker(monkeypatch):
     return outputs
 
 
-# The distiller cites SHORT labels, never UUIDs (see dream.condense) — so a test
-# supplies both the candidate and the refmap the labels resolve through.
-REFMAP = {"e1": ("u1", "m1"), "e2": ("u1", "m2")}
+# The distiller cites SHORT slot#index labels, never UUIDs (see render_windows) —
+# so a test supplies both the candidate and the refmap its labels resolve through.
+REFMAP = {"a#0": ("u1", "m1"), "a#1": ("u1", "m2")}
 
 
 def _candidate(**over):
     c = {"statement": "Fix bugs at the layer that should have prevented them.",
          "elaboration": "Root-cause rule.", "stance": "user_asserted",
-         "evidence": [{"ref": "e1", "quote": "Fix bugs at the layer"}]}
+         "evidence": [{"ref": "a#0", "quote": "Fix bugs at the layer"}]}
     c.update(over)
     return c
 
@@ -155,35 +167,205 @@ def test_skeleton_refuses_to_triage_on_metadata_alone(store):
         dream.skeleton(store, "u3")
 
 
-def test_condense_labels_messages_with_short_refs_not_uuids(store):
+def _long_unit(con, unit_id="long", n=200, hit_at=140,
+               hit_text="the marmoset calibration needs a torque wrench"):
+    """A unit long enough that its opening and its matched passage cannot overlap."""
+    con.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,msg_count,"
+                "synced_at) VALUES (%s,'cc_session','claude_code','long',now(),%s,now())",
+                (unit_id, n))
+    for i in range(n):
+        con.execute(
+            "INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,'2026-01-01')",
+            (unit_id, f"m{i}", i, "user" if i % 2 == 0 else "assistant",
+             hit_text if i == hit_at else f"routine turn {i} about other things"))
+    con.commit()
+    _reindex()
+
+
+def test_windows_are_centred_on_the_retrieval_hit_not_the_units_opening(store):
+    """THE point of the rendering. Measured on the real corpus before this: rendering
+    from idx 0 up to a char budget put 44/45 = 98% of retrieval matches OUTSIDE the
+    window the dreamer was shown (median match at idx 1039, median 23 messages
+    shown). The layer was distilling conversation preambles."""
+    _long_unit(store, hit_at=140)
+    body, refmap, slots = dream.render_windows(
+        store, [{"unit_id": "long", "msg_idx": 140}])
+
+    idxs = sorted(int(r.split("#")[1]) for r in refmap)
+    assert 140 in idxs, "the matched message itself must be rendered"
+    assert idxs == list(range(140 - dream.WINDOW_BEFORE, 140 + dream.WINDOW_AFTER + 1))
+    assert 0 not in idxs, "rendering the opening is the bug this replaced"
+    assert "marmoset calibration" in body                 # the matched text is present
+    assert "<-- retrieval match" in body                  # ...and marked as the match
+    assert "200 messages" in body                         # honest about what was NOT shown
+    assert slots == {"a": "long"}
+
+
+def test_refs_are_slot_plus_index_never_uuids(store):
     """Measured: shown a correct 36-char UUID, the model wrote back one transposed
     digit, and the grounding gate discarded three genuinely-grounded insights over
-    the typo. So the transcript carries SHORT labels and code owns the mapping."""
-    body, refmap = dream.condense(store, ["u1"])
-    assert refmap == {"e1": ("u1", "m1"), "e2": ("u1", "m2")}
-    assert "[e1 user]" in body and "[e2 assistant]" in body
+    the typo. So refs are short and code owns the mapping. Slot+index also makes the
+    ref a RULE rather than a table, which is what lets navigation address messages
+    that were not in the first rendering."""
+    body, refmap, _ = dream.render_windows(store, [{"unit_id": "u1", "msg_idx": 0}])
+    assert refmap == {"a#0": ("u1", "m1"), "a#1": ("u1", "m2")}
+    assert "[a#0 user]" in body and "[a#1 assistant]" in body
     # No per-message id anywhere in the prompt: there is nothing to mistype. (The
     # unit header still names its unit as context — it is not citable, since the
     # schema only accepts a ref.)
     assert not any(msg_id in body for _, msg_id in refmap.values())
 
 
-def test_condense_refs_are_unique_across_a_multi_unit_batch(store):
+def test_refs_are_unique_across_a_multi_unit_batch(store):
     """One label space per prompt: a duplicated label would silently resolve a
     citation to the wrong transcript."""
     _add_units(store, 2)
-    body, refmap = dream.condense(store, ["u1", "u2", "u3"])
-    assert len(refmap) == len(set(refmap)) == 4
+    body, refmap, slots = dream.render_windows(
+        store, [{"unit_id": u, "msg_idx": 0} for u in ("u1", "u2", "u3")])
+    assert len(refmap) == 4                       # u1 has two messages, u2/u3 one each
     assert {u for u, _ in refmap.values()} == {"u1", "u2", "u3"}
-    assert body.count("[e") == 4
+    assert slots == {"a": "u1", "b": "u2", "c": "u3"}
+    assert sorted(refmap) == ["a#0", "a#1", "b#0", "c#0"]
 
 
-def test_condense_refuses_a_batch_with_nothing_quotable(store):
+def test_a_seed_without_a_matched_position_is_refused(store):
+    """A browse (no query) yields no match position. Centring on idx 0 in that case
+    would quietly reinstate the render-the-opening bug, so it fails instead."""
+    with pytest.raises(dream.DreamError, match="no msg_idx"):
+        dream.render_windows(store, [{"unit_id": "u1", "msg_idx": None}])
+
+
+def test_requested_expansions_render_and_merge_with_the_seed_window(store):
+    """Navigation: the dreamer asks for a range it was not shown, and gets it. An
+    expansion abutting the seed window renders as ONE continuous passage — a repeated
+    overlapping block would read as two separate exchanges of the same turns."""
+    _long_unit(store, hit_at=140)
+    seed = [{"unit_id": "long", "msg_idx": 140}]
+    _, before, _ = dream.render_windows(store, seed)
+    body, after, _ = dream.render_windows(
+        store, seed, [{"slot": "a", "from_idx": 100, "to_idx": 125, "why": "context"}])
+
+    assert set(before) < set(after), "the expansion must add refs, not replace them"
+    assert "a#100" in after and "a#120" in after
+    assert body.count("-- a: messages") == 2      # a gap at 126-133 keeps them apart
+    # ...and an expansion that touches the seed window merges into one range
+    body2, _, _ = dream.render_windows(
+        store, seed, [{"slot": "a", "from_idx": 120, "to_idx": 135, "why": "lead-in"}])
+    assert body2.count("-- a: messages") == 1
+
+
+def test_a_wide_expansion_can_never_evict_the_matched_message(store):
+    """Found while building this: an expansion merged with the seed window and the
+    size cap then spent itself from the START of the merged range, dropping the
+    matched message and its neighbours — reinstating the render-the-wrong-part bug
+    through the very feature meant to fix it. The budget is spent OUTWARD FROM THE
+    MATCH, so the hit and its closest context always survive."""
+    _long_unit(store, n=200, hit_at=140)
+    seed = [{"unit_id": "long", "msg_idx": 140}]
+    _, refs, _ = dream.render_windows(
+        store, seed,
+        [{"slot": "a", "from_idx": 0, "to_idx": 139, "why": "the entire lead-in"}])
+    assert "a#140" in refs, "the matched message was evicted by an expansion"
+    for near in ("a#139", "a#141"):
+        assert near in refs, f"{near} (adjacent to the match) was evicted"
+
+
+def test_an_expansion_naming_an_unknown_transcript_fails_loud(store):
+    _long_unit(store, hit_at=140)
+    with pytest.raises(dream.DreamError, match="unknown transcript"):
+        dream.render_windows(store, [{"unit_id": "long", "msg_idx": 140}],
+                             [{"slot": "z", "from_idx": 0, "to_idx": 5, "why": "x"}])
+
+
+def test_an_oversized_range_says_what_it_omitted(store):
+    """Silent truncation is how the dreamer comes to believe it read a passage it
+    did not. The omission is stated in the text the model sees."""
+    _long_unit(store, n=200, hit_at=140)
+    body, _, _ = dream.render_windows(
+        store, [{"unit_id": "long", "msg_idx": 140}],
+        [{"slot": "a", "from_idx": 0, "to_idx": 199, "why": "everything"}])
+    assert "message(s) in this range omitted for size" in body
+
+
+def test_distill_serves_read_requests_then_stops(store, stub_worker):
+    """One navigation round: the dreamer asks, code fulfils, the dreamer distills from
+    the wider rendering. Insights from BOTH rounds are kept — a round is an addition,
+    not a do-over, so nothing already paid for is discarded."""
+    _long_unit(store, hit_at=140)
+    first = _distill_one(ref="a#140", statement="First-round claim.")
+    first["read_requests"] = [{"slot": "a", "from_idx": 100, "to_idx": 120,
+                               "why": "the thread starts earlier"}]
+    second = _distill_one(ref="a#105", statement="Second-round claim.")
+    stub_worker += [first, second]
+
+    notes = []
+    got, refmap = dream.distill(store, dream.get_topic(store, "t1"),
+                                [{"unit_id": "long", "msg_idx": 140}], notes)
+    assert [c["statement"] for c in got] == ["First-round claim.", "Second-round claim."]
+    assert "a#105" in refmap, "the requested range must be citable in round two"
+    assert not stub_worker, "exactly two calls: one round of navigation, then stop"
+    assert notes == []
+
+
+def test_unserved_read_requests_are_reported_never_silently_dropped(store, stub_worker):
+    """A request arriving in the final round cannot be served. Saying so is the only
+    signal that MAX_NAV_ROUNDS is set too low; dropping it reads as 'the windows
+    sufficed' when they did not."""
+    _long_unit(store, hit_at=140)
+    for statement in ("R1", "R2"):
+        out = _distill_one(ref="a#140", statement=statement)
+        out["read_requests"] = [{"slot": "a", "from_idx": 0, "to_idx": 9,
+                                 "why": "still need the opening"}]
+        stub_worker.append(out)
+
+    notes = []
+    dream.distill(store, dream.get_topic(store, "t1"),
+                  [{"unit_id": "long", "msg_idx": 140}], notes)
+    assert any("unserved" in n for n in notes), notes
+    assert any("still need the opening" in n for n in notes)
+
+
+def test_too_many_read_requests_are_capped_and_the_cap_is_reported(store, stub_worker):
+    _long_unit(store, hit_at=140)
+    out = _distill_one(ref="a#140")
+    out["read_requests"] = [{"slot": "a", "from_idx": i, "to_idx": i + 1, "why": "w"}
+                            for i in range(dream.MAX_EXPANSIONS + 3)]
+    stub_worker += [out, _distill_one(ref="a#140", statement="second")]
+    notes = []
+    dream.distill(store, dream.get_topic(store, "t1"),
+                  [{"unit_id": "long", "msg_idx": 140}], notes)
+    assert any(f"capped {dream.MAX_EXPANSIONS + 3} read requests" in n for n in notes)
+
+
+def test_seeds_for_positions_a_pending_unit_by_retrieval(store):
+    """`dream_pending` stores unit assignments; WHERE the topic lives in a unit is a
+    retrieval fact computed at dig time. It must find the matching passage, not idx 0."""
+    _long_unit(store, hit_at=140, hit_text="root cause rather than the symptom site")
+    seeds, unpositioned = dream.seeds_for(
+        store, dream.get_topic(store, "t1"), ["long"])
+    assert unpositioned == []
+    assert [s["unit_id"] for s in seeds] == ["long"]
+    assert seeds[0]["msg_idx"] == 140
+
+
+def test_an_unindexed_unit_is_reported_not_positioned_at_zero(store):
+    """A unit with no chunk cannot be positioned. Centring it on idx 0 would silently
+    reinstate the render-the-opening bug; dropping it would lose the assignment."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,synced_at) "
+                  "VALUES ('ghost','cc_session','claude_code','g',now(),now())")
+    store.commit()                      # deliberately NOT indexed
+    seeds, unpositioned = dream.seeds_for(
+        store, dream.get_topic(store, "t1"), ["ghost"])
+    assert seeds == [] and unpositioned == ["ghost"]
+
+
+def test_render_refuses_a_batch_with_nothing_quotable(store):
     store.execute("INSERT INTO units (unit_id,kind,source,title,synced_at) "
                   "VALUES ('empty','chat','claude_ai','e',now())")
     store.commit()
     with pytest.raises(dream.DreamError, match="nothing quotable"):
-        dream.condense(store, ["empty"])
+        dream.render_windows(store, [{"unit_id": "empty", "msg_idx": 0}])
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +376,7 @@ def test_ground_accepts_a_verbatim_quote(store):
 
 
 def test_ground_accepts_whitespace_differences_only(store):
-    c = _candidate(evidence=[{"ref": "e1", "quote": "  Fix   bugs\nat the layer  "}])
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "  Fix   bugs\nat the layer  "}])
     assert len(dream.ground(store, c, REFMAP)) == 1
 
 
@@ -202,7 +384,7 @@ def test_ground_accepts_whitespace_differences_only(store):
     ([], "cites no evidence"),
     ([{"ref": "e99", "quote": "Fix bugs"}], "never shown to the distiller"),
     ([{"ref": "", "quote": "Fix bugs"}], "never shown to the distiller"),
-    ([{"ref": "e1", "quote": "text that is absent"}], "not found verbatim"),
+    ([{"ref": "a#0", "quote": "text that is absent"}], "not found verbatim"),
 ])
 def test_ground_rejects_ungrounded_candidates(store, evidence, match):
     with pytest.raises(dream.DreamError, match=match):
@@ -211,7 +393,7 @@ def test_ground_rejects_ungrounded_candidates(store, evidence, match):
 
 def test_ground_rejects_a_candidate_with_one_fabricated_reference(store):
     """Partly grounded is not grounded — it is untrustworthy."""
-    c = _candidate(evidence=[{"ref": "e1", "quote": "Fix bugs at the layer"},
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer"},
                              {"ref": "ghost", "quote": "Fix bugs at the layer"}])
     with pytest.raises(dream.DreamError, match="never shown to the distiller"):
         dream.ground(store, c, REFMAP)
@@ -231,8 +413,8 @@ def test_ground_refuses_to_cite_derived_text(store):
 
 def test_ground_dedupes_two_quotes_from_one_message(store):
     """(src_unit, src_msg) is the citation key AND the evidence PK."""
-    c = _candidate(evidence=[{"ref": "e1", "quote": "Fix bugs at the layer"},
-                             {"ref": "e1", "quote": "should have prevented"}])
+    c = _candidate(evidence=[{"ref": "a#0", "quote": "Fix bugs at the layer"},
+                             {"ref": "a#0", "quote": "should have prevented"}])
     assert len(dream.ground(store, c, REFMAP)) == 1
 
 
@@ -240,11 +422,11 @@ def test_a_user_stance_must_cite_a_user_authored_turn(store):
     """The mechanical half of attribution: without it, the only things between an
     assistant turn and a 'user_asserted' insight are two LLM opinions — and
     passes_substance waives the two-source bar on exactly that stance."""
-    c = _candidate(evidence=[{"ref": "e2", "quote": "root-cause rule"}])
+    c = _candidate(evidence=[{"ref": "a#1", "quote": "root-cause rule"}])
     with pytest.raises(dream.DreamError, match="no user-authored turn"):
         dream.ground(store, c, REFMAP)                # e2 -> m2, an assistant turn
     ok = _candidate(stance="claude_proposed",
-                    evidence=[{"ref": "e2", "quote": "root-cause rule"}])
+                    evidence=[{"ref": "a#1", "quote": "root-cause rule"}])
     assert len(dream.ground(store, ok, REFMAP)) == 1  # non-user stance: fine
 
 
@@ -496,7 +678,7 @@ def test_older_contradicting_evidence_never_inverts_the_timeline(store):
     t = dream.get_topic(store, "t1")
     c = _candidate(statement="The opposite, argued back in 2024.")
     c["_evidence"] = dream.ground(
-        store, c, {"e1": ("u80", "m1")})
+        store, c, {"a#0": ("u80", "m1")})
     c.update({"action": "contradict", "target_id": cur["unit_id"]})
     stats = dream.persist(store, t, [c])
     assert stats == {"new": 1, "reinforce": 0, "refine": 0, "contradict": 0,
@@ -689,7 +871,8 @@ def test_untouched_topics_cost_nothing(store, stub_worker):
 
 
 def _add_units(con, n, start=2):
-    """Extra citable raw units, so a topic's backlog can reach the dig threshold."""
+    """Extra citable raw units, so a topic's backlog can reach the dig threshold.
+    Indexed on the way out — a dig can only position itself on indexed content."""
     ids = []
     for i in range(start, start + n):
         uid = f"u{i}"
@@ -701,6 +884,7 @@ def _add_units(con, n, start=2):
                     (uid, "Fix bugs at the layer that should have prevented them."))
         ids.append(uid)
     con.commit()
+    _reindex()
     return ids
 
 
@@ -709,8 +893,8 @@ def _triage_all(unit_ids, topic="t1"):
                             for u in unit_ids]}
 
 
-def _distill_one(ref="e1", statement="Fix bugs at the preventing layer."):
-    """`ref` is a label from the batch condense() rendered — e1 is the first."""
+def _distill_one(ref="a#0", statement="Fix bugs at the preventing layer."):
+    """`ref` is a label render_windows() emitted: slot letter + message index."""
     return {"insights": [{"statement": statement, "elaboration": "e",
                           "stance": "user_asserted",
                           "evidence": [{"ref": ref, "quote": "Fix bugs at the layer"}]}],
