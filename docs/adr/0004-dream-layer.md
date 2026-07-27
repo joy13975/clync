@@ -1,9 +1,21 @@
 # ADR 0004 — The Dream layer: topic-driven knowledge distillation
 
-- **Status:** Accepted — implemented in `dream.py` (2026-07-26). The cost model in D9
-  and the topic-status vocabulary in D3 were **corrected by measurement during the
-  build**; both now describe what the code does, not what was estimated.
-- **Date:** 2026-07-26
+- **Status:** Accepted — implemented in `dream.py`. **Revised 2026-07-27** after
+  measuring what the built layer actually read and actually cost. Three decisions
+  changed rather than being patched around, each marked "Revised 2026-07-27" in
+  place with the measurement that forced it:
+  - **D4** — the dig read each unit's OPENING, not the passage retrieval had
+    matched. 42 of 45 matches (93%) fell outside the rendered window. It now
+    renders the hit plus surrounding turns, and the dreamer can request more.
+  - **D2** — the stored, model-written digest is deleted. It was the only
+    ungrounded text in the store, a precomputed answer to an unasked question, and
+    it had already gone stale in a way that made recall report "nothing distilled"
+    above a list of distilled insights. Rendered from the insight rows at read time.
+  - **D1/D4** — `reconcile` is folded into `falsify`, which was already shown the
+    same held-insight list. A ripe topic costs 3 calls, down from 5.
+  The cost model in D9 and the topic-status vocabulary in D3 were corrected by
+  measurement during the original build; they describe what the code does.
+- **Date:** 2026-07-26 (revised 2026-07-27)
 - **Scope:** A third content layer in clync's store: *derived knowledge* distilled
   from the raw transcripts of both existing sources, plus the retrieval surface
   that prefers it. Builds on [ADR 0003](0003-postgres-only-and-cc-ingest.md)'s
@@ -98,48 +110,93 @@ Two things nobody in the baseline does, and which matter most here:
 ### D1. Execution substrate: headless `claude -p`, one subprocess per work item
 
 Opus for every call that makes a knowledge judgement. Triage (routing only) runs
-Opus at `--effort low`; distillation, falsification and consolidation run at
-default effort. The invocation is the measured minimal form from Context, always
-with `--json-schema`.
+Opus at `--effort low`; distillation and falsification run at default effort. The
+invocation is the measured minimal form from Context, always with `--json-schema`.
 
 Every call is a pure function of its prompt: no tools (`--tools ""`), no MCP, no
 settings, no session. The Dream worker never reads the filesystem and never
-writes anywhere except through `dream.py`'s own DB writes. This is what makes
-the layer auditable and re-runnable.
+writes anywhere except through `dream.py`'s own DB writes. This is what makes the
+layer auditable and re-runnable.
+
+**Revised 2026-07-27 — why navigation did NOT become a tool.** The dreamer needs
+to read further into a conversation than its seed window (D4), and the obvious
+shape is a scoped read-only MCP tool. Measured on this CLI (2.1.220, one probe
+set, prefill = input + cache_creation + cache_read):
+
+| worker configuration | prefill | nav tool reachable |
+|---|---|---|
+| `--tools ""` (this layer's flags) | 515 floor, ~2.1k real | no |
+| `--tools ""` + `--mcp-config` | 659 | **no** — `""` strips MCP tools too |
+| `--mcp-config`, no `--tools` | 85,709 | yes |
+| `--tools "Read"` + `--mcp-config` | 5,421 | yes |
+
+`--tools` governs the BUILT-IN set only, and MCP tools ride along only when a
+non-empty built-in selection is present. So a nav tool costs a 10x prefill floor
+AND forces a filesystem-wide `Read` schema into every call, scoped only by a
+permission denial rather than by absence. Rejected.
+
+Instead the dreamer returns `read_requests` in its structured output and **code**
+fulfils them, re-rendering and re-invoking (`MAX_NAV_ROUNDS`, currently one
+round). Same capability, fewer parts: no MCP process, no second tool surface, no
+new trust boundary, prefill unchanged, and reads are scoped to raw sources *by
+construction* and logged because code performs them. The purity property above
+therefore survives navigation — which a tool-using session would have ended.
 
 **Fail loud:** a call whose result JSON has `is_error`, a non-`success` `subtype`,
 or a missing `structured_output` raises. There is no "skip this item and carry
 on" path — the item is marked `failed` with the raw error retained, the run
 aborts if failures exceed a threshold, and `clync doctor` surfaces it.
 
-### D2. Two levels, never recursive
+### D2. One stored level, and a digest rendered at read time
 
-- **`dream_insight`** — one atomic claim. "Prefer fixing at the layer that
-  should have prevented the bug over the layer where it surfaced." Carries
-  statement, elaboration, stance, evidence, validity window.
-- **`dream_digest`** — one per topic: the synthesized current state of the user's
-  thinking on that topic, assembled from its *active* insights, in **fixed
-  structured sections** (schema-enforced, not free prose):
+- **`dream_insight`** — one atomic claim, and the ONLY thing this layer stores.
+  "Prefer fixing at the layer that should have prevented the bug over the layer
+  where it surfaced." Carries statement, elaboration, stance, evidence, validity
+  window.
+- **The digest** — one per topic: the current state of the user's thinking on that
+  topic, in **fixed structured sections**, assembled from its *active* insight rows
+  by `dream.render_digest` **when it is asked for**. It is not stored and there is
+  no model call in it.
 
   | section | contents |
   |---|---|
   | **Settled** | active insights, stance `user_asserted`/`user_endorsed`, with support count |
-  | **Rejected approaches** | active insights with stance `user_rejected` — what he argued against, and why |
-  | **Changed positions** | supersession chains: `old → new`, dated from the validity windows |
-  | **Open** | insights the falsification gate marked contested, or questions raised and never resolved |
+  | **Rejected approaches** | active insights with stance `user_rejected` — what was argued against, and why |
+  | **Changed positions** | supersessions recorded as `contradict` (never `refine`): `old → new`, dated from the validity windows |
+  | **Open** | insights the falsification gate marked contested |
 
-  Fixed slots make the digest diffable across runs, mechanically assemblable from
-  the insight rows (so the consolidate call *writes prose per bullet*, it does not
-  invent structure), and directly actionable by an agent. "Changed positions" is
-  the section that only exists because of D6's supersede-never-overwrite rule.
+**Revised 2026-07-27.** This ADR originally specified a stored `dream_digest`
+unit, written by a `consolidate` model call that composed connective prose around
+bullets code had already assembled. That call is deleted. Three reasons, in order
+of weight:
 
-A digest is **always regenerated from the insight set**, and insights are
-**always derived from raw transcript evidence**. Derived text is never input to
-another derivation. This caps hallucination amplification at one hop — the
-specific failure RAPTOR measures and a deeper ladder would compound.
+1. **It was the only ungrounded text in the store.** Every other artifact traces
+   to a verbatim quote through a mechanical gate. The digest's prose traced to
+   nothing, and grounding it would have meant building a whole second
+   verification path for text nobody had asked for.
+2. **It was a precomputed answer to an unasked question.** A reader arrives with
+   an actual question; a nightly synthesis cannot know it. Rendering the sections
+   on read lets the caller (or the model reading them) synthesize with the
+   question in hand, which is strictly better than a stored guess at it.
+3. **A stored summary of rows that keep changing is a staleness bug waiting.** It
+   had already produced one: a budget-capped backfill spent its whole allowance
+   digging a topic and then never wrote the digest, so recall reported "nothing
+   distilled" above a list of twenty distilled insights, permanently.
 
-There is no level 3. If cross-topic synthesis is wanted later, it is a *query-time*
-composition over digests, not a stored third tier.
+Deleting it also removed a nightly model call per changed topic, a `units` row per
+topic, and the `dream-digest-` id prefix that was duplicated across three call
+sites. Rows of the retired kind are cleaned up on provisioning, since stale
+synthesis prose left behind would go on answering `search_history`.
+
+The non-recursion guarantee is unchanged and now trivially true: insights derive
+**only** from raw transcript evidence (`source='all'` means raw only, and the
+grounding gate rejects any citation to a non-raw unit), and the digest is a pure
+function of insight rows computed at read time. Derived text is never input to
+another derivation, so hallucination amplification is capped at one hop — the
+specific failure RAPTOR measures, which a deeper ladder compounds.
+
+There is no level 3. Cross-topic synthesis, if ever wanted, is a query-time
+composition, not a stored tier.
 
 ### D3. `dream_topics`: curated seeds, plus proposals
 
@@ -177,19 +234,53 @@ what makes a "background" layer quietly expensive forever.
    per unit.
 2. **Gate.** Topics no unit touched are **skipped entirely — zero calls.** Most
    nights that means 1–3 of 6 topics do any work at all.
-3. **Fresh slate only.** For each touched topic, retrieve via
-   `search.hybrid_search` with `since = last_dig_at`, restricted to raw sources,
-   unioned across the topic's probe queries. History is *not* re-swept.
-4. **Condense** — candidates reduced to the turns that carry intent (user
-   prompts, assistant text, `Agent` results) by reusing the existing `embed_text`
-   tier; tool stdout is already excluded there.
+3. **Queue, then wait for ripeness.** A triaged unit is queued against its topic
+   in `dream_pending`; the topic is dug once `DIG_MIN_UNITS` have accumulated or
+   its oldest pending unit has waited `DIG_MAX_DEFER_DAYS`. Cost scales with
+   *topics dug*, not units changed — measured, digging every flagged topic
+   immediately cost 14 calls for one ordinary day. Nothing is lost by waiting:
+   the queue is a table, and only units actually mined leave it.
+4. **Seed from the retrieval HIT, and render the window around it.** For each
+   unit, the position of the matching chunk (`msg_idx`, carried out of
+   `hybrid_search`) plus `WINDOW_BEFORE`/`WINDOW_AFTER` neighbouring turns, with
+   the matched turn marked and the unit's true size stated.
+
+   **Revised 2026-07-27.** This step originally said "condense": order the unit's
+   messages by index and take turns until a char budget runs out. That reads the
+   conversation's OPENING. Retrieval had located the unit by a chunk match and the
+   match was then discarded. Measured against the committed pre-fix code over 45
+   (query, unit) pairs on units with >= 40 messages: **42/45 = 93% of matches fell
+   outside the rendered window**, median match at message index 1284 against a
+   median 23 messages rendered, every window starting at index 0; worst case a
+   23,653-message unit matched at index 20,927 and rendered from 0..19. Every
+   insight the layer held had been distilled from a preamble.
+
+   A window is a guess whatever size it is, so the dreamer can ask for more:
+   `read_requests` fulfilled by code, not a tool (D1). The size budget within a
+   range is spent OUTWARD FROM THE MATCH — spending it from the range start let a
+   wide requested expansion evict the matched message, reintroducing this very bug
+   through the feature meant to fix it.
 5. **Distill** — one call per *topic* (not per unit), schema-constrained,
-   emitting candidate insights with mandatory evidence refs.
-6. **Reconcile + falsify + consolidate** — batched per topic (D6), and a digest
-   is regenerated **only if** its active insight set actually changed.
+   emitting candidate insights with mandatory evidence refs. Refs are
+   `<slot>#<index>` and code owns the mapping, so the model never handles a uuid:
+   shown a correct 36-char id, a real dig transposed one digit and the grounding
+   gate correctly discarded 3 of 15 insights. Making the ref a RULE rather than a
+   table is also what lets navigation cite messages no earlier rendering showed.
+6. **Falsify** — batched per topic (D6). The new/reinforce/refine/contradict
+   decision rides on the same call: falsify already had to be shown the held
+   insights (a candidate that merely restates one must be rejected), which is
+   exactly what that decision needs, so the separate `reconcile` call was
+   redundant and is gone. Its targets are `[hN]` labels for the same
+   no-uuids-in-model-output reason.
 
 Every stage is gated by the one before it. A quiet day costs one triage call and
-nothing else.
+nothing else; a ripe topic costs **3 calls** (triage + distill + falsify), with a
+fourth only when the dreamer asks to read further. It was 5.
+
+`distill` and `falsify` are deliberately NOT merged, unlike `reconcile`:
+generating and refuting in one completion is self-review, and the independent pass
+measurably earns its keep, having rejected 10 of 14 and 7 of 27 candidates with
+substantive reasoning.
 
 #### Bulk (explicit, one-time-ish) — `dream backfill`
 
@@ -204,7 +295,11 @@ rewriting a charter — those are the only recurring reasons to re-sweep history
 The topic's probe queries are revisable in both modes: a distill call may propose
 query additions when it finds vocabulary the probes missed. That is the "repeated
 dig" — each run's understanding sharpens the next run's retrieval, without
-re-reading history.
+re-reading history. **Bounded** (`PROBE_QUERIES_MAX`): every dig could propose more
+and nothing removed any, so one live topic reached 49 queries from 5 seeds, and
+`candidates` runs one hybrid search per query. Past the cap the newest learned
+queries displace the oldest; the hand-written seeds are never displaced, since they
+are the charter expressed as retrieval.
 
 **Non-circularity is enforced at the query, not by convention:** the dig filters
 to `source IN ('claude_ai','claude_code')`. Combined with `--no-session-persistence`
@@ -257,7 +352,8 @@ A candidate insight passes three gates before it becomes durable:
    `user_asserted` with an explicit statement. Blocks single-mention noise
    without discarding a clearly-stated one-off principle.
 
-On reconcile against existing insights, the outcome is one of:
+Reconciliation against existing insights rides on the falsify verdict (D4), and
+its outcome is one of:
 
 - **reinforce** — same claim, new evidence → append refs, extend
   `last_seen_at`; `support_count` is *derived* (distinct cited source units),
@@ -328,7 +424,7 @@ CREATE TABLE dream_evidence (
 
 CREATE TABLE dream_queue (               -- resumable, budget-governed work
     item_id    text PRIMARY KEY,
-    kind       text NOT NULL,            -- triage | distill | falsify | reconcile | consolidate
+    kind       text NOT NULL,            -- triage | distill | falsify
     topic_id   text,
     payload    jsonb NOT NULL,
     state      text NOT NULL,            -- pending | running | done | failed
@@ -418,7 +514,7 @@ Cost model, **corrected by measurement**. The first real nightly run on this cor
 cost **14 calls for one ordinary day** (6 changed units) — not the 3–8 originally
 estimated here. The reason is structural and worth stating plainly: **nightly cost
 scales with TOPICS DUG, not units changed.** Six units triaged into four topics, and
-each topic then costs a distill + falsify (+ reconcile) + consolidate. At the stated
+each topic then cost a distill + falsify + reconcile + consolidate. At the stated
 daily volume of 10–20 sessions essentially every topic gets touched every day, which
 would have made the nightly pass ~20+ calls forever — a "background" layer that is
 permanently expensive, i.e. exactly the failure the two-mode split exists to prevent.
@@ -444,15 +540,18 @@ cache_creation + cache_read`; small samples, n in the table):
 | triage — all new/changed units, batched (15/call) | 5.5k / 0.8k | 2 |
 | distill — one call per topic dug | 13.0k / 8.8k | 5 |
 | falsify — batched per topic dug | 3.0k / 4.9k | 5 |
-| reconcile — only if the topic already holds insights | ~2k / ~3k | 1 |
-| consolidate — only digests whose insight set changed | 1.1k / 0.4k | 5 |
+
+`reconcile` (~2k/~3k) and `consolidate` (1.1k/0.4k) were measured and then DELETED
+— see D2 and D4. Distill's input rises somewhat with hit-centered windows (it
+renders more of each unit than the old 6k-char opening) and rises again on a
+navigation round; the call COUNT is what the nightly budget is governed by.
 
 | nightly pass | calls |
 |---|---|
 | no changed units | **0** (returns before triage) |
 | changed units, no topic ripe | **1** (the triage that decided so) |
-| one ripe topic | **4–5** |
-| worst case, all 6 topics ripe the same night | ~20, and only every ~3rd night |
+| one ripe topic | **3** (4 if the dreamer asks to read further) |
+| worst case, all 6 topics ripe the same night | ~13-19, and only every ~3rd night |
 
 Nothing in the nightly path re-reads history.
 
@@ -496,7 +595,8 @@ is duplicated — the ADR 0003 boundary holds.
 ## Open questions (need a decision before implementation)
 
 1. **Insight granularity.** Target ~50 or ~500 insights per topic? Drives whether
-   digests stay readable and whether reconcile stays cheap.
+   a rendered digest stays readable and whether falsify's held-insight listing stays
+   cheap (it is shown every held claim for the topic, so this is the term that grows).
 2. **cc sessions are noisy.** A large share are mechanical (fix CI, rerun tests)
    and carry no durable knowledge. Is batched skeleton triage enough to drop them,
    or should there be a cheap pre-filter before triage even sees them?
