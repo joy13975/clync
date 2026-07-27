@@ -136,8 +136,11 @@ AND forces a filesystem-wide `Read` schema into every call, scoped only by a
 permission denial rather than by absence. Rejected.
 
 Instead the dreamer returns `read_requests` in its structured output and **code**
-fulfils them, re-rendering and re-invoking (`MAX_NAV_ROUNDS`, currently one
-round). Same capability, fewer parts: no MCP process, no second tool surface, no
+fulfils them, re-rendering and re-invoking (`MAX_NAV_ROUNDS`, currently two
+rounds — one bound on every real dig measured, 3/3, so it truncated the feature
+rather than bounding a rare case; unserved requests are reported, which keeps the
+budget auditable against the next measurement). Same capability, fewer parts: no
+MCP process, no second tool surface, no
 new trust boundary, prefill unchanged, and reads are scoped to raw sources *by
 construction* and logged because code performs them. The purity property above
 therefore survives navigation — which a tool-using session would have ended.

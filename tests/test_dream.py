@@ -312,10 +312,14 @@ def test_distill_serves_read_requests_then_stops(store, stub_worker):
     assert notes == []
 
 
-def test_unserved_read_requests_are_reported_never_silently_dropped(store, stub_worker):
+def test_unserved_read_requests_are_reported_never_silently_dropped(
+        store, stub_worker, monkeypatch):
     """A request arriving in the final round cannot be served. Saying so is the only
     signal that MAX_NAV_ROUNDS is set too low; dropping it reads as 'the windows
-    sufficed' when they did not."""
+    sufficed' when they did not. The cap is pinned locally: this pins the behaviour at
+    the final-round boundary, not whatever the shipped budget currently happens to be.
+    """
+    monkeypatch.setattr(dream, "MAX_NAV_ROUNDS", 1)
     _long_unit(store, hit_at=140)
     for statement in ("R1", "R2"):
         out = _distill_one(ref="a#140", statement=statement)
