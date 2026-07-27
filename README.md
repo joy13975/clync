@@ -69,7 +69,7 @@ session to load the MCP tools + skills.
 | `doctor` | health check: store, deps, launchd job, MCP registration, search index, dream layer |
 | `status [--tail N]` | last successful sync, launchd state, recent scheduled-run log |
 | `install [--at HH:MM]` / `uninstall` | manage the daily launchd job |
-| `dream topics [--seed] [--all]` | list dream topics (id, status, active insight count, digest presence, last dig time); `--seed` inserts the built-in starter topics if absent, `--all` includes non-active topics |
+| `dream topics [--seed] [--all]` | list dream topics (id, status, active insight count, last dig time); `--seed` inserts the built-in starter topics if absent, `--all` includes non-active topics |
 | `dream run [--max-calls N]` | the incremental (nightly-shaped) dream pass — see [Dream layer](#dream-layer) |
 | `dream backfill [--topic T] [--max-calls N]` | the explicit bulk dream pass — see [Dream layer](#dream-layer) |
 | `dream recall "<query>" [--topic T] [--limit N] [--as-of ISO] [--evidence]` | dream-first tiered recall from the shell: TOPIC / COVERAGE / DIGEST / INSIGHTS / RAW TRANSCRIPTS |
@@ -137,8 +137,8 @@ ln -s ~/code/clync/clync ~/.local/bin/clync   # then: clync search "…", clync 
 A third content layer (design: [docs/adr/0004](docs/adr/0004-dream-layer.md)),
 built on top of the raw `units`/`messages` store. Where `search`/`search_history`
 answer *"where did I discuss X?"*, the Dream layer answers *"what do I actually
-think about X?"* by distilling topic-scoped **insight** atoms and per-topic
-**digests** out of the raw transcripts.
+think about X?"* by distilling topic-scoped, cited **insight** atoms out of the
+raw transcripts, and rendering a per-topic **digest** from them on read.
 
 - **Inference has no API billing.** All model calls go through the local
   headless `claude -p` CLI under the existing subscription OAuth — no
@@ -170,8 +170,7 @@ Two separate passes, with cost profiles two orders of magnitude apart:
 
 - **`dream run [--max-calls N]`** — the incremental, nightly-shaped pass, gated
   by triage: only units changed since the watermark are looked at (batched 15
-  per triage call), and a digest is only rebuilt if its insight set actually
-  changed. Digs are **batched across nights**: a triaged unit is queued against
+  per triage call). Digs are **batched across nights**: a triaged unit is queued against
   its topic, and that topic is dug once 3 units have accumulated or its oldest
   has waited a week. This matters because nightly cost scales with *topics dug*,
   not units changed — measured, digging every flagged topic immediately cost 14

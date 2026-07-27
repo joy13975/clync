@@ -45,7 +45,6 @@ from clync import (RAW_SOURCES, _json, _now, connect_pg, get_meta,
 # --------------------------------------------------------------------------- #
 DREAM_SOURCE = "dream"
 KIND_INSIGHT = "dream_insight"
-KIND_DIGEST = "dream_digest"
 
 WORKER_MODEL = "opus"           # every knowledge judgement runs on Opus
 TRIAGE_EFFORT = "low"           # triage is routing, not judgement
@@ -74,8 +73,8 @@ DIG_BATCH_UNITS = 6              # candidate units per distill call
 # The dreamer is shown the RETRIEVAL HIT plus the turns around it, because that is
 # the part of the unit the topic was actually found in. It used to be shown the
 # unit's opening — `ORDER BY idx` up to a char budget — which measured on the real
-# corpus (45 query/unit pairs, units >= 40 messages) put 44/45 = 98% of matches
-# OUTSIDE the rendered window: median match at idx 1039 against a median 23
+# corpus (45 query/unit pairs, units >= 40 messages) put 42/45 = 93% of matches
+# OUTSIDE the rendered window: median match at idx 1284 against a median 23
 # messages rendered, worst case a 23,653-message unit matched at idx 20,927 and
 # rendered from idx 0..19. The layer was distilling conversation preambles.
 WINDOW_BEFORE = 6                # turns of lead-in before the matched message
@@ -91,6 +90,9 @@ RANGE_MSGS = 30                  # per-range message cap
 # call. Code-driven reads cost nothing extra, are scoped to raw sources by
 # construction, and are logged because code performs them.
 MAX_EXPANSIONS = 6               # ranges the dreamer may request per round
+# `candidates` runs one hybrid search per probe query, and every dig may propose
+# more while nothing ever removed any: a live topic reached 49 from 5 seeds.
+PROBE_QUERIES_MAX = 20
 MAX_NAV_ROUNDS = 1               # rounds of requested expansion per dig
 # Nightly digs are batched ACROSS nights. Measured on the real corpus: six changed
 # units triaged into four topics, and digging every flagged topic immediately cost
@@ -234,6 +236,11 @@ def ensure_dream_schema(*, rebuild: bool = False) -> None:
             con.execute("DELETE FROM units WHERE source=%s", (DREAM_SOURCE,))
         for stmt in sql_statements(DREAM_SCHEMA):
             con.execute(stmt)
+        # Digests were a stored, model-written `units` row until they became a
+        # read-time rendering of the insight rows. Any row of that retired kind is an
+        # orphan that nothing derives or refreshes any more, and leaving it behind
+        # would let stale synthesis prose keep answering searches. Idempotent.
+        con.execute("DELETE FROM units WHERE kind='dream_digest'")
         con.commit()
 
 
@@ -359,6 +366,18 @@ SEED_TOPICS = [
 ]
 
 
+def _seed_queries(topic_id: str) -> set[str]:
+    """The topic's HAND-WRITTEN probe queries, from `SEED_TOPICS`. A model-proposed
+    query must never evict one of these: they are the charter expressed as retrieval,
+    and a topic that loses them stops being about what it says it is about. Returns
+    empty for a topic the user added by hand — then nothing is protected, which is
+    correct: there is no authored seed list to protect."""
+    for tid, _name, _charter, probes in SEED_TOPICS:
+        if tid == topic_id:
+            return set(probes)
+    return set()
+
+
 def seed_topics(con) -> int:
     """Insert the seed topics that don't exist yet. Idempotent; never overwrites a
     charter or probe list the user has since edited."""
@@ -394,9 +413,24 @@ def get_topic(con, topic_id: str) -> dict:
 
 def add_probe_queries(con, topic_id: str, new: list[str]) -> list[str]:
     """Extend a topic's probe queries (the distiller may propose vocabulary the
-    seeds missed — this is what makes each dig sharpen the next one's retrieval)."""
-    cur = list(get_topic(con, topic_id)["probe_queries"])
+    seeds missed — this is what makes each dig sharpen the next one's retrieval).
+
+    BOUNDED. Every dig could propose more, and nothing removed any: one live topic
+    reached 49 queries from 5 seeds. That is not free — `candidates` runs one hybrid
+    search PER query, so unchecked growth makes every later dig slower and drifts
+    retrieval toward whatever vocabulary recent digs happened to use. Past the cap
+    the newest suggestions displace the oldest LEARNED ones; the hand-written seeds
+    are never displaced, because they are the topic's charter in query form and a
+    model suggestion must not be able to evict them."""
+    topic = get_topic(con, topic_id)
+    cur = list(topic["probe_queries"])
     merged = cur + [q for q in new if q and q not in cur]
+    if len(merged) > PROBE_QUERIES_MAX:
+        seeds = _seed_queries(topic_id)
+        protected = [q for q in merged if q in seeds]
+        learned = [q for q in merged if q not in seeds]
+        keep = max(0, PROBE_QUERIES_MAX - len(protected))
+        merged = protected + learned[-keep:] if keep else protected
     if merged != cur:
         con.execute("UPDATE dream_topics SET probe_queries=%s WHERE topic_id=%s",
                     (_json(merged), topic_id))
@@ -690,7 +724,7 @@ def triage(con, unit_ids: list[str]) -> dict[str, list[str]]:
             raise DreamError(f"triage invented topic_id(s) {bad} for {a['unit_id']!r}")
         if a["topic_ids"]:
             result[a["unit_id"]] = a["topic_ids"]
-    # Every OFFERED unit needs a verdict, exactly as falsify/reconcile demand one
+    # Every OFFERED unit needs a verdict, exactly as falsify demands one
     # per candidate: an omitted unit is indistinguishable from "assigned nothing",
     # and the watermark then moves past it permanently.
     missing = valid_units - {a["unit_id"] for a in out["assignments"]}
@@ -961,7 +995,23 @@ _FALSIFY_SYSTEM = (
     "  * it merely restates something in the EXISTING insights you are shown.\n\n"
     "Mark a claim `contested` (rather than rejecting) when the evidence genuinely "
     "supports competing readings. Default to rejection when uncertain — a rejected "
-    "candidate costs nothing, a wrong one poisons the knowledge base."
+    "candidate costs nothing, a wrong one poisons the knowledge base.\n\n"
+    "For every candidate you do NOT reject, also say how it meets what is already "
+    "held (you are shown those, each with a short [hN] label and the date it has been "
+    "held since):\n"
+    "  new         nothing already held covers it\n"
+    "  reinforce   an existing claim says the same thing; this is additional evidence "
+    "for it, not a change\n"
+    "  refine      an existing claim says the same thing but this wording is sharper "
+    "or more complete; it should REPLACE that one\n"
+    "  contradict  the user's position CHANGED — this claim is incompatible with an "
+    "existing one, and this one is the current view\n\n"
+    "`contradict` is for a genuine change of mind, not for two claims that merely "
+    "differ in emphasis or scope — those are usually both true and independent "
+    "(`new`). For reinforce / refine / contradict, `target` MUST be one of the [hN] "
+    "labels; for `new` it is an empty string. Note the asymmetry: a candidate that "
+    "merely RESTATES a held claim and adds nothing is a rejection, whereas one that "
+    "brings fresh evidence for it is `reinforce`."
 )
 
 _FALSIFY_SCHEMA = {
@@ -976,9 +1026,13 @@ _FALSIFY_SCHEMA = {
                     "verdict": {"type": "string",
                                 "enum": ["upheld", "rejected", "contested"]},
                     "corrected_stance": {"type": "string", "enum": list(STANCES)},
+                    "action": {"type": "string",
+                               "enum": ["new", "reinforce", "refine", "contradict"]},
+                    "target": {"type": "string"},      # "" for new / rejected
                     "reason": {"type": "string"},
                 },
-                "required": ["index", "verdict", "corrected_stance", "reason"],
+                "required": ["index", "verdict", "corrected_stance", "action",
+                             "target", "reason"],
                 "additionalProperties": False,
             },
         }
@@ -990,26 +1044,50 @@ _FALSIFY_SCHEMA = {
 
 def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = None
             ) -> list[dict]:
-    """Batched adversarial pass. Returns the surviving candidates, each carrying
-    `verdict` ('upheld'|'contested') and a possibly-corrected `stance`.
+    """Batched adversarial pass AND the reconcile decision, in one call. Returns the
+    surviving candidates, each carrying `verdict` ('upheld'|'contested'), a
+    possibly-corrected `stance`, and `action`/`target_id` for `persist`.
+
+    The two used to be separate calls. They were merged because the second was
+    REDUNDANT, not to save tokens: falsify already had to be shown the held insights
+    (a candidate that merely restates one must be rejected), which is exactly the
+    input the reconcile decision needs. Two calls sending the same held-insight list
+    to ask two questions about the same candidate is one call. This is emphatically
+    NOT an argument for merging distill and falsify: generating and refuting in one
+    completion is self-review, and the independent pass measurably earns its keep
+    (it rejected 10 of 14 and 7 of 27 candidates with substantive reasoning).
+
+    Held insights are addressed by SHORT `[hN]` labels and code owns the mapping.
+    Reconcile used to require the model to copy a 36-char uuid verbatim — the same
+    thing that, measured in the distiller, produced one transposed digit and cost
+    three genuinely-grounded insights. There is no reason to keep that hazard.
 
     Rejection reasons are appended to `rejections` when given. The falsifier's own
     reasoning is the most useful signal there is for tuning a charter or a prompt,
     and a bare reject COUNT throws it away."""
     if not candidates:
         return []
-    existing = [r["statement"] for r in con.execute(
-        "SELECT statement FROM dream_insights WHERE topic_id=%s AND status=%s",
-        (topic["topic_id"], STATUS_ACTIVE)).fetchall()]
+    held = con.execute(
+        "SELECT unit_id, statement, stance, valid_from FROM dream_insights "
+        "WHERE topic_id=%s AND status=%s ORDER BY valid_from",
+        (topic["topic_id"], STATUS_ACTIVE)).fetchall()
+    # The held-since date is shown so the model is not judging recency blind —
+    # `contradict` asserts "this one is the current view", which is a temporal claim
+    # (persist still gates chronology mechanically; this improves the input).
+    labels = {f"h{i}": r["unit_id"] for i, r in enumerate(held)}
+    held_text = "\n".join(
+        f"  [h{i}] ({r['stance']}, held since {r['valid_from'].date().isoformat()}) "
+        f"{r['statement']}" for i, r in enumerate(held)) or "  (none)"
     listing = "\n\n".join(
         f"[{i}] CLAIM: {c['statement']}\n    stance: {c['stance']}\n    quotes:\n"
         + "\n".join(f"      - {e['quote'][:300]}" for e in c["evidence"])
         for i, c in enumerate(candidates))
     prompt = (f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n"
-              f"EXISTING INSIGHTS (a candidate that merely restates one of these must be "
-              f"rejected):\n" + ("\n".join(f"  - {s}" for s in existing) or "  (none)")
-              + f"\n\n=====\n\nCANDIDATES ({len(candidates)})\n\n{listing}\n\n=====\n"
-              f"Return exactly one verdict per candidate index.")
+              f"ALREADY HELD (a candidate that merely restates one of these, adding no "
+              f"new evidence, must be rejected):\n{held_text}"
+              f"\n\n=====\n\nCANDIDATES ({len(candidates)})\n\n{listing}\n\n=====\n"
+              f"Return exactly one verdict per candidate index, each with its action "
+              f"and — for reinforce/refine/contradict — the [hN] label it targets.")
     out = _call(con, "falsify", {"topic_id": topic["topic_id"], "n": len(candidates)},
                 topic["topic_id"], prompt, _FALSIFY_SCHEMA, system=_FALSIFY_SYSTEM)
 
@@ -1025,8 +1103,23 @@ def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = 
             if rejections is not None:
                 rejections.append(f"falsify: {c['statement'][:70]} <- {v['reason']}")
             continue
+        action, target = v["action"], v["target"]
+        if not held:
+            # Nothing to relate to: the only truthful action is `new`, whatever the
+            # model said. Mechanical, so a stray 'reinforce' cannot reach persist and
+            # name a target that does not exist.
+            action, target_id = "new", ""
+        elif action == "new":
+            target_id = ""
+        elif target not in labels:
+            raise DreamError(
+                f"falsify named an unknown target {target!r} for action={action} on "
+                f"{c['statement'][:60]!r} (known: {sorted(labels)})")
+        else:
+            target_id = labels[target]
         survivors.append({**c, "stance": v["corrected_stance"],
-                          "verdict": v["verdict"], "verdict_reason": v["reason"]})
+                          "verdict": v["verdict"], "verdict_reason": v["reason"],
+                          "action": action, "target_id": target_id})
     return survivors
 
 
@@ -1038,92 +1131,6 @@ def passes_substance(candidate: dict, evidence: list[dict]) -> bool:
     principle: >=2 distinct source units, OR the user asserted it outright."""
     return (len({e["src_unit_id"] for e in evidence}) >= 2
             or candidate["stance"] == "user_asserted")
-
-
-# --------------------------------------------------------------------------- #
-# Reconcile — how a survivor meets what we already believe
-# --------------------------------------------------------------------------- #
-_RECONCILE_SYSTEM = (
-    "You decide how each new knowledge claim relates to a set of claims already held.\n\n"
-    "  new         nothing already held covers it\n"
-    "  reinforce   an existing claim says the same thing; this is additional evidence "
-    "for it, not a change\n"
-    "  refine      an existing claim says the same thing but this wording is sharper or "
-    "more complete; it should REPLACE that one\n"
-    "  contradict  the user's position CHANGED — this claim is incompatible with an "
-    "existing one, and this one is the current view\n\n"
-    "`contradict` is for a genuine change of mind, not for two claims that merely differ "
-    "in emphasis or scope — those are usually both true and independent (`new`). "
-    "For reinforce / refine / contradict you MUST name the existing insight's id."
-)
-
-_RECONCILE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "decisions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer"},
-                    "action": {"type": "string",
-                               "enum": ["new", "reinforce", "refine", "contradict"]},
-                    "target_id": {"type": "string"},   # "" for new
-                    "reason": {"type": "string"},
-                },
-                "required": ["index", "action", "target_id", "reason"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["decisions"],
-    "additionalProperties": False,
-}
-
-
-def reconcile(con, topic: dict, survivors: list[dict]) -> list[dict]:
-    """Decide new / reinforce / refine / contradict per survivor. Returns the
-    survivors annotated with `action` + `target_id`."""
-    if not survivors:
-        return []
-    existing = con.execute(
-        "SELECT unit_id, statement, stance, valid_from FROM dream_insights "
-        "WHERE topic_id=%s AND status=%s ORDER BY valid_from",
-        (topic["topic_id"], STATUS_ACTIVE)).fetchall()
-    if not existing:                     # nothing to reconcile against — all new
-        return [{**c, "action": "new", "target_id": ""} for c in survivors]
-
-    # The held-since date is shown so the model is not judging recency blind —
-    # `contradict` asserts "this one is the current view", which is a temporal
-    # claim (persist still gates chronology mechanically; this improves the input).
-    held = "\n".join(
-        f"  [{r['unit_id']}] ({r['stance']}, held since "
-        f"{r['valid_from'].date().isoformat()}) {r['statement']}"
-        for r in existing)
-    listing = "\n".join(f"  [{i}] ({c['stance']}) {c['statement']}"
-                        for i, c in enumerate(survivors))
-    prompt = (f"TOPIC: {topic['name']}\n\nALREADY HELD\n{held}\n\n=====\n\n"
-              f"NEW CLAIMS\n{listing}\n\n=====\n"
-              f"Return exactly one decision per new-claim index. Use the bracketed ids "
-              f"verbatim as target_id; use an empty string for `new`.")
-    out = _call(con, "reconcile", {"topic_id": topic["topic_id"], "n": len(survivors)},
-                topic["topic_id"], prompt, _RECONCILE_SCHEMA, system=_RECONCILE_SYSTEM)
-
-    valid = {r["unit_id"] for r in existing}
-    by_index = {d["index"]: d for d in out["decisions"]}
-    missing = set(range(len(survivors))) - set(by_index)
-    if missing:
-        raise DreamError(f"reconcile skipped index(es) {sorted(missing)}")
-    annotated = []
-    for i, c in enumerate(survivors):
-        d = by_index[i]
-        if d["action"] != "new" and d["target_id"] not in valid:
-            raise DreamError(
-                f"reconcile named an unknown target_id {d['target_id']!r} for "
-                f"action={d['action']} on {c['statement'][:60]!r}")
-        annotated.append({**c, "action": d["action"], "target_id": d["target_id"],
-                          "reconcile_reason": d["reason"]})
-    return annotated
 
 
 # --------------------------------------------------------------------------- #
@@ -1170,7 +1177,8 @@ def _write_unit(con, unit_id: str, kind: str, title: str, body: str,
 
 
 def persist(con, topic: dict, decided: list[dict]) -> dict:
-    """Apply reconcile decisions. Bi-temporal and append-only: a superseded insight
+    """Apply the survivors' new/reinforce/refine/contradict actions (decided by
+    `falsify`). Bi-temporal and append-only: a superseded insight
     keeps its row, gets its validity window CLOSED, and points at its replacement —
     so "when did I change my mind about X" stays answerable.
 
@@ -1390,8 +1398,7 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
             report["rejected_substance"] += 1
             report["rejections"].append(f"substance: {s['statement'][:70]}")
 
-    decided = reconcile(con, topic, final)
-    report["written"] = persist(con, topic, decided)
+    report["written"] = persist(con, topic, final)
     con.execute("UPDATE dream_topics SET last_dig_at=%s WHERE topic_id=%s",
                 (_now(), topic["topic_id"]))
     con.commit()
@@ -1401,30 +1408,12 @@ def dig(con, topic: dict, seeds: list[dict]) -> dict:
 # --------------------------------------------------------------------------- #
 # Consolidate — the topic digest (fixed sections; bullets never invented)
 # --------------------------------------------------------------------------- #
-# The four sections are FIXED and the bullets are assembled from `dream_insights`
-# rows in code. The model writes only the short synthesis prose that ties each
-# section together, so a digest cannot invent structure or claims — the two things
-# a free-prose digest gets wrong. "Changed positions" exists only because
-# supersession closes windows instead of deleting (D6); "Rejected approaches" only
-# because stance is tracked (D5).
+# The four sections are FIXED and every bullet is a `dream_insights` row, rendered
+# by code — there is no model call in the digest at all, so it cannot invent
+# structure or claims. "Changed positions" exists only because supersession closes
+# windows instead of deleting (D6); "Rejected approaches" only because stance is
+# tracked (D5).
 DIGEST_SECTIONS = ("settled", "rejected", "changed", "open")
-
-_CONSOLIDATE_SYSTEM = (
-    "You write the connective prose for a knowledge digest. You are given a topic and "
-    "its verified claims, already grouped into fixed sections.\n\n"
-    "For each section write 1-3 sentences that tie its claims together: the through-line, "
-    "any tension between them, what the grouping amounts to. Do NOT restate the claims "
-    "one by one (they are printed verbatim beneath your prose), do not add claims that "
-    "are not listed, and do not editorialise about the person. If a section has no "
-    "claims, return an empty string for it."
-)
-
-_CONSOLIDATE_SCHEMA = {
-    "type": "object",
-    "properties": {s: {"type": "string"} for s in DIGEST_SECTIONS},
-    "required": list(DIGEST_SECTIONS),
-    "additionalProperties": False,
-}
 
 
 def _digest_buckets(con, topic_id: str) -> dict[str, list[dict]]:
@@ -1465,59 +1454,37 @@ def _stance_label(stance: str, support_count: int) -> str:
     return f"[{stance}, {support_count} source(s)]"
 
 
-def consolidate(con, topic: dict) -> str | None:
-    """Regenerate a topic's digest from its ACTIVE insight rows. Returns the digest
-    text, or None when the topic has no insights yet.
+def render_digest(con, topic_id: str) -> list[str]:
+    """A topic's digest, rendered DETERMINISTICALLY from its insight rows, at the
+    moment it is asked for. Empty list when the topic has no insights.
 
-    Always re-derived from insight rows — never from a previous digest. That is what
-    keeps the abstraction ladder two levels deep and stops derived text feeding
-    another derivation."""
-    b = _digest_buckets(con, topic["topic_id"])
+    This replaced a model call that wrote connective prose and stored the result as
+    its own `units` row. The call was deleted, not grounded, for three reasons: the
+    bullets were already assembled from insight rows in code, so the prose was the
+    ONLY ungrounded text anywhere in the store; it was a precomputed answer to a
+    question nobody had asked yet, and a reader holding the actual question
+    synthesizes better than a nightly guess; and a STORED summary of rows that keep
+    changing is a staleness bug waiting to happen. Rendering here removes an entire
+    derived artifact, a nightly call per changed topic, and that staleness window.
+    """
+    b = _digest_buckets(con, topic_id)
     if not any(b.values()):
-        return None
-
-    def _lines(rows, changed=False):
-        out = []
-        for r in rows:
-            if changed:
-                out.append(f"- was: {r['superseded_statement']}\n  now: {r['statement']} "
+        return []
+    out: list[str] = []
+    for section in DIGEST_SECTIONS:
+        if not b[section]:
+            continue
+        out.append(f"  {_SECTION_TITLES[section]}:")
+        for r in b[section]:
+            if section == "changed":
+                out.append(f"    - was: {r['superseded_statement']}")
+                out.append(f"      now: {r['statement']} "
                            f"(changed {r['valid_from'].date().isoformat()})")
             else:
-                out.append(f"- {r['statement']} "
+                out.append(f"    - {r['statement']} "
                            f"{_stance_label(r['stance'], r['support_count'])} "
                            f"(last seen {r['last_seen_at'].date().isoformat()})")
-        return "\n".join(out)
-
-    listing = "\n\n".join(
-        f"{_SECTION_TITLES[s]}:\n{_lines(b[s], changed=(s == 'changed')) or '  (none)'}"
-        for s in DIGEST_SECTIONS)
-    prose = _call(con, "consolidate", {"topic_id": topic["topic_id"]},
-                  topic["topic_id"],
-                  f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n{listing}",
-                  _CONSOLIDATE_SCHEMA, system=_CONSOLIDATE_SYSTEM)
-
-    parts = [f"# {topic['name']}"]
-    for s in DIGEST_SECTIONS:
-        if not b[s]:
-            continue
-        parts.append(f"\n## {_SECTION_TITLES[s]}\n")
-        if prose.get(s, "").strip():
-            parts.append(prose[s].strip() + "\n")
-        parts.append(_lines(b[s], changed=(s == "changed")))
-    text = "\n".join(parts)
-
-    digest_id = f"dream-digest-{topic['topic_id']}"
-    now = datetime.now(timezone.utc)
-    oldest = min((r["first_seen_at"] for rows in b.values() for r in rows), default=now)
-    _write_unit(con, digest_id, KIND_DIGEST,
-                f"[{topic['topic_id']}] digest: {topic['name']}", text, oldest, now)
-    con.commit()
-    return text
-
-
-def digest_of(con, topic_id: str) -> dict | None:
-    return con.execute("SELECT title, summary, updated_at FROM units WHERE unit_id=%s",
-                       (f"dream-digest-{topic_id}",)).fetchone()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1604,9 +1571,9 @@ def recall(con, query: str = "", *, topic_id: str | None = None, limit: int = 8,
     # --- coverage: the gap is information the caller MUST have. A thin digest
     # presented as authoritative is worse than an honest "not distilled yet".
     cov: list[str] = []
-    digest = digest_of(con, topic["topic_id"]) if topic else None
+    digest = render_digest(con, topic["topic_id"]) if topic else []
     if topic and not digest:
-        cov.append(f"topic '{topic['topic_id']}' has no digest yet — nothing distilled")
+        cov.append(f"topic '{topic['topic_id']}' has no insights yet — nothing distilled")
     if topic and topic["last_dig_at"]:
         # Same eligibility predicate as the nightly selection (_changed_units):
         # counting by raw `updated_at` would hide exactly the units that
@@ -1650,8 +1617,10 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
     out.append("\nCOVERAGE:")
     out += [f"  ! {c}" for c in result["coverage"]] or ["  (no gaps)"]
 
-    out.append("\nDIGEST:")
-    out.append(result["digest"]["summary"] if result["digest"] else "  (none)")
+    # Rendered from the insight rows printed below it, at read time — so the digest
+    # can never disagree with them, and nothing here is ungrounded prose.
+    out.append("\nDIGEST (rendered from the insights below):")
+    out += result["digest"] or ["  (none)"]
 
     out.append("\nINSIGHTS:")
     if not result["insights"]:
@@ -1702,10 +1671,10 @@ class _Budget:
     coherent boundary — never half-way through a topic's gate chain.
 
     `take(n)` RESERVES n calls, because a dig must not begin unless its whole gate
-    chain fits. A reservation is an upper bound, not a spend: a dig whose topic has
-    no existing insights skips reconcile and uses 2 of its 3. So `reserved` governs
-    the cap while the reported call count comes from `dream_queue` — the audit log
-    of calls actually made. Reporting reservations as spend would overstate cost."""
+    chain fits. A reservation is an upper bound, not a spend: a dig uses 2 of its 3
+    unless the dreamer asks to read further passages. So `reserved` governs the cap
+    while the reported call count comes from `dream_queue` — the audit log of calls
+    actually made. Reporting reservations as spend would overstate cost."""
 
     def __init__(self, max_calls: int | None):
         self.max_calls, self.reserved = max_calls, 0
@@ -1821,7 +1790,7 @@ def _index_written(con, report: dict) -> None:
     wrote = any(any(d["written"].values())
                 for digs in report.get("digs", {}).values()
                 for d in (digs if isinstance(digs, list) else [digs]))
-    if not (wrote or report.get("consolidated")):
+    if not wrote:
         return
     con.commit()                      # the new units must be visible to build_index
     import search
@@ -1846,7 +1815,7 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     t0 = _now()
     report: dict = {"mode": "incremental", "changed": 0, "skipped_empty": [],
                     "topics_touched": [], "queued": 0, "digs": {},
-                    "consolidated": [], "calls": 0, "deferred": [],
+                    "calls": 0, "deferred": [],
                     "stopped_early": None}
     watermark = get_meta(con, WATERMARK_KEY)
     if not watermark:
@@ -1882,7 +1851,7 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
         # Dig only the topics whose backlog is ripe. Cost scales with topics dug, so
         # this — not the unit count — is the nightly budget's real lever.
         for tid, unit_ids in _ripe_topics(con).items():
-            # Each dig is distill + falsify + reconcile => up to 3 calls.
+            # Each dig is distill (+1 if it navigates) + falsify => up to 3 calls.
             if not budget.take(3):
                 report["stopped_early"] = "max-calls reached before digging " + tid
                 break
@@ -1904,14 +1873,6 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
             # the watermark has already moved past them.
             _clear_pending(con, tid, [s["unit_id"] for s in seeds])
 
-        for tid, rep in report["digs"].items():
-            if not any(rep["written"].values()):
-                continue            # insight set unchanged => digest cannot differ
-            if not budget.take():
-                report["stopped_early"] = "max-calls reached before consolidating " + tid
-                break
-            consolidate(con, get_topic(con, tid))
-            report["consolidated"].append(tid)
     except Exception as e:
         _reraise_throttle(e)
         raise
@@ -1943,7 +1904,7 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
     already mined), so the next invocation continues where this one stopped."""
     budget = _Budget(max_calls)
     calls_before = _calls_made(con)
-    report: dict = {"mode": "backfill", "digs": {}, "consolidated": [], "calls": 0,
+    report: dict = {"mode": "backfill", "digs": {}, "calls": 0,
                     "stopped_early": None}
     targets = [get_topic(con, topic_id)] if topic_id else topics(con)
     try:
@@ -1960,9 +1921,6 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
                 rounds.append(dig(con, t, batch))
             if rounds:
                 report["digs"][t["topic_id"]] = rounds
-                if budget.take():
-                    consolidate(con, get_topic(con, t["topic_id"]))
-                    report["consolidated"].append(t["topic_id"])
             if report["stopped_early"]:
                 break
     except Exception as e:
@@ -1983,10 +1941,9 @@ def status(con) -> dict:
         "count(i.unit_id) FILTER (WHERE i.contested)           AS contested "
         "FROM dream_topics t LEFT JOIN dream_insights i USING(topic_id) "
         "GROUP BY t.topic_id, t.status, t.last_dig_at ORDER BY t.topic_id").fetchall()
-    digests = {r["unit_id"].replace("dream-digest-", "") for r in con.execute(
-        "SELECT unit_id FROM units WHERE kind=%s", (KIND_DIGEST,)).fetchall()}
-    for r in rows:
-        r["digest"] = r["topic_id"] in digests
+    # No `digest` field: the digest is rendered from the active insights at read
+    # time, so its presence IS `active > 0`. Reporting it separately would be two
+    # names for one fact — and the kind that drifts once someone changes one of them.
     return {"topics": rows, "watermark": get_meta(con, WATERMARK_KEY),
             "pending": pending_counts(con), "usage": usage_totals(con)}
 

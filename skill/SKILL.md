@@ -74,8 +74,10 @@ count too: pasted-file text is indexed.
      never been dug" or "12 units changed since it was last distilled" is the
      honest answer to a confident-sounding question; presenting a thin digest as
      the user's settled view is the failure mode this layer exists to avoid.
-   - `DIGEST` — the synthesized current position, in fixed sections (Settled /
-     Rejected approaches / Changed positions / Open).
+   - `DIGEST` — the current position in fixed sections (Settled / Rejected
+     approaches / Changed positions / Open). Rendered from the insight rows printed
+     beneath it at read time, so it can never disagree with them and contains no
+     ungrounded prose.
    - `INSIGHTS` — atomic claims, each with a **stance**. Attribute correctly:
      `user_asserted`/`user_endorsed` is the user's own position;
      `user_rejected` is something they turned down (report it AS rejected — it is

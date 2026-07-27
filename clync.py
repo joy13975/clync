@@ -1157,7 +1157,7 @@ def cmd_list(args) -> int:
 
 
 def cmd_dream_topics(args) -> int:
-    """List dream topics: id, status, active insight count, digest presence, last dig."""
+    """List dream topics: id, status, active insight count, last dig time."""
     import dream
     ensure_cluster()
     con = connect()
@@ -1173,7 +1173,7 @@ def cmd_dream_topics(args) -> int:
         print("(no topics)")
     for r in rows:
         print(f"{r['topic_id']:<28} {r['status']:<10} active={r['active']:<4} "
-              f"digest={'yes' if r['digest'] else 'no':<3} last_dig_at={r['last_dig_at']}")
+              f"last_dig_at={r['last_dig_at']}")
     return 0
 
 
@@ -1232,8 +1232,6 @@ def _print_dream_report(report: dict) -> int:
             # work that was silently skipped.
             for n in d.get("notes", []):
                 print(f"      ! {n}")
-    if report.get("consolidated"):
-        print(f"consolidated: {', '.join(report['consolidated'])}")
     print(f"calls       : {report['calls']}")
     if report.get("stopped_early"):
         print(f"stopped_early: {report['stopped_early']}")
@@ -1281,7 +1279,7 @@ def cmd_dream_status(args) -> int:
     for r in st["topics"]:
         print(f"  {r['topic_id']:<28} {r['status']:<10} active={r['active']:<4} "
               f"superseded={r['superseded']:<4} contested={r['contested']:<4} "
-              f"digest={'yes' if r['digest'] else 'no':<3} last_dig_at={r['last_dig_at']}")
+              f"last_dig_at={r['last_dig_at']}")
     print("\nusage by kind:")
     for r in st["usage"]["by_kind"]:
         print(f"  {r['kind']:<10} calls={r['calls']:<4} input={r['input_tokens']:<8} "
@@ -1347,10 +1345,8 @@ def cmd_doctor(args) -> int:
             con.close()
         n_active_topics = sum(1 for r in dst["topics"] if r["status"] == "active")
         n_active_insights = sum(r["active"] for r in dst["topics"])
-        n_digests = sum(1 for r in dst["topics"] if r["digest"])
         print(f"dream       : {n_active_topics} active topic(s), {n_active_insights} "
-              f"active insight(s), {n_digests} digest(s), "
-              f"{dst['usage']['failed']} failed queue item(s)")
+              f"active insight(s), {dst['usage']['failed']} failed queue item(s)")
 
     try:
         import mcp_server  # noqa: F401 — self-test that deps resolve + server builds

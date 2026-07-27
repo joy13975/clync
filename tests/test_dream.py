@@ -548,15 +548,66 @@ def test_falsify_drops_rejected_and_keeps_contested(store, stub_worker):
              {**_candidate(statement="B"), "_evidence": []}]
     stub_worker.append({"verdicts": [
         {"index": 0, "verdict": "rejected", "corrected_stance": "user_asserted",
-         "reason": "generic"},
+         "action": "new", "target": "", "reason": "generic"},
         {"index": 1, "verdict": "contested", "corrected_stance": "co_derived",
-         "reason": "two readings"}]})
+         "action": "new", "target": "", "reason": "two readings"}]})
     rejections: list[str] = []
     out = dream.falsify(store, dream.get_topic(store, "t1"), cands, rejections)
     assert [c["statement"] for c in out] == ["B"]
     assert out[0]["stance"] == "co_derived" and out[0]["verdict"] == "contested"
     # the REASON survives, not just the count — it is what tunes charters/prompts
     assert len(rejections) == 1 and "generic" in rejections[0]
+
+
+def _held(con, statement="An existing claim.", unit_id="dream-held1"):
+    """One active insight for this topic, so falsify has something to reconcile to."""
+    con.execute("INSERT INTO units (unit_id,kind,source,title,synced_at) "
+                "VALUES (%s,%s,'dream',%s,now())", (unit_id, dream.KIND_INSIGHT, statement))
+    con.execute(
+        "INSERT INTO dream_insights (unit_id,topic_id,statement,stance,status,"
+        "support_count,contested,valid_from,first_seen_at,last_seen_at,distilled_at,"
+        "model,evidence_sig) VALUES (%s,'t1',%s,'user_asserted','active',1,false,"
+        "'2026-01-01','2026-01-01','2026-01-01','2026-01-01','opus','sig')",
+        (unit_id, statement))
+    con.commit()
+    return unit_id
+
+
+def test_falsify_resolves_its_reconcile_target_from_a_short_label(store, stub_worker):
+    """The reconcile decision now rides on falsify's verdict — one call, since falsify
+    already had to be shown the held insights. The target is a SHORT [hN] label and
+    code owns the mapping: reconcile used to make the model copy a 36-char uuid
+    verbatim, the same hazard that cost three insights in the distiller."""
+    unit_id = _held(store)
+    cands = [{**_candidate(), "_evidence": []}]
+    stub_worker.append({"verdicts": [
+        {"index": 0, "verdict": "upheld", "corrected_stance": "user_asserted",
+         "action": "refine", "target": "h0", "reason": "sharper wording"}]})
+    out = dream.falsify(store, dream.get_topic(store, "t1"), cands)
+    assert out[0]["action"] == "refine"
+    assert out[0]["target_id"] == unit_id, "the label must resolve to the real id"
+
+
+def test_falsify_rejects_a_target_label_it_was_not_shown(store, stub_worker):
+    _held(store)
+    stub_worker.append({"verdicts": [
+        {"index": 0, "verdict": "upheld", "corrected_stance": "user_asserted",
+         "action": "contradict", "target": "h9", "reason": "changed position"}]})
+    with pytest.raises(dream.DreamError, match="unknown target"):
+        dream.falsify(store, dream.get_topic(store, "t1"),
+                      [{**_candidate(), "_evidence": []}])
+
+
+def test_with_nothing_held_the_action_is_forced_to_new(store, stub_worker):
+    """No held insights means `new` is the only truthful action whatever the model
+    says — mechanically, so a stray 'reinforce' can never reach persist and name a
+    target that does not exist."""
+    stub_worker.append({"verdicts": [
+        {"index": 0, "verdict": "upheld", "corrected_stance": "user_asserted",
+         "action": "reinforce", "target": "h0", "reason": "confused"}]})
+    out = dream.falsify(store, dream.get_topic(store, "t1"),
+                        [{**_candidate(), "_evidence": []}])
+    assert out[0]["action"] == "new" and out[0]["target_id"] == ""
 
 
 def test_falsify_fails_loud_if_a_candidate_went_unjudged(store, stub_worker):
@@ -713,9 +764,9 @@ def test_raw_facets_are_rejected_for_the_dream_source(pg_test_db):
 # --------------------------------------------------------------------------- #
 def test_recall_states_coverage_gaps_loudly(store):
     r = dream.recall(store, "anything", topic_id="t1")
-    assert any("no digest" in c for c in r["coverage"])
+    assert any("no insights" in c for c in r["coverage"])
     assert any("never been dug" in c for c in r["coverage"])
-    assert r["digest"] is None and r["insights"] == []
+    assert r["digest"] == [] and r["insights"] == []
 
 
 def test_recall_warns_when_the_dig_is_stale(store):
@@ -826,17 +877,54 @@ def test_digest_changed_bucket_keys_on_contradict_never_refine(store):
     assert changed[0]["superseded_statement"] == "Same position, sharper wording."
 
 
-def test_digest_prints_only_db_statements_even_if_the_model_rambles(store, stub_worker):
+def test_digest_is_rendered_from_rows_with_no_model_call_at_all(store):
+    """The digest was a model call that wrote connective prose around bullets code had
+    already assembled — the only ungrounded text in the store, precomputed for a
+    question nobody had asked. It is now rendered from the rows at read time, so
+    there is nothing to invent and nothing to go stale. `stub_worker` is deliberately
+    absent: a model call here would raise for want of a stub."""
     _persist_one(store, statement="the only real claim")
-    stub_worker.append({s: "INVENTED CLAIM: everything is fine" if s == "settled" else ""
-                        for s in dream.DIGEST_SECTIONS})
-    text = dream.consolidate(store, dream.get_topic(store, "t1"))
-    assert "the only real claim" in text
-    assert text.count("- ") == 1          # exactly one bullet, from the DB
+    lines = dream.render_digest(store, "t1")
+    assert any("the only real claim" in ln for ln in lines)
+    assert sum(ln.count("    - ") for ln in lines) == 1   # one bullet, from the DB
+    assert any("Settled" in ln for ln in lines)
 
 
-def test_digest_is_none_for_a_topic_with_no_insights(store):
-    assert dream.consolidate(store, dream.get_topic(store, "t1")) is None
+def test_digest_is_empty_for_a_topic_with_no_insights(store):
+    assert dream.render_digest(store, "t1") == []
+
+
+def test_a_retired_stored_digest_unit_is_cleaned_up(store):
+    """Digests used to be stored `units` rows written by a model call. Now they are
+    rendered from the insight rows at read time, so a leftover row is an orphan
+    nothing refreshes — and it would go on answering `search_history` with stale
+    synthesis prose that no longer matches the insights."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,summary,synced_at) "
+                  "VALUES ('dream-digest-t1','dream_digest','dream','d','stale',now())")
+    store.commit()
+    dream.ensure_dream_schema()
+    assert store.execute("SELECT count(*) n FROM units WHERE kind='dream_digest'"
+                         ).fetchone()["n"] == 0
+
+
+def test_probe_queries_are_capped_and_never_evict_the_authored_seeds(store):
+    """`candidates` runs one hybrid search PER probe query, and every dig could add
+    more while nothing removed any — a live topic reached 49 from 5 seeds. Past the
+    cap the newest LEARNED queries displace the oldest, and the hand-written seeds
+    are never displaced: they are the charter expressed as retrieval."""
+    seeds = list(dream.SEED_TOPICS[0][3])
+    tid = dream.SEED_TOPICS[0][0]
+    store.execute("INSERT INTO dream_topics (topic_id,name,charter,probe_queries,"
+                  "status,created_at) VALUES (%s,'n','c',%s,'active',now())",
+                  (tid, clync._json(seeds)))
+    store.commit()
+
+    merged = dream.add_probe_queries(
+        store, tid, [f"learned query {i}" for i in range(40)])
+    assert len(merged) == dream.PROBE_QUERIES_MAX
+    assert set(seeds) <= set(merged), "an authored seed query was evicted"
+    # the survivors are the NEWEST learned ones, not the oldest
+    assert "learned query 39" in merged and "learned query 0" not in merged
 
 
 # --------------------------------------------------------------------------- #
@@ -864,7 +952,7 @@ def test_untouched_topics_cost_nothing(store, stub_worker):
     r = dream.run_incremental(store)
     assert r["changed"] == 1 and r["topics_touched"] == []
     # `calls` is what the audit log says happened, NOT what the budget reserved: a
-    # dig reserves 3 up front but skips reconcile on a topic with no prior insights,
+    # dig reserves 3 up front but only navigates when the dreamer asks,
     # and reporting the reservation would overstate spend.
     assert r["calls"] == store.execute(
         "SELECT count(*) n FROM dream_queue").fetchone()["n"] == 1
@@ -902,7 +990,8 @@ def _distill_one(ref="a#0", statement="Fix bugs at the preventing layer."):
 
 
 _UPHELD = {"verdicts": [{"index": 0, "verdict": "upheld",
-                         "corrected_stance": "user_asserted", "reason": "ok"}]}
+                         "corrected_stance": "user_asserted",
+                         "action": "new", "target": "", "reason": "ok"}]}
 
 
 def test_a_thin_night_queues_instead_of_digging(store, stub_worker):
@@ -924,20 +1013,24 @@ def test_a_thin_night_queues_instead_of_digging(store, stub_worker):
 def test_a_ripe_backlog_digs_and_reports_actual_calls(store, stub_worker,
                                                       pg_test_db, mock_embed):
     """Once DIG_MIN_UNITS accumulate the dig fires. A dig RESERVES 3 calls so it never
-    starts a gate chain it can't finish, but a topic with no prior insights skips
-    reconcile — so reported calls must come from the audit log, not the reservation."""
+    starts a gate chain it can't finish, but it only spends the third when the dreamer
+    asks to read further passages — so reported calls must come from the audit log,
+    not the reservation.
+
+    Also pins the nightly cost after the redesign: a ripe topic is triage + distill +
+    falsify = 3 calls. It was 5 (reconcile was a separate call, and a digest was
+    written per changed topic); reconcile was redundant with falsify's own input and
+    the digest is now rendered at read time."""
     ids = ["u1"] + _add_units(store, dream.DIG_MIN_UNITS - 1)
     clync.set_meta(store, dream.WATERMARK_KEY, "2020-01-01T00:00:00+00:00")
     store.commit()
-    stub_worker += [_triage_all(ids), _distill_one(), _UPHELD,
-                    {s: "" for s in dream.DIGEST_SECTIONS}]
+    stub_worker += [_triage_all(ids), _distill_one(), _UPHELD]
     r = dream.run_incremental(store)
-    # triage + distill + falsify + consolidate = 4; reconcile was skipped.
-    # The budget reserved 5 (1 triage + 3 dig + 1 consolidate).
-    assert r["calls"] == 4
+    assert r["calls"] == 3
     assert r["calls"] == store.execute(
         "SELECT count(*) n FROM dream_queue").fetchone()["n"]
-    assert r["consolidated"] == ["t1"]
+    assert r["digs"]["t1"]["written"] == {"new": 1, "reinforce": 0, "refine": 0,
+                                          "contradict": 0, "out_of_order": 0}
     assert not stub_worker, f"{len(stub_worker)} stub output(s) went unused"
 
 
@@ -949,8 +1042,7 @@ def test_units_beyond_the_batch_cap_stay_pending_and_are_not_lost(store, stub_wo
     ids = ["u1"] + _add_units(store, dream.DIG_BATCH_UNITS + 2)
     clync.set_meta(store, dream.WATERMARK_KEY, "2020-01-01T00:00:00+00:00")
     store.commit()
-    stub_worker += [_triage_all(ids), _distill_one(), _UPHELD,
-                    {s: "" for s in dream.DIGEST_SECTIONS}]
+    stub_worker += [_triage_all(ids), _distill_one(), _UPHELD]
     dream.run_incremental(store)
 
     left = {r["unit_id"] for r in store.execute(
