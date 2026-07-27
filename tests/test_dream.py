@@ -185,8 +185,8 @@ def _long_unit(con, unit_id="long", n=200, hit_at=140,
 
 def test_windows_are_centred_on_the_retrieval_hit_not_the_units_opening(store):
     """THE point of the rendering. Measured on the real corpus before this: rendering
-    from idx 0 up to a char budget put 44/45 = 98% of retrieval matches OUTSIDE the
-    window the dreamer was shown (median match at idx 1039, median 23 messages
+    from idx 0 up to a char budget put 42/45 = 93% of retrieval matches OUTSIDE the
+    window the dreamer was shown (median match at idx 1284, median 23 messages
     shown). The layer was distilling conversation preambles."""
     _long_unit(store, hit_at=140)
     body, refmap, slots = dream.render_windows(

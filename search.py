@@ -372,8 +372,8 @@ def _row_to_result(r: dict) -> dict:
     # dream.recall's relevance floor needs dense_sim for exactly that.
     # `msg_idx` is WHERE in the unit the match actually is. Retrieval is the only
     # layer that knows it, so dropping it here forces every consumer to guess a
-    # window — measured consequence: 98% of matches fell outside the window the
-    # dream layer rendered (it started at idx 0), median match at idx 1039.
+    # window — measured consequence: 93% of matches fell outside the window the
+    # dream layer rendered (it started at idx 0), median match at idx 1284.
     return {"unit_id": r["unit_id"], "unit_name": r["unit_name"],
             "source": r["source"], "lang": r["lang"], "text": r["text"],
             "msg_idx": r["msg_idx"], "chunk_idx": r["chunk_idx"],

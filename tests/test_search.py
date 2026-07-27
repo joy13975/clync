@@ -247,8 +247,8 @@ def test_legacy_conversation_keyed_index_is_replaced(pg_test_db, mock_embed):
 def test_retrieval_carries_the_matched_position_out(pg_test_db, mock_embed):
     """`msg_idx` is WHERE the match is, and only retrieval knows it. A consumer that
     has to guess instead renders the wrong part of the unit: measured on the real
-    corpus, 98% of matches fell outside the window the dream layer showed, because it
-    started at idx 0 while the median match sat at idx 1039. So the position must
+    corpus, 93% of matches fell outside the window the dream layer showed, because it
+    started at idx 0 while the median match sat at idx 1284. So the position must
     come OUT of hybrid_search, and be the position of the actually-matched chunk."""
     search = pg_test_db
     # one long unit; the distinctive phrase sits deep inside it, never near idx 0
