@@ -79,3 +79,14 @@ def mock_embed(monkeypatch):
         return dense, sparse
 
     monkeypatch.setattr(search, "_embed", _fake)
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_codex_root(tmp_path_factory, monkeypatch):
+    """Tests must NEVER read the user's real `~/.codex`. Point the Codex ingest
+    root at an isolated empty dir by default (an existing-empty root is a valid
+    empty corpus -> ingest_codex is a no-op); a test that exercises Codex ingest
+    overrides `codex.CODEX_ROOT` itself. (Claude Code ingest tests already redirect
+    `cc.CC_ROOT` per-test by the same convention.)"""
+    import codex
+    monkeypatch.setattr(codex, "CODEX_ROOT", tmp_path_factory.mktemp("codex_root_sandbox"))

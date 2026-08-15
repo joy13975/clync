@@ -50,7 +50,7 @@ def _seed_cc(unit_id, title, repo, texts, worktree=None, branch=None):
                      worktree=worktree, git_branch=branch, cc_version="2.1.0",
                      entrypoint="cli", model="claude-opus-4-8", messages=msgs)
     con = clync.connect()
-    clync._upsert_cc_session(con, s)
+    clync._upsert_local_session(con, s, "claude_code", "cc_session")
     con.commit()
     con.close()
 
@@ -345,7 +345,7 @@ def test_resumed_cc_sessions_index_without_chunk_collision(pg_test_db, mock_embe
                          worktree=None, git_branch=None, cc_version="2.1.0",
                          entrypoint="cli", model=None, messages=msgs)
         con = clync.connect()
-        clync._upsert_cc_session(con, s)
+        clync._upsert_local_session(con, s, "claude_code", "cc_session")
         con.commit()
         con.close()
     assert search.build_index(full=False)["reindexed_units"] == 2

@@ -5,9 +5,12 @@ both sources land AND become searchable from one run, and a dead claude.ai cooki
 never blocks local capture or indexing (the failure is returned, not swallowed)."""
 from __future__ import annotations
 
+import json
+
 import cc
 import clync
 from tests.test_cc import _cli_events, _write_session
+from tests.test_chatgpt import _FakeCGPTClient, _pair, _wire_cgpt
 from tests.test_sync import _FakeClient, _conv, _wire
 
 
@@ -16,33 +19,65 @@ def _wire_cc(tmp_path, monkeypatch):
     monkeypatch.setattr(cc, "CC_ROOT", tmp_path)
 
 
-def test_sync_all_indexes_both_sources_searchable(pg_test_db, tmp_path,
-                                                  monkeypatch, mock_embed):
-    """One `_sync_all(do_index=True)` run must leave BOTH a claude.ai chat and a
-    local Claude Code session stored AND retrievable by hybrid_search — i.e. the
-    daily job auto-embeds everything it synced, in one pass."""
+def _wire_codex(tmp_path, monkeypatch):
+    """Seed one real-shaped Codex rollout under a sandboxed root and point the
+    Codex ingest there — so `_sync_all` ingests it without touching real ~/.codex."""
+    import codex
+    root = tmp_path / "codex"
+    rollout = root / "sessions" / "2026" / "01" / "01" / "rollout-2026-01-01T00-00-00-cdx1.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "cdx1", "cwd": "/Users/j/code/clync",
+                     "originator": "codex_cli_rs", "cli_version": "0.66.0"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "turn_context",
+         "payload": {"cwd": "/Users/j/code/clync", "model": "gpt-5.1-codex"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "response_item",
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "hello from codex cli"}]}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "response_item",
+         "payload": {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "the codex answer"}]}},
+    ]
+    rollout.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+    monkeypatch.setattr(codex, "CODEX_ROOT", root)
+
+
+def test_sync_all_indexes_all_sources_searchable(pg_test_db, tmp_path,
+                                                 monkeypatch, mock_embed):
+    """One `_sync_all(do_index=True)` run must leave a claude.ai chat, a local
+    Claude Code session, a local Codex CLI session, AND a ChatGPT conversation
+    stored AND retrievable by hybrid_search — i.e. the daily job auto-embeds
+    everything it synced across all four sources, in one pass."""
     search = pg_test_db
     per_org = {"org1": {"convs": [_conv("c1", "2026-02-01T00:00:00+00:00", "hello from the app")]}}
     _wire(monkeypatch, _FakeClient(per_org), [{"uuid": "org1", "name": "Org2"}])
     _wire_cc(tmp_path, monkeypatch)
+    _wire_codex(tmp_path, monkeypatch)
+    _wire_cgpt(monkeypatch, _FakeCGPTClient([
+        _pair("cg1", "2026-02-01T00:00:00Z", "a chatgpt web question", "the chatgpt answer")]))
 
     err = clync._sync_all("prof", None, full=True, download_files=False,
                           do_index=True, notify_fail=False)
-    assert err is None                                  # app leg succeeded -> nothing to re-raise
+    assert err is None                                  # both network legs succeeded
 
     con = clync.connect()
     try:
         kinds = {r["source"] for r in con.execute(
             "SELECT DISTINCT source FROM units").fetchall()}
-        assert kinds == {"claude_ai", "claude_code"}    # both sources stored in one run
+        assert kinds == {"claude_ai", "claude_code", "codex_cli", "chatgpt"}  # all four
     finally:
         con.close()
 
-    # both sources are in the freshly built index and reachable via search
+    # all four sources are in the freshly built index and reachable via search
     app_hits = {h["unit_id"] for h in search.hybrid_search("", source="claude_ai", topk=50)}
     cc_hits = {h["unit_id"] for h in search.hybrid_search("", source="claude_code", topk=50)}
+    codex_hits = {h["unit_id"] for h in search.hybrid_search("", source="codex_cli", topk=50)}
+    cgpt_hits = {h["unit_id"] for h in search.hybrid_search("", source="chatgpt", topk=50)}
     assert "c1" in app_hits                             # app chat auto-embedded + searchable
     assert "sess-1" in cc_hits                          # cc session auto-embedded + searchable
+    assert "cdx1" in codex_hits                         # codex session auto-embedded + searchable
+    assert "cg1" in cgpt_hits                           # chatgpt conv auto-embedded + searchable
 
 
 def test_sync_all_app_failure_still_ingests_and_indexes_cc(pg_test_db, tmp_path,
@@ -60,6 +95,7 @@ def test_sync_all_app_failure_still_ingests_and_indexes_cc(pg_test_db, tmp_path,
     monkeypatch.setattr(clync, "ClaudeClient", lambda cookies, profile: _BoomClient({}))
     monkeypatch.setattr(clync, "resolve_orgs", lambda c, ref: [{"uuid": "org1", "name": "Org2"}])
     _wire_cc(tmp_path, monkeypatch)
+    _wire_cgpt(monkeypatch, _FakeCGPTClient([]))        # ChatGPT leg OK -> only the app leg fails
 
     err = clync._sync_all("prof", None, full=True, download_files=False,
                           do_index=True, notify_fail=False)

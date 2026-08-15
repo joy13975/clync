@@ -69,12 +69,13 @@ AUTH_COOKIE_NAMES = ("sessionKey", "cf_clearance")
 REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate-limited
 DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
 # SSOT for the `source` facet values (CLI argparse choices + search validation).
-# `all` deliberately means RAW ONLY (claude_ai + claude_code). The Dream layer
-# (ADR 0004) is reachable via source='dream' or the combined `search_history`
-# surface, never by accident: that keeps every pre-existing query's meaning intact
-# AND makes non-circularity the default — the dig cannot retrieve its own output.
-VALID_SOURCES = ("all", "claude_ai", "claude_code", "dream")
-RAW_SOURCES = ("claude_ai", "claude_code")
+# `all` deliberately means RAW ONLY (claude_ai + claude_code + codex_cli + chatgpt).
+# The Dream layer (ADR 0004) is reachable via source='dream' or the combined
+# `search_history` surface, never by accident: that keeps every pre-existing query's
+# meaning intact AND makes non-circularity the default — the dig cannot retrieve its
+# own output.
+VALID_SOURCES = ("all", "claude_ai", "claude_code", "codex_cli", "chatgpt", "dream")
+RAW_SOURCES = ("claude_ai", "claude_code", "codex_cli", "chatgpt")
 
 
 def resolve_sources(source: str) -> list[str]:
@@ -142,31 +143,55 @@ def resolve_profile_dir(display_name: str) -> Path:
     return CHROME_DIR / matches[0]
 
 
+def _read_profile_cookies(profile_display_name: str, host_like: str,
+                          names: tuple[str, ...] | None = None,
+                          tolerant: bool = False) -> dict[str, str]:
+    """Live-read + decrypt a Chrome profile's cookies for a host. `names` limits
+    to specific cookie names; None reads every cookie for the host. The DB is
+    copied first to dodge Chrome's live lock; decryption uses the login-keychain
+    Safe Storage key. `tolerant` skips a cookie that will not decrypt (e.g. an
+    app-bound v20 cookie irrelevant to us) instead of raising — each caller then
+    validates that the cookie IT needs is present and well-formed (fail-loud on
+    the load-bearing one, not on incidental ones)."""
+    profile_dir = resolve_profile_dir(profile_display_name)
+    cookies_db = profile_dir / "Cookies"
+    if not cookies_db.exists():
+        raise RuntimeError(f"No Cookies DB at {cookies_db}")
+    key = _safe_storage_key()
+    if names:
+        placeholders = ",".join("?" * len(names))
+        sql = ("SELECT name, encrypted_value FROM cookies "
+               f"WHERE host_key LIKE ? AND name IN ({placeholders})")
+        params: tuple = (host_like, *names)
+    else:
+        sql = "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE ?"
+        params = (host_like,)
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot = Path(tmp) / "Cookies"  # copy to dodge Chrome's live lock
+        shutil.copy2(cookies_db, snapshot)
+        con = sqlite3.connect(snapshot)
+        try:
+            rows = con.execute(sql, params).fetchall()
+        finally:
+            con.close()
+    cookies: dict[str, str] = {}
+    for name, val in rows:
+        try:
+            cookies[name] = _decrypt_cookie(val, key)
+        except RuntimeError:
+            if not tolerant:
+                raise
+    return cookies
+
+
 def read_auth_cookies(profile_display_name: str) -> dict[str, str]:
     """Live-read + decrypt claude.ai auth cookies from a Chrome profile.
 
     Read fresh every run, so sessionKey + cf_clearance are always as current as
     the browser's last claude.ai activity — that is the freshness mechanism.
     """
-    profile_dir = resolve_profile_dir(profile_display_name)
-    cookies_db = profile_dir / "Cookies"
-    if not cookies_db.exists():
-        raise RuntimeError(f"No Cookies DB at {cookies_db}")
-    key = _safe_storage_key()
-    placeholders = ",".join("?" * len(AUTH_COOKIE_NAMES))
-    with tempfile.TemporaryDirectory() as tmp:
-        snapshot = Path(tmp) / "Cookies"  # copy to dodge Chrome's live lock
-        shutil.copy2(cookies_db, snapshot)
-        con = sqlite3.connect(snapshot)
-        try:
-            rows = con.execute(
-                "SELECT name, encrypted_value FROM cookies "
-                f"WHERE host_key LIKE '%claude.ai%' AND name IN ({placeholders})",
-                AUTH_COOKIE_NAMES,
-            ).fetchall()
-        finally:
-            con.close()
-    cookies = {name: _decrypt_cookie(val, key) for name, val in rows}
+    cookies = _read_profile_cookies(profile_display_name, "%claude.ai%",
+                                    AUTH_COOKIE_NAMES)
     if "sessionKey" not in cookies:
         raise RuntimeError(
             f"No claude.ai login found in the {profile_display_name!r} Chrome "
@@ -175,6 +200,29 @@ def read_auth_cookies(profile_display_name: str) -> dict[str, str]:
     if not cookies["sessionKey"].startswith("sk-ant-sid"):
         raise RuntimeError("Decrypted sessionKey has an unexpected format.")
     return cookies
+
+
+def read_chatgpt_cookies(profile_display_name: str) -> dict[str, str]:
+    """Live-read + decrypt every chatgpt.com cookie from a Chrome profile. All of
+    them are set on the request (as the browser does) so Cloudflare's clearance
+    cookies ride along; the session-token cookie is the load-bearing credential
+    and its absence fails loud. Read fresh every run for freshness (mirror of
+    read_auth_cookies)."""
+    cookies = _read_profile_cookies(profile_display_name, "%chatgpt.com%",
+                                    names=None, tolerant=True)
+    if chatgpt_mod_session_cookie() not in cookies:
+        raise RuntimeError(
+            f"No ChatGPT login found in the {profile_display_name!r} Chrome "
+            f"profile (no {chatgpt_mod_session_cookie()} cookie). Open "
+            f"https://chatgpt.com in that profile and LOG IN, then re-run."
+        )
+    return cookies
+
+
+def chatgpt_mod_session_cookie() -> str:
+    """The ChatGPT session-token cookie name (SSOT lives in chatgpt.py)."""
+    import chatgpt
+    return chatgpt.SESSION_COOKIE
 
 
 # --------------------------------------------------------------------------- #
@@ -301,8 +349,8 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS units (
     unit_id      text PRIMARY KEY,
-    kind         text NOT NULL,          -- chat | project_doc | cc_session
-    source       text NOT NULL,          -- claude_ai | claude_code
+    kind         text NOT NULL,          -- chat | project_doc | cc_session | codex_session | chatgpt
+    source       text NOT NULL,          -- claude_ai | claude_code | codex_cli | chatgpt
     title        text,
     summary      text,
     model        text,
@@ -373,15 +421,29 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_unit ON files(unit_id);
 
--- Per-file incremental watermark for the local Claude Code ingest: a transcript
--- is re-parsed only when its mtime/size changes.
+-- Per-file incremental watermark for the local file-based ingests (Claude Code
+-- AND Codex CLI): a transcript is re-parsed only when its mtime/size changes. The
+-- `source` column partitions the two — each ingest loads and reconciles only its
+-- own source's rows, so file_paths and deletion reconciliation never cross sources.
 CREATE TABLE IF NOT EXISTS cc_sync_state (
     file_path  text PRIMARY KEY,
     mtime      double precision,
     size       bigint,
     session_id text,
+    source     text NOT NULL,
     synced_at  timestamptz NOT NULL
 );
+-- Backfill the source column onto a pre-existing table (rows written before the
+-- Codex ingest existed are all Claude Code). The DEFAULT exists ONLY to stamp
+-- those legacy rows during this ADD COLUMN.
+ALTER TABLE IF EXISTS cc_sync_state
+    ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'claude_code';
+-- Drop the DEFAULT once the backfill has run: its sole purpose was the migration
+-- above. Keeping it live would let a future watermark INSERT that omits `source`
+-- silently label itself 'claude_code' (NOT NULL would still pass) and slip the
+-- source-partitioned deletion reconciliation. Every live INSERT binds source
+-- explicitly, so with no default an omitted bind now fails loud (NOT NULL).
+ALTER TABLE IF EXISTS cc_sync_state ALTER COLUMN source DROP DEFAULT;
 
 CREATE TABLE IF NOT EXISTS meta (key text PRIMARY KEY, value text);
 """
@@ -817,25 +879,31 @@ def _same_instant(stored, remote_iso: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Local Claude Code session ingest (cookie-independent; see cc.py + ADR 0003)
+# Local file-based session ingest (cookie-independent). Two sources share ONE
+# mechanism, partitioned by the `source` column of cc_sync_state:
+#   - Claude Code transcripts (see cc.py + ADR 0003)
+#   - Codex CLI rollouts       (see codex.py)
 # --------------------------------------------------------------------------- #
-def _upsert_cc_session(con, s) -> None:
-    """Write one parsed CCSession -> a `units` row (kind=cc_session) + its
-    cleaned `messages` (wholesale-replaced; per-unit identity)."""
+def _upsert_local_session(con, s, source: str, kind: str) -> None:
+    """Write one parsed session (a CCSession / CodexSession / ChatGPTConversation
+    — duck-typed on identical field names; the network-sourced ChatGPT object
+    leaves the local-workspace fields None) -> a `units` row + its cleaned
+    `messages` (wholesale-replaced; per-unit identity)."""
     con.execute(
         """INSERT INTO units
              (unit_id, kind, source, title, summary, model, created_at, updated_at,
               repo, cwd, worktree, git_branch, cc_version, entrypoint,
               raw, synced_at)
-           VALUES (%s,'cc_session','claude_code',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            ON CONFLICT(unit_id) DO UPDATE SET
+             kind=EXCLUDED.kind, source=EXCLUDED.source,
              title=EXCLUDED.title, summary=EXCLUDED.summary, model=EXCLUDED.model,
              created_at=EXCLUDED.created_at, updated_at=EXCLUDED.updated_at,
              repo=EXCLUDED.repo, cwd=EXCLUDED.cwd, worktree=EXCLUDED.worktree,
              git_branch=EXCLUDED.git_branch, cc_version=EXCLUDED.cc_version,
              entrypoint=EXCLUDED.entrypoint,
              raw=EXCLUDED.raw, synced_at=EXCLUDED.synced_at""",
-        (s.session_id, s.title, s.summary, s.model,
+        (s.session_id, kind, source, s.title, s.summary, s.model,
          s.created_at, s.updated_at, s.repo, s.cwd, s.worktree, s.git_branch,
          s.cc_version, s.entrypoint,
          _json({"session_id": s.session_id, "cwd": s.cwd, "repo": s.repo,
@@ -847,21 +915,35 @@ def _upsert_cc_session(con, s) -> None:
     _replace_unit_messages(con, s.session_id, rows)
 
 
-def ingest_cc(full: bool = False) -> dict:
-    """Ingest local Claude Code transcripts into the store. Incremental by file
-    mtime/size (a `cc_sync_state` watermark); `full` re-parses every file. Also
-    reconciles deletions: a transcript removed from disk loses its unit/messages
-    and its watermark row (the mirror of the claude.ai upstream-deletion purge —
-    never degrade silently to stale data). An unavailable transcript root raises
-    (in `cc.iter_session_files`, before any store mutation) — a missing source
-    is an error, never evidence of deletion. No network / cookies. Returns
-    stats. Fails loud on a store error."""
-    import cc
-    files = list(cc.iter_session_files())  # raises on a missing root, before the store is touched
+_UNSET = object()   # default out_of_scope_marker: a value no parser ever returns
+
+
+def _ingest_local(source: str, kind: str, iter_files, parse_session, full: bool,
+                  out_of_scope_marker: object = _UNSET) -> dict:
+    """Shared incremental ingest for a local file-based source. Incremental by
+    file mtime/size (the `cc_sync_state` watermark, partitioned by `source`);
+    `full` re-parses every file. Also reconciles deletions WITHIN this source: a
+    file removed from disk loses its unit/messages and its watermark row (mirror
+    of the claude.ai upstream-deletion purge — never degrade silently to stale
+    data). An unavailable root raises (in `iter_files`, before any store
+    mutation) — a missing source is an error, never evidence of deletion. No
+    network / cookies. Returns stats. Fails loud on a store error.
+
+    `out_of_scope_marker` is the sentinel a parser returns for a file it examined
+    but deliberately skipped by scope (e.g. codex.OUT_OF_SCOPE for a non-terminal
+    originator). Those are watermarked (so they are not re-parsed every sync) but
+    counted on their OWN `out_of_scope` axis, NOT as ingested sessions — so a
+    producer rename that pushes the whole corpus out of scope shows up as
+    out_of_scope==files_parsed with sessions_ingested==0, never a silent healthy
+    run. A source with no scope sentinel leaves the default (matches nothing)."""
+    files = list(iter_files())  # raises on a missing root, before the store is touched
     con = connect()
+    # Only THIS source's watermarks — so a cross-source path never reads as
+    # "deleted" and gets its unit purged during reconciliation.
     state = {r["file_path"]: (r["mtime"], r["size"]) for r in con.execute(
-        "SELECT file_path, mtime, size FROM cc_sync_state").fetchall()}
-    ingested = skipped = sessions = 0
+        "SELECT file_path, mtime, size FROM cc_sync_state WHERE source=%s",
+        (source,)).fetchall()}
+    ingested = skipped = sessions = out_of_scope = 0
     try:
         for path in files:
             st = path.stat()
@@ -869,42 +951,110 @@ def ingest_cc(full: bool = False) -> dict:
             if not full and state.get(key) == (st.st_mtime, st.st_size):
                 skipped += 1
                 continue
-            parsed = cc.parse_session(path)
-            if parsed is not None:
-                _upsert_cc_session(con, parsed)
+            parsed = parse_session(path)
+            if parsed is out_of_scope_marker:      # examined, deliberately skipped by scope
+                out_of_scope += 1
+                session = None
+            else:
+                session = parsed
+            if session is not None:
+                _upsert_local_session(con, session, source, kind)
                 sessions += 1
             con.execute(
-                "INSERT INTO cc_sync_state (file_path, mtime, size, session_id, synced_at) "
-                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT(file_path) DO UPDATE SET "
+                "INSERT INTO cc_sync_state (file_path, mtime, size, session_id, source, "
+                "synced_at) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(file_path) DO UPDATE SET "
                 "mtime=EXCLUDED.mtime, size=EXCLUDED.size, "
-                "session_id=EXCLUDED.session_id, synced_at=EXCLUDED.synced_at",
+                "session_id=EXCLUDED.session_id, source=EXCLUDED.source, "
+                "synced_at=EXCLUDED.synced_at",
                 (key, st.st_mtime, st.st_size,
-                 parsed.session_id if parsed else None, _now()))
+                 session.session_id if session else None, source, _now()))
             con.commit()
             ingested += 1
-        # Reconcile deletions: drop watermark rows for files no longer on disk,
-        # then every cc unit left without ANY backing file (FK cascades its
-        # messages; build_index drops its chunks via the `gone` path).
+        # Reconcile deletions WITHIN this source: drop watermark rows for files no
+        # longer on disk, then every unit of this kind left without ANY backing
+        # file (FK cascades its messages; build_index drops its chunks via `gone`).
         on_disk = {str(p) for p in files}
         dead_paths = [fp for fp in state if fp not in on_disk]
         if dead_paths:
             con.execute("DELETE FROM cc_sync_state WHERE file_path = ANY(%s)",
                         (dead_paths,))
         removed = len(con.execute(
-            "DELETE FROM units u WHERE u.kind='cc_session' AND NOT EXISTS "
-            "(SELECT 1 FROM cc_sync_state s WHERE s.session_id = u.unit_id) "
-            "RETURNING u.unit_id").fetchall())
+            "DELETE FROM units u WHERE u.kind=%s AND NOT EXISTS "
+            "(SELECT 1 FROM cc_sync_state s WHERE s.session_id = u.unit_id "
+            " AND s.source=%s) RETURNING u.unit_id", (kind, source)).fetchall())
         con.commit()
         total = con.execute(
-            "SELECT COUNT(*) FROM units WHERE source='claude_code'").fetchone()["count"]
+            "SELECT COUNT(*) FROM units WHERE source=%s", (source,)).fetchone()["count"]
     finally:
         con.close()
-    print(f"[cc] files_parsed={ingested} unchanged={skipped} "
-          f"cli_sessions_ingested={sessions} sessions_removed={removed} "
-          f"cc_sessions_in_db={total}")
+    print(f"[{source}] files_parsed={ingested} unchanged={skipped} "
+          f"sessions_ingested={sessions} out_of_scope={out_of_scope} "
+          f"sessions_removed={removed} sessions_in_db={total}")
     return {"files_parsed": ingested, "unchanged": skipped,
-            "sessions_ingested": sessions, "sessions_removed": removed,
-            "cc_sessions_in_db": total}
+            "sessions_ingested": sessions, "out_of_scope": out_of_scope,
+            "sessions_removed": removed, "sessions_in_db": total}
+
+
+def ingest_cc(full: bool = False) -> dict:
+    """Ingest local Claude Code transcripts (`~/.claude/projects`). See _ingest_local."""
+    import cc
+    return _ingest_local("claude_code", "cc_session",
+                         cc.iter_session_files, cc.parse_session, full)
+
+
+def ingest_codex(full: bool = False) -> dict:
+    """Ingest local Codex CLI rollouts (`~/.codex/sessions` + archived). See _ingest_local."""
+    import codex
+    return _ingest_local("codex_cli", "codex_session",
+                         codex.iter_session_files, codex.parse_session, full,
+                         out_of_scope_marker=codex.OUT_OF_SCOPE)
+
+
+def ingest_chatgpt(profile: str, full: bool = False) -> dict:
+    """Ingest ChatGPT web history (source=chatgpt, kind=chatgpt) via the private
+    web API (cookies -> accessToken -> /backend-api). NETWORK/cookies — fails loud
+    on an expired login (mirror of the claude.ai leg, NOT the cookie-independent
+    local ingests). Incremental by each conversation's `update_time` (skip when the
+    stored instant matches); `full` re-fetches every conversation. Deletion is
+    reconciled against the live listing — a conversation gone upstream loses its
+    unit (FK-cascades its messages), scoped to kind='chatgpt' so no other source is
+    ever touched. Returns stats."""
+    import chatgpt
+    client = chatgpt.ChatGPTClient(read_chatgpt_cookies(profile), profile)
+    con = connect()
+    fetched = skipped = removed = 0
+    try:
+        stored = {r["unit_id"]: r["updated_at"] for r in con.execute(
+            "SELECT unit_id, updated_at FROM units WHERE kind='chatgpt'").fetchall()}
+        remote = list(client.iter_conversations())
+        remote_ids = {c["id"] for c in remote}
+        print(f"[chatgpt] conversations: {len(remote)} remote | "
+              f"{len(stored)} already stored")
+        for c in remote:
+            cid = c["id"]
+            if (not full and cid in stored
+                    and _same_instant(stored[cid], chatgpt._iso(c.get("update_time")))):
+                skipped += 1
+                continue
+            conv = chatgpt.linearize(client.get_conversation(cid), c)
+            _upsert_local_session(con, conv, "chatgpt", "chatgpt")
+            con.commit()
+            fetched += 1
+        # Reconcile deletions WITHIN source=chatgpt only (kind guards the scope).
+        dead = [u for u in stored if u not in remote_ids]
+        if dead:
+            removed = len(con.execute(
+                "DELETE FROM units WHERE kind='chatgpt' AND unit_id = ANY(%s) "
+                "RETURNING unit_id", (dead,)).fetchall())
+        con.commit()
+        total = con.execute(
+            "SELECT COUNT(*) AS n FROM units WHERE source='chatgpt'").fetchone()["n"]
+    finally:
+        con.close()
+    print(f"[chatgpt] fetched/updated={fetched} unchanged={skipped} "
+          f"conversations_removed={removed} conversations_in_db={total}")
+    return {"fetched": fetched, "unchanged": skipped,
+            "conversations_removed": removed, "conversations_in_db": total}
 
 
 # --------------------------------------------------------------------------- #
@@ -972,31 +1122,41 @@ def _index_after_sync(full: bool) -> None:
 
 def _sync_all(profile: str, org_ref: str | None, full: bool, download_files: bool,
               do_index: bool, notify_fail: bool) -> Exception | None:
-    """Run claude.ai sync (cookie/network — may fail) then ALWAYS the local
-    Claude Code ingest (no network), then index. claude.ai failure is captured and
-    RETURNED for the caller to re-raise (fail-loud) — but only after cc + index run,
-    so a stale/expired cookie never blocks local-session capture. A cc-ingest or
-    index failure is not captured — it raises immediately (notifying first on the
-    scheduled path, so an unattended failure is never silent)."""
+    """Run the network legs (claude.ai then ChatGPT, cookie/network — each may
+    fail) then ALWAYS the local ingests (Claude Code + Codex CLI, no network), then
+    index. Each network leg's failure is captured INDEPENDENTLY and RETURNED for the
+    caller to re-raise (fail-loud) — but only after the local ingests + index run,
+    so one stale/expired cookie never blocks the other network leg OR local-session
+    capture. A local-ingest or index failure is not captured — it raises immediately
+    (notifying first on the scheduled path, so an unattended failure is never
+    silent)."""
     ensure_cluster()
-    err: Exception | None = None
-    try:
-        run_sync(profile, org_ref, full, download_files=download_files)
-    except Exception as e:                    # captured, re-raised by caller (loud)
-        if notify_fail:
-            notify("fail", "clync sync failed", str(e))
-        print(f"claude.ai sync FAILED: {e}\n  -> continuing with local Claude Code "
-              f"ingest (cookie-independent)", file=sys.stderr)
-        err = e
+    net_errs: list[Exception] = []
+    for label, run in (("claude.ai", lambda: run_sync(
+                            profile, org_ref, full, download_files=download_files)),
+                       ("ChatGPT", lambda: ingest_chatgpt(profile, full=full))):
+        try:
+            run()
+        except Exception as e:                # captured, re-raised by caller (loud)
+            if notify_fail:
+                notify("fail", f"clync {label} sync failed", str(e))
+            print(f"{label} sync FAILED: {e}\n  -> continuing with the remaining "
+                  f"network + local ingests", file=sys.stderr)
+            net_errs.append(e)
     try:
         ingest_cc(full=full)
+        ingest_codex(full=full)
     except Exception as e:
         if notify_fail:
-            notify("fail", "clync cc ingest failed", str(e))
+            notify("fail", "clync local ingest failed", str(e))
         raise
     if do_index:
         _index_after_sync(full)
-    return err
+    if not net_errs:
+        return None
+    if len(net_errs) == 1:
+        return net_errs[0]
+    return RuntimeError("; ".join(f"{type(e).__name__}: {e}" for e in net_errs))
 
 
 def cmd_sync(args) -> int:
@@ -1023,6 +1183,24 @@ def cmd_sync_cc(args) -> int:
     """Ingest local Claude Code sessions ONLY (no network/cookies), then index."""
     ensure_cluster()
     ingest_cc(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
+def cmd_sync_codex(args) -> int:
+    """Ingest local Codex CLI sessions ONLY (no network/cookies), then index."""
+    ensure_cluster()
+    ingest_codex(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
+def cmd_sync_chatgpt(args) -> int:
+    """Sync ChatGPT web history ONLY — network/cookies, fails loud — then index."""
+    ensure_cluster()
+    ingest_chatgpt(_require_profile(args), full=args.full)
     if not args.no_index:
         _index_after_sync(args.full)
     return 0
@@ -1340,6 +1518,8 @@ def cmd_doctor(args) -> int:
             nchat = _n("SELECT COUNT(*) n FROM units WHERE kind='chat'")
             ndoc = _n("SELECT COUNT(*) n FROM units WHERE kind='project_doc'")
             ncc = _n("SELECT COUNT(*) n FROM units WHERE kind='cc_session'")
+            ncodex = _n("SELECT COUNT(*) n FROM units WHERE kind='codex_session'")
+            nchatgpt = _n("SELECT COUNT(*) n FROM units WHERE kind='chatgpt'")
             nmsg = _n("SELECT COUNT(*) n FROM messages")
             nfile = _n("SELECT COUNT(*) n FROM files")
             ndl = _n("SELECT COUNT(*) n FROM files WHERE local_path IS NOT NULL")
@@ -1348,6 +1528,7 @@ def cmd_doctor(args) -> int:
             con.close()
         print(f"store       : {PG_DB}@localhost:{PG_PORT}\n"
               f"              {nchat} chats, {ndoc} project docs, {ncc} cc sessions, "
+              f"{ncodex} codex sessions, {nchatgpt} chatgpt sessions, "
               f"{nmsg} messages, {nfile} files ({ndl} images), last_success={last}")
         print(f"search index: ok ({st['chunks']} chunks indexed)")
         if last:
@@ -1586,7 +1767,7 @@ def main() -> int:
                    ).set_defaults(func=cmd_whoami)
 
     sp = sub.add_parser("sync", parents=[cred],
-                        help="sync BOTH sources (claude.ai + local Claude Code) + index")
+                        help="sync ALL sources (claude.ai + local Claude Code + Codex CLI) + index")
     sp.add_argument("--full", action="store_true", help="re-fetch/re-parse everything")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
     sp.add_argument("--no-index", action="store_true",
@@ -1605,6 +1786,19 @@ def main() -> int:
     sp.add_argument("--full", action="store_true", help="re-parse every transcript")
     sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
     sp.set_defaults(func=cmd_sync_cc)
+
+    sp = sub.add_parser("sync-chatgpt", parents=[cred],
+                        help="sync ChatGPT web history ONLY (network/cookies)")
+    sp.add_argument("--full", action="store_true",
+                    help="re-fetch every conversation (ignore incremental watermarks)")
+    sp.add_argument("--no-index", action="store_true", help="skip reindex after sync")
+    sp.set_defaults(func=cmd_sync_chatgpt)
+
+    sp = sub.add_parser("sync-codex", help="ingest local Codex CLI sessions ONLY "
+                                           "(no network / cookies) + index")
+    sp.add_argument("--full", action="store_true", help="re-parse every rollout")
+    sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
+    sp.set_defaults(func=cmd_sync_codex)
 
     sp = sub.add_parser("index", help="(re)build the hybrid-search index")
     sp.add_argument("--full", action="store_true", help="reindex every unit")

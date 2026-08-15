@@ -17,7 +17,7 @@ from datetime import datetime
 
 # The store + shared config live in the core module (SSOT). Search is core now
 # (ADR 0003): its deps are no longer an optional extra.
-from clync import (DEFAULT_TOPK, PG_BIN, connect_pg, require_rebuild,
+from clync import (DEFAULT_TOPK, PG_BIN, RAW_SOURCES, connect_pg, require_rebuild,
                    resolve_sources, sql_statements, _vector_control_present)
 
 EMBED_MODEL = "BAAI/bge-m3"
@@ -150,7 +150,7 @@ def _pieces(text: str) -> list[str]:
 
 def _display_name(kind, title, project_name, repo) -> str:
     """The human-facing unit label shown in results and folded into embed text."""
-    if kind == "cc_session":
+    if kind in ("cc_session", "codex_session"):
         base = title or "session"
         return f"[{repo}] {base}" if repo else base
     base = title or ("document" if kind == "project_doc" else "untitled")
@@ -303,18 +303,26 @@ def build_index(full: bool = False) -> dict:
 # --------------------------------------------------------------------------- #
 # Faceted hybrid search
 # --------------------------------------------------------------------------- #
-# Every source-specific facet the WHERE builder understands, mapped to the ONE raw
-# source whose units can satisfy it. This registry is the SSOT read by BOTH
+# Every source-specific facet the WHERE builder understands, mapped to the SET of
+# raw sources whose units can satisfy it. This registry is the SSOT read by BOTH
 # `_validate_facets` and `_facet_where` (they take the same `facets` dict), so a
 # facet added to the WHERE builder cannot be silently un-guarded: an unregistered
 # key fails loud on the first call instead of validating and then ANDing an
 # unsatisfiable predicate into an empty, confident "no matches". (`session` was
 # exactly that hole: it reached the WHERE builder but not the hand-enumerated
 # guard, so source='dream' + session=... returned nothing with no error.)
+# A facet maps to a SET because a facet can be carried by more than one source:
+# repo/worktree come from a local session's cwd (Claude Code AND Codex CLI), and
+# `model` is carried by every conversational source (ChatGPT records model_slug).
+# `branch` stays Claude-Code-only (Codex rollouts record no git branch); ChatGPT
+# carries no repo/worktree/branch/project — only model.
 FACET_SOURCES = {
-    "repo": "claude_code", "worktree": "claude_code", "branch": "claude_code",
-    "session": "claude_code",
-    "project": "claude_ai", "model": "claude_ai",
+    "repo": frozenset({"claude_code", "codex_cli"}),
+    "worktree": frozenset({"claude_code", "codex_cli"}),
+    "branch": frozenset({"claude_code"}),
+    "session": frozenset({"claude_code", "codex_cli"}),
+    "project": frozenset({"claude_ai"}),
+    "model": frozenset({"claude_ai", "claude_code", "codex_cli", "chatgpt"}),
 }
 
 
@@ -337,11 +345,14 @@ def _validate_facets(source: str, facets: dict) -> None:
         if bad:
             raise ValueError(f"facet(s) {bad} do not apply to source='dream' "
                              f"(derived knowledge has no repo/project facets)")
-    elif source in ("claude_ai", "claude_code"):
-        bad = [k for k, v in facets.items() if v and FACET_SOURCES[k] != source]
+    elif source in RAW_SOURCES:
+        # A single raw source: every set facet must be satisfiable BY that source.
+        bad = [k for k, v in facets.items() if v and source not in FACET_SOURCES[k]]
         if bad:
-            raise ValueError(f"facet(s) {bad} apply only to source="
-                             f"'{FACET_SOURCES[bad[0]]}', not source='{source}'")
+            raise ValueError(
+                f"facet(s) {bad} do not apply to source='{source}' — "
+                f"{bad[0]!r} is satisfied only by source(s) "
+                f"{sorted(FACET_SOURCES[bad[0]])}")
 
 
 def _facet_where(source, facets: dict, since, until, params: dict) -> str:
