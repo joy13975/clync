@@ -1110,6 +1110,21 @@ def distill(con, topic: dict, seeds: list[dict], notes: list | None = None
             add_probe_queries(con, topic["topic_id"], out["probe_queries_to_add"])
         found += out["insights"]
         reqs = out["read_requests"]
+        # A request whose to_idx precedes its from_idx is malformed model output —
+        # the JSON schema types both as int and cannot enforce their order. Drop it
+        # with a LOUD note, exactly as an unserved or over-cap request is dropped-and-
+        # reported below. A reversed range from the dreamer must never abort the whole
+        # run: it is one degraded nav request, the same class the branches below treat
+        # as noted-not-fatal. (render_windows keeps its own reversed-range raise as an
+        # internal invariant — a bad range reaching it now means a code error, not
+        # model output.)
+        malformed = [r for r in reqs if int(r["to_idx"]) < int(r["from_idx"])]
+        if malformed and notes is not None:
+            e = malformed[0]
+            notes.append(
+                f"{len(malformed)} read request(s) dropped: to_idx before from_idx "
+                f"— e.g. slot {e['slot']!r} {e['from_idx']}->{e['to_idx']}")
+        reqs = [r for r in reqs if int(r["to_idx"]) >= int(r["from_idx"])]
         if not reqs or round_no >= MAX_NAV_ROUNDS:
             # Requests arriving in the FINAL round cannot be served. Say so rather
             # than dropping them: it is the signal that MAX_NAV_ROUNDS is too low.

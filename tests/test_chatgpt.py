@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import chatgpt
 import clync
+import pytest
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +213,23 @@ def _pair(cid, update_time, user_text, answer, title=None, model="gpt-5-6-thinki
     meta = {"id": cid, "title": title or answer[:20],
             "create_time": update_time, "update_time": update_time}
     return (meta, detail)
+
+
+def test_read_chatgpt_cookies_accepts_chunked_session_token(monkeypatch):
+    """next-auth splits an oversized session token into <name>.0/.1 (each Chrome
+    cookie capped at ~4 KB); the whole login is present as chunks, not as the
+    bare cookie. read_chatgpt_cookies must treat the .0 chunk as proof of login,
+    not raise a false 'no login found'."""
+    base = chatgpt.SESSION_COOKIE
+    chunked = {f"{base}.0": "part0", f"{base}.1": "part1", "cf_clearance": "c"}
+    monkeypatch.setattr(clync, "_read_profile_cookies",
+                        lambda *a, **k: dict(chunked))
+    assert clync.read_chatgpt_cookies("prof") == chunked
+
+    monkeypatch.setattr(clync, "_read_profile_cookies",
+                        lambda *a, **k: {"cf_clearance": "c"})
+    with pytest.raises(RuntimeError, match="No ChatGPT login"):
+        clync.read_chatgpt_cookies("prof")
 
 
 def _wire_cgpt(monkeypatch, client):

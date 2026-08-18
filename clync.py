@@ -210,10 +210,15 @@ def read_chatgpt_cookies(profile_display_name: str) -> dict[str, str]:
     read_auth_cookies)."""
     cookies = _read_profile_cookies(profile_display_name, "%chatgpt.com%",
                                     names=None, tolerant=True)
-    if chatgpt_mod_session_cookie() not in cookies:
+    base = chatgpt_mod_session_cookie()
+    # next-auth splits an oversized session token into <name>.0, <name>.1, …
+    # (each Chrome cookie capped at ~4 KB) and the server reassembles the
+    # chunks; the browser sends every chunk, so all of them ride along here.
+    # Either the whole cookie or its first chunk is proof of login.
+    if base not in cookies and f"{base}.0" not in cookies:
         raise RuntimeError(
             f"No ChatGPT login found in the {profile_display_name!r} Chrome "
-            f"profile (no {chatgpt_mod_session_cookie()} cookie). Open "
+            f"profile (no {base} cookie). Open "
             f"https://chatgpt.com in that profile and LOG IN, then re-run."
         )
     return cookies

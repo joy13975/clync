@@ -349,6 +349,31 @@ def test_too_many_read_requests_are_capped_and_the_cap_is_reported(store, stub_w
     assert any(f"capped {dream.MAX_EXPANSIONS + 3} read requests" in n for n in notes)
 
 
+def test_reversed_read_request_is_dropped_and_reported_never_aborts(store, stub_worker):
+    """A read request with to_idx before from_idx is malformed model output. It is
+    dropped and reported like an unserved/capped request — it must NOT raise and abort
+    the whole run (the pre-fix behaviour: one reversed range from the dreamer killed
+    every remaining topic in the nightly dig)."""
+    _long_unit(store, hit_at=140)
+    first = _distill_one(ref="a#140", statement="Kept claim.")
+    # One malformed range (the exact shape that fired the alert: from_idx > to_idx)
+    # alongside one valid range. Only the malformed one is dropped; the valid one is
+    # still served, so a single reversed range degrades neither the round nor the run.
+    first["read_requests"] = [
+        {"slot": "a", "from_idx": 135, "to_idx": 34, "why": "reversed - malformed"},
+        {"slot": "a", "from_idx": 100, "to_idx": 120, "why": "the thread starts earlier"},
+    ]
+    second = _distill_one(ref="a#105", statement="second")
+    stub_worker += [first, second]
+
+    notes = []
+    got, refmap = dream.distill(store, dream.get_topic(store, "t1"),
+                                [{"unit_id": "long", "msg_idx": 140}], notes)
+    assert [c["statement"] for c in got] == ["Kept claim.", "second"]
+    assert "a#105" in refmap, "the valid range must still be served in round two"
+    assert any("to_idx before from_idx" in n for n in notes), notes
+
+
 def test_seeds_for_positions_a_pending_unit_by_retrieval(store):
     """`dream_pending` stores unit assignments; WHERE the topic lives in a unit is a
     retrieval fact computed at dig time. It must find the matching passage, not idx 0."""
