@@ -107,6 +107,12 @@ PROBE_QUERIES_MAX = 20
 # already holds): those are the only ones a restate/refine/contradict decision can
 # be about, so the cap costs discrimination nothing where it matters.
 FALSIFY_HELD_MAX = 40
+# The falsifier must return one verdict per candidate index, but `_FALSIFY_SCHEMA` cannot
+# express "the array covers indices 0..N-1", so a large batch occasionally comes back one
+# verdict short. When that happens falsify re-asks for only the missing indices this many
+# times before it fails loud — recovering the occasional dropped verdict without ever
+# promoting an unjudged candidate by default. See falsify().
+FALSIFY_REASK_MAX = 2
 # Rounds of requested expansion per dig: the loop runs `MAX_NAV_ROUNDS + 1` calls, so
 # N is how many asks can be SERVED. Was 1, and 1 bound on every real dig measured
 # (3/3, 2-3 requests unserved each, with substantive reasons — "a#3102 is cut off
@@ -458,18 +464,32 @@ def _run_worker(prompt: str, schema: dict, *, system: str,
         argv += ["--effort", effort]
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        raise DreamError(
+        # A non-zero exit yields raw CLI stderr, never the structured result JSON, so a
+        # substrate limit here can only be recognised by the marker fallback.
+        err = DreamError(
             f"claude CLI exited {proc.returncode}: {(proc.stderr or proc.stdout)[:2000]}")
+        _reraise_throttle(err)
+        raise err
     try:
         res = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise DreamError(f"claude CLI returned non-JSON: {proc.stdout[:2000]}") from e
     if res.get("is_error") or res.get("subtype") != "success":
-        raise DreamError(
-            f"worker call failed: subtype={res.get('subtype')!r} "
-            f"api_error_status={res.get('api_error_status')!r} "
-            f"terminal_reason={res.get('terminal_reason')!r} "
-            f"result={str(res.get('result'))[:1000]}")
+        detail = (f"subtype={res.get('subtype')!r} "
+                  f"api_error_status={res.get('api_error_status')!r} "
+                  f"terminal_reason={res.get('terminal_reason')!r} "
+                  f"result={str(res.get('result'))[:1000]}")
+        # Classify substrate limits HERE, at the boundary that owns the structured signal:
+        # the CLI's api_error_status IS the machine field, so a 429/529 is a resumable
+        # throttle, not a per-topic content defect. Downstream isolation keys on the
+        # DreamThrottled TYPE, never on re-scanning this free text (see _isolate_topic_failure).
+        if _throttle_status(res.get("api_error_status")):
+            raise DreamThrottled(f"worker call throttled (substrate limit): {detail}")
+        err = DreamError(f"worker call failed: {detail}")
+        if res.get("api_error_status") is None:
+            # No structured status reported -> the marker scan is the only signal left.
+            _reraise_throttle(err)
+        raise err
     out = res.get("structured_output")
     if not isinstance(out, dict):
         raise DreamError(
@@ -1381,24 +1401,54 @@ def falsify(con, topic: dict, candidates: list[dict], rejections: list | None = 
     held_text = "\n".join(
         f"  [h{i}] ({r['stance']}, held since {r['valid_from'].date().isoformat()}) "
         f"{r['statement']}" for i, r in enumerate(held)) or "  (none)"
-    listing = "\n\n".join(
-        f"[{i}] CLAIM: {c['statement']}\n    stance: {c['stance']}\n    quotes:\n"
-        + "\n".join(f"      - {e['quote'][:300]}" for e in c["evidence"])
-        for i, c in enumerate(candidates))
-    prompt = (f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n"
+    def _block(i):  # one candidate under its ORIGINAL index — reused by the re-ask below
+        c = candidates[i]
+        return (f"[{i}] CLAIM: {c['statement']}\n    stance: {c['stance']}\n    quotes:\n"
+                + "\n".join(f"      - {e['quote'][:300]}" for e in c["evidence"]))
+    listing = "\n\n".join(_block(i) for i in range(len(candidates)))
+    # Shared by the main pass AND the re-ask, so the topic framing + held-insight
+    # instruction stay identical between them (a reworded copy would silently diverge).
+    header = (f"TOPIC: {topic['name']}\nCHARTER: {topic['charter']}\n\n"
               f"ALREADY HELD (a candidate that merely restates one of these, adding no "
-              f"new evidence, must be rejected):\n{held_text}"
-              f"\n\n=====\n\nCANDIDATES ({len(candidates)})\n\n{listing}\n\n=====\n"
-              f"Return exactly one verdict per candidate index, each with its action "
-              f"and — for reinforce/refine/contradict — the [hN] label it targets.")
+              f"new evidence, must be rejected):\n{held_text}")
+    # The verdict-shape instruction is identical in the main pass and the re-ask;
+    # one copy keeps the action enum / [hN] convention from silently diverging
+    # between the two prompts (same reason `header` is shared).
+    verdict_instr = ("each with its action and — for reinforce/refine/contradict — "
+                     "the [hN] label it targets")
+    prompt = (f"{header}\n\n=====\n\nCANDIDATES ({len(candidates)})\n\n{listing}\n\n=====\n"
+              f"Return exactly one verdict per candidate index, {verdict_instr}.")
     out = _call(con, "falsify", {"topic_id": topic["topic_id"], "n": len(candidates)},
                 topic["topic_id"], prompt, _FALSIFY_SCHEMA, system=_FALSIFY_SYSTEM)
-
     by_index = {v["index"]: v for v in out["verdicts"]}
-    missing = set(range(len(candidates))) - set(by_index)
+
+    # A missing verdict is a transient defect of the external model (the schema cannot
+    # enforce completeness — see FALSIFY_REASK_MAX), not corrupt state. Re-ask for ONLY the
+    # gap, reusing the identical held context so the [hN] targets stay valid and showing each
+    # candidate under its ORIGINAL index so the merge is unambiguous. These extra calls are
+    # rare and bounded, so they are deliberately NOT charged against the per-dig budget
+    # reservation — gating them would reintroduce the very whole-run abort this repair removes.
+    for _ in range(FALSIFY_REASK_MAX):
+        missing = sorted(set(range(len(candidates))) - by_index.keys())
+        if not missing:
+            break
+        reask = (f"{header}\n\n=====\n\n"
+                 f"Your previous response omitted a verdict for candidate index(es) "
+                 f"{missing}. Return exactly one verdict per index listed below, "
+                 f"{verdict_instr}. Keep the SAME index numbers shown in brackets.\n\n"
+                 + "\n\n".join(_block(i) for i in missing) + "\n\n=====")
+        more = _call(con, "falsify-reask",
+                     {"topic_id": topic["topic_id"], "missing": missing},
+                     topic["topic_id"], reask, _FALSIFY_SCHEMA, system=_FALSIFY_SYSTEM)
+        for v in more["verdicts"]:
+            if v["index"] in missing and v["index"] not in by_index:
+                by_index[v["index"]] = v
+
+    missing = sorted(set(range(len(candidates))) - by_index.keys())
     if missing:
-        raise DreamError(f"falsify skipped candidate index(es) {sorted(missing)} — "
-                         f"an unjudged candidate must never be promoted by default")
+        raise DreamError(f"falsify skipped candidate index(es) {missing} — an unjudged "
+                         f"candidate must never be promoted by default (unrecovered after "
+                         f"{FALSIFY_REASK_MAX} re-ask(s))")
     survivors = []
     for i, c in enumerate(candidates):
         v = by_index[i]
@@ -2132,13 +2182,55 @@ class DreamThrottled(DreamError):
     NOT retry in a loop or return partial results as if complete."""
 
 
-_THROTTLE_MARKERS = ("rate limit", "usage limit", "rate_limit", "429",
-                     "too many requests", "exceeded your")
+# FALLBACK classifier only. The PRIMARY throttle signal is the CLI's structured
+# api_error_status, read in _run_worker via _throttle_status. These free-text markers are
+# scanned SOLELY where no structured status exists -- a non-zero CLI exit carrying raw
+# stderr, or an error the CLI reported without a status field. "529"/"overloaded" are listed
+# so that status-less fallback still recognises an overload; the primary path already covers
+# 429/529 structurally, so this list is never the load-bearing run-continuation classifier.
+_THROTTLE_MARKERS = ("rate limit", "usage limit", "rate_limit", "429", "529",
+                     "too many requests", "exceeded your", "overloaded")
+
+
+def _throttle_status(status: object) -> bool:
+    """PRIMARY throttle classifier: True iff the CLI's structured HTTP status marks a
+    substrate rate-limit (429) or overload (529). Read from the machine field, never from
+    free text -- this is what _run_worker uses to raise DreamThrottled AT THE PRODUCER, so
+    no downstream consumer has to scan an error message to decide isolate-vs-stop."""
+    try:
+        return int(status) in (429, 529)
+    except (TypeError, ValueError):
+        return False
 
 
 def _reraise_throttle(e: Exception) -> None:
+    """FALLBACK only (see _THROTTLE_MARKERS): re-raise as DreamThrottled when a status-less
+    error's text matches a marker. _run_worker calls this for the no-structured-status paths;
+    it is deliberately NOT used as a run-continuation classifier by any consumer."""
     if any(m in str(e).lower() for m in _THROTTLE_MARKERS):
         raise DreamThrottled(str(e)) from e
+
+
+def _isolate_topic_failure(con, report: dict, topic_id: str, e: DreamError) -> None:
+    """Route a per-topic dig failure so ONE topic's defect never aborts the whole pass.
+    SSOT for the isolation both run_incremental and run_backfill apply.
+
+    A throttle is the resumable substrate limit, not a topic defect. It is classified at the
+    PRODUCER (_run_worker raises DreamThrottled from the CLI's structured api_error_status, or
+    the marker fallback when the CLI reports no status), so isolation keys on the exception
+    TYPE here — never on re-scanning free error text, whose incompleteness would otherwise
+    misroute a 529/overload into rollback-and-continue. A DreamThrottled propagates out and
+    stops the run (state lives in dream_queue; the next invocation continues). EVERYTHING ELSE
+    is one degraded topic — e.g. the model returns output even a bounded falsify re-ask can't
+    repair — so roll back the crashed call's half-written transaction (mirrors "a crashed call
+    leaves no phantom attempt") and record it LOUDLY in failed_topics. The topic's queue is
+    left pending for retry, the other topics still complete and persist, and the CLI surfaces
+    failed_topics as notify("fail") + a non-zero exit — an isolated failure is never a silent
+    "ok"."""
+    if isinstance(e, DreamThrottled):
+        raise e
+    con.rollback()
+    report["failed_topics"].append({"topic_id": topic_id, "error": str(e)[:2000]})
 
 
 class _Budget:
@@ -2146,10 +2238,14 @@ class _Budget:
     coherent boundary — never half-way through a topic's gate chain.
 
     `take(n)` RESERVES n calls, because a dig must not begin unless its whole gate
-    chain fits. A reservation is an upper bound, not a spend: a dig uses 2 of its 3
-    unless the dreamer asks to read further passages. So `reserved` governs the cap
-    while the reported call count comes from `dream_queue` — the audit log of calls
-    actually made. Reporting reservations as spend would overstate cost."""
+    chain fits. A reservation is USUALLY an upper bound, not a spend: a dig uses 2
+    of its 3 unless the dreamer asks to read further passages. The ONE deliberate
+    exception is falsify's verdict-gap re-asks — up to FALSIFY_REASK_MAX extra calls
+    that are intentionally NOT charged against the reservation (see falsify), so a
+    reask-triggering dig can make more calls than it reserved. `reserved` therefore
+    governs the cap while the reported call count comes from `dream_queue` — the
+    audit log of calls actually made, which is what surfaces that overspend rather
+    than hiding it. Reporting reservations as spend would overstate cost."""
 
     def __init__(self, max_calls: int | None):
         self.max_calls, self.reserved = max_calls, 0
@@ -2296,7 +2392,7 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
     t0 = _now()
     report: dict = {"mode": "incremental", "changed": 0, "skipped_empty": [],
                     "topics_touched": [], "queued": 0, "digs": {},
-                    "calls": 0, "deferred": [],
+                    "calls": 0, "deferred": [], "failed_topics": [],
                     "questions_fed": report_queries["fed"],
                     "topic_candidates": report_queries["topic_candidates"],
                     "stopped_early": None}
@@ -2345,7 +2441,11 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
             # never rendered from idx 0, which is the bug this whole path exists to
             # remove, and never dropped.
             seeds, unpositioned = seeds_for(con, t, batch)
-            rep = dig(con, t, seeds)
+            try:
+                rep = dig(con, t, seeds)
+            except DreamError as e:
+                _isolate_topic_failure(con, report, tid, e)   # one topic fails, run continues
+                continue
             if unpositioned:
                 rep["notes"].append(
                     f"{len(unpositioned)} unit(s) not in the search index, left "
@@ -2356,10 +2456,10 @@ def run_incremental(con, max_calls: int | None = None) -> dict:
             # the watermark has already moved past them.
             _clear_pending(con, tid, [s["unit_id"] for s in seeds])
 
-    except Exception as e:
-        _reraise_throttle(e)
-        raise
     finally:
+        # A DreamThrottled (producer-classified) propagates out to stop the run; the
+        # finally still records the calls this run spent. No consumer-side re-classification
+        # of error text lives here — throttle detection is owned by _run_worker.
         report["calls"] = _calls_made(con) - calls_before
 
     # Deferred work must be VISIBLE in the report, or a cheap night is
@@ -2398,27 +2498,32 @@ def run_backfill(con, topic_id: str | None = None, max_calls: int = 30) -> dict:
     calls_before = _calls_made(con)
     reconcile_evidence(con)          # same boundary duty as run_incremental's
     report: dict = {"mode": "backfill", "digs": {}, "calls": 0,
-                    "stopped_early": None}
+                    "stopped_early": None, "failed_topics": []}
     targets = [get_topic(con, topic_id)] if topic_id else topics(con)
     try:
         for t in targets:
             rounds = []
-            while True:
-                if not budget.take(3):
-                    report["stopped_early"] = "max-calls reached"
-                    break
-                batch = candidates(con, t, limit=DIG_BATCH_UNITS)
-                if not batch:
-                    break               # this topic's candidate pool is exhausted
-                rounds.append(dig(con, t, batch))
+            try:
+                while True:
+                    if not budget.take(3):
+                        report["stopped_early"] = "max-calls reached"
+                        break
+                    batch = candidates(con, t, limit=DIG_BATCH_UNITS)
+                    if not batch:
+                        break               # this topic's candidate pool is exhausted
+                    rounds.append(dig(con, t, batch))
+            except DreamError as e:
+                # Keep the rounds this topic already persisted, then isolate: one topic's
+                # failure moves to the next target instead of aborting the whole backfill.
+                _isolate_topic_failure(con, report, t["topic_id"], e)
             if rounds:
                 report["digs"][t["topic_id"]] = rounds
             if report["stopped_early"]:
                 break
-    except Exception as e:
-        _reraise_throttle(e)
-        raise
     finally:
+        # A DreamThrottled (producer-classified) propagates out to stop the run; the
+        # finally still records the calls this run spent. Throttle detection is owned by
+        # _run_worker, so no error-text re-classification happens here.
         report["calls"] = _calls_made(con) - calls_before
     _index_written(con, report)
     return report

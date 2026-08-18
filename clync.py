@@ -1310,6 +1310,18 @@ def cmd_scheduled(args) -> int:
         raise
     finally:
         con.close()
+    # A topic whose dig failed is isolated inside run_incremental so the other topics still
+    # complete and persist — but an isolated failure is still a failure: surface it loudly
+    # (notify + non-zero exit) rather than letting it hide behind an "ok" line.
+    failed = report.get("failed_topics") or []
+    if failed:
+        summary = "; ".join(f"{f['topic_id']}: {f['error'][:150]}" for f in failed)
+        notify("fail", f"clync dream: {len(failed)} topic(s) failed",
+               f"other topics completed; these did not: {summary}")
+        print(f"[scheduled] dream ran (calls={report['calls']} "
+              f"changed={report['changed']} topics={report['topics_touched']}) but "
+              f"{len(failed)} topic(s) FAILED: {summary}", file=sys.stderr)
+        return 1
     print(f"[scheduled] ok; dream calls={report['calls']} "
           f"changed={report['changed']} topics={report['topics_touched']}")
     return 0
@@ -1381,7 +1393,9 @@ def cmd_dream_run(args) -> int:
     finally:
         con.close()
     _print_dream_report(report)
-    return 0
+    # An isolated topic failure is still a failure: exit non-zero so a caller (or the
+    # operator watching $?) sees it, not just the printed "! FAILED" line.
+    return 1 if report.get("failed_topics") else 0
 
 
 def cmd_dream_backfill(args) -> int:
@@ -1394,7 +1408,7 @@ def cmd_dream_backfill(args) -> int:
     finally:
         con.close()
     _print_dream_report(report)
-    return 0
+    return 1 if report.get("failed_topics") else 0
 
 
 def _print_dream_report(report: dict) -> None:
@@ -1440,6 +1454,10 @@ def _print_dream_report(report: dict) -> None:
     print(f"calls       : {report['calls']}")
     if report.get("stopped_early"):
         print(f"stopped_early: {report['stopped_early']}")
+    # An isolated topic failure (run_incremental kept the other topics going) must be
+    # visible here too, or a manual run hides it behind an otherwise-clean report.
+    for f in report.get("failed_topics", []):
+        print(f"  ! FAILED[{f['topic_id']}] {f['error']}")
     # A night that digs nothing is normal (topics batch up across nights) — but it
     # must SAY what is waiting, so "cheap" is never mistaken for "stuck".
     for d in report.get("deferred", []):

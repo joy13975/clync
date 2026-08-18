@@ -559,11 +559,62 @@ def test_failed_call_is_recorded_then_reraised(store, monkeypatch):
     assert row["state"] == "failed" and "kaboom" in row["error"]
 
 
-def test_throttling_is_distinguishable_from_other_failures():
-    for msg in ("hit the rate limit", "usage limit reached", "429 Too Many Requests"):
+def test_throttle_marker_fallback_recognises_status_less_limits():
+    """The marker scan is the FALLBACK for status-less errors (a non-zero CLI exit's raw
+    stderr). It must still catch a 429 rate-limit AND a 529 overload phrased in free text,
+    and leave a genuine content error alone."""
+    for msg in ("hit the rate limit", "usage limit reached", "429 Too Many Requests",
+                "529 overloaded_error", "the model is overloaded"):
         with pytest.raises(dream.DreamThrottled):
             dream._reraise_throttle(dream.DreamError(msg))
     assert dream._reraise_throttle(dream.DreamError("syntax error")) is None
+
+
+@pytest.mark.parametrize("status", [429, 529, "429", "529"])
+def test_worker_classifies_substrate_limit_as_throttle(monkeypatch, status):
+    """PRODUCER-side classification at the boundary that owns the CLI's structured signal:
+    a 429 rate-limit or 529 overload comes back as an is_error result with api_error_status
+    set, and _run_worker raises DreamThrottled — never a plain DreamError that a downstream
+    text-scan could misroute into per-topic isolation (the whole point of the class fix)."""
+    body = json.dumps({"is_error": True, "subtype": "error_during_execution",
+                       "api_error_status": status, "result": "overloaded_error"})
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _proc(body))
+    with pytest.raises(dream.DreamThrottled):
+        dream._run_worker("p", {}, system="s")
+
+
+def test_worker_non_limit_status_stays_a_content_failure(monkeypatch):
+    """A NON-limit HTTP status is a genuine failure, not a resumable throttle: it stays a
+    plain DreamError so isolation records it as a topic defect rather than silently treating
+    it as the substrate backing off."""
+    body = json.dumps({"is_error": True, "subtype": "error_during_execution",
+                       "api_error_status": 400, "result": "bad request"})
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _proc(body))
+    with pytest.raises(dream.DreamError) as ei:
+        dream._run_worker("p", {}, system="s")
+    assert not isinstance(ei.value, dream.DreamThrottled)
+
+
+def test_isolate_topic_failure_stops_on_throttle_type_not_text(store):
+    """Isolation decides stop-vs-continue by the exception TYPE, never by scanning the
+    message: a DreamThrottled whose text carries NO substring marker at all (the 529/overload
+    the old denylist missed) still propagates out to stop the run, and is never recorded as a
+    per-topic content defect."""
+    marker_free = "the backing service pushed back"   # matches NO substring in _THROTTLE_MARKERS
+    assert not any(m in marker_free for m in dream._THROTTLE_MARKERS)
+    report = {"failed_topics": []}
+    with pytest.raises(dream.DreamThrottled):
+        dream._isolate_topic_failure(store, report, "t1",
+                                     dream.DreamThrottled(marker_free))
+    assert report["failed_topics"] == []
+
+
+def test_isolate_topic_failure_records_a_content_defect(store):
+    """A non-throttle DreamError is the one-degraded-topic case: rolled back and recorded in
+    failed_topics so the run continues — never re-raised."""
+    report = {"failed_topics": []}
+    dream._isolate_topic_failure(store, report, "t1", dream.DreamError("bad output"))
+    assert [f["topic_id"] for f in report["failed_topics"]] == ["t1"]
 
 
 # --------------------------------------------------------------------------- #
@@ -697,13 +748,39 @@ def test_with_nothing_held_the_action_is_forced_to_new(store, stub_worker):
 
 
 def test_falsify_fails_loud_if_a_candidate_went_unjudged(store, stub_worker):
+    """A gap that survives the re-ask loop (FALSIFY_REASK_MAX re-asks, each still
+    omitting the same index) must still fail loud — the re-ask recovers a
+    TRANSIENT drop, it must never turn into a silent default promotion for a
+    PERSISTENT one."""
+    cands = [{**_candidate(), "_evidence": []}, {**_candidate(statement="B"),
+                                                 "_evidence": []}]
+    incomplete = {"verdicts": [
+        {"index": 0, "verdict": "upheld", "corrected_stance": "user_asserted",
+         "action": "new", "target": "", "reason": "ok"}]}   # index 1 always missing
+    stub_worker.append(incomplete)
+    for _ in range(dream.FALSIFY_REASK_MAX):
+        stub_worker.append(incomplete)
+    with pytest.raises(dream.DreamError, match="unrecovered after"):
+        dream.falsify(store, dream.get_topic(store, "t1"), cands)
+
+
+def test_falsify_recovers_a_dropped_verdict_via_reask(store, stub_worker):
+    """A missing verdict is a transient defect of the external model, not corrupt
+    state: falsify re-asks for ONLY the gap and merges the recovered verdict in —
+    the candidate is judged, never silently promoted NOR permanently lost."""
     cands = [{**_candidate(), "_evidence": []}, {**_candidate(statement="B"),
                                                  "_evidence": []}]
     stub_worker.append({"verdicts": [
         {"index": 0, "verdict": "upheld", "corrected_stance": "user_asserted",
-         "reason": "ok"}]})
-    with pytest.raises(dream.DreamError, match="skipped candidate index"):
-        dream.falsify(store, dream.get_topic(store, "t1"), cands)
+         "action": "new", "target": "", "reason": "ok"}]})           # index 1 missing
+    stub_worker.append({"verdicts": [
+        {"index": 1, "verdict": "contested", "corrected_stance": "co_derived",
+         "action": "new", "target": "", "reason": "recovered on re-ask"}]})
+    out = dream.falsify(store, dream.get_topic(store, "t1"), cands)
+    assert len(out) == 2
+    assert {c["statement"] for c in out} == {"Fix bugs at the layer that should have prevented them.", "B"}
+    by_statement = {c["statement"]: c for c in out}
+    assert by_statement["B"]["verdict"] == "contested"
 
 
 # --------------------------------------------------------------------------- #
@@ -1270,6 +1347,149 @@ def test_a_run_that_wrote_nothing_does_not_index(store, pg_test_db, mock_embed):
     assert "indexed" not in report
 
 
+def test_run_incremental_isolates_a_failing_topic(store, stub_worker, pg_test_db,
+                                                   mock_embed):
+    """A non-throttle DreamError from one topic's dig — here, falsify's verdict gap
+    surviving all its re-asks — must not abort a night that has a SIBLING topic
+    ripe in the same run: the failure is isolated into `failed_topics`, the other
+    topic's write still lands, and `run_incremental` itself does not raise."""
+    store.execute(
+        "INSERT INTO dream_topics (topic_id,name,charter,probe_queries,status,"
+        "created_at) VALUES ('t2','Topic Two','Charter text.',%s,'active',now())",
+        (clync._json(["root cause"]),))
+    store.commit()
+    t1_ids = ["u1"] + _add_units(store, 2, start=2)     # u1,u2,u3 -> t1 (>= DIG_MIN_UNITS)
+    t2_ids = _add_units(store, 3, start=20)             # u20,u21,u22 -> t2
+
+    clync.set_meta(store, dream.WATERMARK_KEY, "2020-01-01T00:00:00+00:00")
+    store.commit()
+
+    incomplete = {"verdicts": []}   # candidate index 0 never shows up, even on re-ask
+    stub_worker.append({"assignments":
+        [{"unit_id": u, "topic_ids": ["t1"], "reason": "r"} for u in t1_ids] +
+        [{"unit_id": u, "topic_ids": ["t2"], "reason": "r"} for u in t2_ids]})
+    # `_ripe_topics`' iteration order between t1/t2 is not a contract this test
+    # pins down — whichever topic the dig loop reaches FIRST gets this SUCCESS
+    # script (distill + a complete falsify verdict); the other gets the
+    # PERSISTENT-GAP script (distill + falsify + its two exhausted re-asks). The
+    # assertions below only check the SHAPE of the outcome, not which topic_id
+    # played which role.
+    stub_worker += [_distill_one(), _UPHELD]
+    stub_worker += [_distill_one(statement="doomed"), incomplete, incomplete, incomplete]
+
+    r = dream.run_incremental(store)
+
+    assert len(r["failed_topics"]) == 1
+    failed = r["failed_topics"][0]
+    assert failed["topic_id"] in ("t1", "t2")
+    assert "unrecovered after" in failed["error"]
+    succeeded = "t2" if failed["topic_id"] == "t1" else "t1"
+    assert set(r["digs"]) == {succeeded}
+    assert r["digs"][succeeded]["written"] == {"new": 1, "reinforce": 0, "refine": 0,
+                                               "contradict": 0, "out_of_order": 0,
+                                               "duplicate_target": 0}
+    # the failed topic's backlog stays pending for retry — never silently cleared
+    assert store.execute("SELECT count(*) n FROM dream_pending WHERE topic_id=%s",
+                         (failed["topic_id"],)).fetchone()["n"] == 3
+    assert not stub_worker, f"{len(stub_worker)} stub output(s) went unused"
+
+
+def test_run_backfill_keeps_persisted_rounds_when_a_later_round_fails(
+        store, stub_worker, pg_test_db, mock_embed, monkeypatch):
+    """The backfill isolation variant (dream._isolate_topic_failure applied in
+    run_backfill): a topic that PERSISTED an early round and then hit a
+    non-throttle DreamError on a later round must keep the persisted round in
+    `digs` AND surface in `failed_topics` — a partial success is neither silently
+    dropped nor promoted to a clean run. Mirrors the run_incremental test.
+
+    `candidates` (real retrieval) is stubbed to hand out one citable batch per
+    round then dry up — this test pins the ISOLATION contract, not the retrieval
+    ranking, so the two rounds are made deterministic instead of depending on the
+    embedder's scoring."""
+    store.execute("INSERT INTO units (unit_id,kind,source,title,updated_at,msg_count,"
+                  "synced_at) VALUES ('u2','cc_session','claude_code','s2',now(),1,now())")
+    store.execute("INSERT INTO messages (unit_id,msg_id,idx,sender,text,created_at) "
+                  "VALUES ('u2','m1',0,'user',%s,'2026-01-01')",
+                  ("Fix bugs at the layer that should have prevented them.",))
+    store.commit()
+    batches = iter([[{"unit_id": "u1", "msg_idx": 0, "score": 1.0}],   # round 1: persists
+                    [{"unit_id": "u2", "msg_idx": 0, "score": 1.0}]])  # round 2: fails
+    monkeypatch.setattr(dream, "candidates", lambda con, t, **k: next(batches, []))
+
+    incomplete = {"verdicts": []}   # candidate index 0 never appears, even on re-ask
+    # Round 1: a clean dig that persists one insight.
+    stub_worker += [_distill_one(), _UPHELD]
+    # Round 2: distill returns a candidate whose verdict never arrives — the same
+    # persistent-gap failure the incremental test uses — exhausting every re-ask.
+    stub_worker += [_distill_one(statement="doomed")] + [incomplete] * (
+        dream.FALSIFY_REASK_MAX + 1)
+
+    r = dream.run_backfill(store, topic_id="t1", max_calls=30)
+
+    assert len(r["failed_topics"]) == 1
+    assert r["failed_topics"][0]["topic_id"] == "t1"
+    assert "unrecovered after" in r["failed_topics"][0]["error"]
+    # the partially-succeeded topic keeps its persisted round(s) in digs...
+    assert "t1" in r["digs"] and len(r["digs"]["t1"]) == 1
+    assert r["digs"]["t1"][0]["written"]["new"] == 1
+    # ...so the same topic_id appears in BOTH digs and failed_topics.
+    assert "t1" in set(r["digs"]) & {f["topic_id"] for f in r["failed_topics"]}
+    # round 1's persisted insight survived the failed round's rollback
+    assert store.execute("SELECT count(*) n FROM dream_insights WHERE topic_id='t1'"
+                         ).fetchone()["n"] == 1
+    assert not stub_worker, f"{len(stub_worker)} stub output(s) went unused"
+
+
+def test_cmd_dream_run_and_backfill_exit_nonzero_on_isolated_failure(monkeypatch):
+    """The CLI's loud-isolation promise at the command layer: an isolated topic
+    failure leaves a NON-ZERO exit (so `$?` and the launchd job see it), and a
+    clean run exits 0. Pins the failed_topics -> exit-code mapping for both dream
+    entry points, which no test asserted before."""
+    import types
+    monkeypatch.setattr(clync, "ensure_cluster", lambda: None)
+    monkeypatch.setattr(clync, "connect",
+                        lambda: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(clync, "_print_dream_report", lambda report: None)
+    failed = {"failed_topics": [{"topic_id": "t1", "error": "boom"}]}
+    clean = {"failed_topics": []}
+
+    monkeypatch.setattr(dream, "run_incremental", lambda con, max_calls=None: failed)
+    assert clync.cmd_dream_run(types.SimpleNamespace(max_calls=None)) == 1
+    monkeypatch.setattr(dream, "run_incremental", lambda con, max_calls=None: clean)
+    assert clync.cmd_dream_run(types.SimpleNamespace(max_calls=None)) == 0
+
+    monkeypatch.setattr(dream, "run_backfill",
+                        lambda con, topic_id=None, max_calls=30: failed)
+    assert clync.cmd_dream_backfill(
+        types.SimpleNamespace(topic=None, max_calls=30)) == 1
+    monkeypatch.setattr(dream, "run_backfill",
+                        lambda con, topic_id=None, max_calls=30: clean)
+    assert clync.cmd_dream_backfill(
+        types.SimpleNamespace(topic=None, max_calls=30)) == 0
+
+
+def test_cmd_scheduled_notifies_loud_and_exits_on_isolated_failure(monkeypatch):
+    """cmd_scheduled is the launchd entry point: an isolated topic failure must fire
+    a LOUD notify('fail') AND return non-zero — never hide behind the '[scheduled]
+    ok' line. This is the user-visible half of the isolation promise."""
+    import types
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(clync, "notify",
+                        lambda level, title, msg: calls.append((level, title, msg)))
+    monkeypatch.setattr(clync, "ensure_cluster", lambda: None)
+    monkeypatch.setattr(clync, "connect",
+                        lambda: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(clync, "get_meta", lambda con, k: None)   # no prior run
+    monkeypatch.setattr(clync, "_sync_all", lambda *a, **k: None)  # sync clean
+    report = {"failed_topics": [{"topic_id": "t1", "error": "boom"}],
+              "calls": 2, "changed": 1, "topics_touched": ["t1"]}
+    monkeypatch.setattr(dream, "run_incremental", lambda con: report)
+
+    rc = clync.cmd_scheduled(types.SimpleNamespace(profile="p", org=None))
+    assert rc == 1
+    assert any(level == "fail" for level, _, _ in calls), calls
+
+
 # --------------------------------------------------------------------------- #
 # Progress derives from the ATTEMPT, never from surviving gate output
 # --------------------------------------------------------------------------- #
@@ -1316,7 +1536,11 @@ def test_a_throttled_call_leaves_no_phantom_attempt(store, stub_worker,
     documented resumable failure — permanently excluded its whole batch from
     backfill without a single message ever having been distilled, while
     coverage showed the topic freshly dug with no gap."""
-    stub_worker.append(RuntimeError("upstream says: rate limit exceeded"))
+    # The producer (_run_worker) owns throttle classification and raises DreamThrottled;
+    # the stub stands in for it, so it raises that TYPE directly rather than a raw error
+    # that some downstream text-scan would have to reclassify.
+    stub_worker.append(dream.DreamThrottled(
+        "worker call throttled (substrate limit): api_error_status=429"))
     with pytest.raises(dream.DreamThrottled):
         dream.run_backfill(store, topic_id="t1", max_calls=30)
     assert _attempted_ranges(store, "t1") == {}, "attempt recorded for a call that never ran"
