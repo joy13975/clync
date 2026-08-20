@@ -158,13 +158,19 @@ def _read_profile_cookies(profile_display_name: str, host_like: str,
     if not cookies_db.exists():
         raise RuntimeError(f"No Cookies DB at {cookies_db}")
     key = _safe_storage_key()
+    # CAST(... AS BLOB) is load-bearing: some profiles store encrypted_value with
+    # TEXT storage class, and sqlite3's default text_factory then tries to UTF-8
+    # decode the ciphertext and raises OperationalError before we ever decrypt it
+    # (observed: the 'AWS Work' profile -> "Could not decode to UTF-8 column
+    # 'encrypted_value'"). The CAST keeps `name` a str while forcing bytes here.
     if names:
         placeholders = ",".join("?" * len(names))
-        sql = ("SELECT name, encrypted_value FROM cookies "
+        sql = ("SELECT name, CAST(encrypted_value AS BLOB) FROM cookies "
                f"WHERE host_key LIKE ? AND name IN ({placeholders})")
         params: tuple = (host_like, *names)
     else:
-        sql = "SELECT name, encrypted_value FROM cookies WHERE host_key LIKE ?"
+        sql = ("SELECT name, CAST(encrypted_value AS BLOB) FROM cookies "
+               "WHERE host_key LIKE ?")
         params = (host_like,)
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "Cookies"  # copy to dodge Chrome's live lock

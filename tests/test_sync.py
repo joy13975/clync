@@ -178,3 +178,34 @@ def test_sync_scrubs_nul_bytes_everywhere(pg_test_db, monkeypatch):
         assert m["raw"]["attachments"][0]["extracted_content"] == "headtail"
     finally:
         con.close()
+
+
+def test_read_profile_cookies_reads_ciphertext_stored_as_text(tmp_path, monkeypatch):
+    """Some Chrome profiles store encrypted_value with TEXT storage class, and
+    sqlite3's default text_factory then tries to UTF-8 decode the ciphertext and
+    raises OperationalError before decryption is ever attempted (observed on the
+    'AWS Work' profile). The read must hand the raw bytes to the decryptor."""
+    import sqlite3
+
+    cipher = b"v10" + bytes(range(0x80, 0xC0))       # not valid UTF-8
+    db = tmp_path / "Cookies"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE cookies (host_key text, name text, "
+                "encrypted_value blob)")
+    con.execute("INSERT INTO cookies VALUES ('.chatgpt.com', 'tok', "
+                "CAST(? AS text))", (cipher,))     # TEXT storage class, raw bytes
+    con.commit()
+    con.close()
+
+    monkeypatch.setattr(clync, "resolve_profile_dir", lambda p: tmp_path)
+    monkeypatch.setattr(clync, "_safe_storage_key", lambda: b"k" * 16)
+    seen: list[bytes] = []
+
+    def _fake_decrypt(val, key):
+        seen.append(val)
+        return "plaintext"
+
+    monkeypatch.setattr(clync, "_decrypt_cookie", _fake_decrypt)
+
+    assert clync._read_profile_cookies("prof", "%chatgpt.com%") == {"tok": "plaintext"}
+    assert seen == [cipher]                          # bytes, not a decode attempt
