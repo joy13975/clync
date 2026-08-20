@@ -232,6 +232,63 @@ def test_read_chatgpt_cookies_accepts_chunked_session_token(monkeypatch):
         clync.read_chatgpt_cookies("prof")
 
 
+class _FakeResp:
+    def __init__(self, status_code, text='{"items": []}'):
+        self.status_code = status_code
+        self.text = text
+        self.headers = {}
+
+    def json(self):
+        import json
+        return json.loads(self.text)
+
+
+class _ScriptedSession:
+    """Serves a scripted list of responses to ChatGPTClient._request."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+        self.cookies = type("_C", (), {"set": lambda *a, **k: None})()
+
+    def get(self, url, **kw):
+        self.calls += 1
+        return self._responses.pop(0) if self._responses else _FakeResp(200)
+
+
+def _scripted_client(monkeypatch, responses):
+    import time
+    monkeypatch.setattr(time, "sleep", lambda s: None)   # no real backoff waits
+    c = chatgpt.ChatGPTClient({}, "prof")
+    c._s = _ScriptedSession(responses)
+    return c
+
+
+_JWKS_503 = '{"detail":"Unable to fetch authentication verification keys."}'
+
+
+def test_request_retries_a_backend_5xx_then_succeeds(monkeypatch):
+    """A transient ChatGPT 503 (observed: OpenAI's backend failing to fetch its
+    own JWKS to verify a perfectly valid Bearer JWT) must NOT abort the sync —
+    it used to kill the whole leg on the first conversations page."""
+    c = _scripted_client(monkeypatch, [_FakeResp(503, _JWKS_503),
+                                       _FakeResp(502, "bad gateway"),
+                                       _FakeResp(200, '{"items": [], "total": 0}')])
+    assert c._request("https://x/backend-api/conversations", bearer="t").json() == {
+        "items": [], "total": 0}
+    assert c._s.calls == 3
+
+
+def test_request_raises_loudly_on_a_persistent_5xx(monkeypatch):
+    """Exhausted retries still fail loud — and name OpenAI's side, not the login,
+    so the user does not go re-authenticate a session that is fine."""
+    c = _scripted_client(monkeypatch,
+                         [_FakeResp(503, _JWKS_503)] * chatgpt._MAX_ATTEMPTS)
+    with pytest.raises(RuntimeError, match="fault on OpenAI's side"):
+        c._request("https://x/backend-api/conversations", bearer="t")
+    assert c._s.calls == chatgpt._MAX_ATTEMPTS
+
+
 def _wire_cgpt(monkeypatch, client):
     monkeypatch.setattr(clync, "read_chatgpt_cookies",
                         lambda profile: {chatgpt.SESSION_COOKIE: "x"})

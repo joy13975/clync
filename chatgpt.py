@@ -40,7 +40,14 @@ IMPERSONATE = "chrome"
 # sitting inside one throttle window (~8 attempts, backoff capped at 30s => it
 # keeps retrying for ~3 min, comfortably longer than the refill interval).
 REQUEST_PACING_S = 1.0          # steady inter-request gap (uses the burst, paces the rest)
-_MAX_ATTEMPTS = 8               # request retries for a 403 (Cloudflare) / 429 (rate limit)
+_MAX_ATTEMPTS = 8               # request retries for every _RETRY_STATUS code below
+# Statuses that are external transients, not a verdict about our request: 403
+# (Cloudflare JS challenge), 429 (rate limit), and 5xx from ChatGPT's own backend.
+# The 5xx entries are load-bearing: a single 503 {"detail":"Unable to fetch
+# authentication verification keys."} — OpenAI's backend failing to fetch its own
+# JWKS to verify our (valid) Bearer JWT — used to abort the whole ChatGPT leg on
+# the FIRST list page, losing a day of history for a fault entirely on their side.
+_RETRY_STATUS = (403, 429, 500, 502, 503, 504)
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 _LIST_PAGE = 100                # conversations per list page (max the API honours)
@@ -98,11 +105,12 @@ class ChatGPTClient:
         self._last_request = 0.0
 
     def _request(self, url: str, *, bearer: str | None):
-        # Retries a Cloudflare 403 (JS-challenge under load) AND a 429 (ChatGPT
-        # rate limit — real on a full ~hundreds-of-conversation backfill) with
-        # backoff, honouring a Retry-After header when the server sends one. A
-        # persistent 403 is a real auth/clearance failure; a persistent 429 means
-        # the rate limit outlasted the backoff — both raise loudly (the caller's
+        # Retries every _RETRY_STATUS code — Cloudflare 403 (JS-challenge under
+        # load), 429 (ChatGPT rate limit — real on a full ~hundreds-of-conversation
+        # backfill), and ChatGPT's own 5xx — with backoff, honouring a Retry-After
+        # header when the server sends one. Persistent means: a real auth/clearance
+        # failure (403), a rate limit that outlasted the backoff (429), or a
+        # server-side outage (5xx) — all raise loudly (the caller's
         # per-conversation commit makes an incremental re-run resume cleanly).
         import time
         backoff = 4.0
@@ -117,7 +125,7 @@ class ChatGPTClient:
             self._last_request = time.monotonic()
             if r.status_code == 200:
                 return r
-            if r.status_code in (403, 429) and attempt < _MAX_ATTEMPTS - 1:
+            if r.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
                 ra = r.headers.get("Retry-After")
                 if ra and ra.strip().isdigit():
                     wait = min(float(ra), 60.0)
@@ -140,6 +148,13 @@ class ChatGPTClient:
                     f"{_MAX_ATTEMPTS} backoff attempts. Wait a few minutes and "
                     f"re-run `clync sync-chatgpt` — per-conversation commits make "
                     f"it resume where it stopped.")
+            if r.status_code >= 500:
+                raise RuntimeError(
+                    f"ChatGPT's backend returned {r.status_code} even after "
+                    f"{_MAX_ATTEMPTS} backoff attempts — this is a fault on "
+                    f"OpenAI's side, not your login: GET {url} -> {r.text[:160]}. "
+                    f"Re-run `clync sync-chatgpt` when it recovers; "
+                    f"per-conversation commits make it resume where it stopped.")
             raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
 
     def _access_token(self) -> str:
