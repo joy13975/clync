@@ -38,15 +38,40 @@ Design rationale for the store + Claude Code ingest:
 
 ## Setup
 
-One command wires up everything (deps, `clync` CLI on your PATH, MCP
+**Prerequisites** (macOS + Chrome only — see [Limitations](#limitations)):
+
+```sh
+brew install uv postgresql@17 pgvector
+```
+
+clync provisions its **own** contained PG17 cluster from those binaries under
+`~/.local/share/clync/`; it never touches an existing Postgres install, its data,
+or its port. Set `$CLYNC_PG_BIN` if your PG17 lives outside Homebrew.
+
+**Install.** One command wires up everything (deps, `clync` CLI on your PATH, MCP
 registration, daily launchd sync, and both Claude Code skills — `clync`
 history-search + `clync-ops` operations) — all defined in this repo,
 symlinked/registered out:
 
 ```sh
-uv run python clync.py setup --profile "Work"   # or export CLYNC_PROFILE; --at HH:MM for time
+git clone https://github.com/joy13975/clync.git ~/code/clync && cd ~/code/clync
+uv run python clync.py setup --profile "Person 1"   # or export CLYNC_PROFILE; --at HH:MM for time
 uv run python clync.py doctor                      # verify: store / deps / launchd / MCP
 ```
+
+`--profile` names the **Chrome profile** logged in to claude.ai, by its display
+name; a wrong name fails loud and lists the available ones.
+
+**Don't use claude.ai in Chrome?** Omit `--profile`. Setup then wires a
+**local-only** install — local Claude Code + Codex sessions, fully searchable —
+and the nightly job skips the network legs rather than failing them. A *lost*
+`$CLYNC_PROFILE` is still a loud error; local-only is recorded explicitly as
+`$CLYNC_LOCAL_ONLY` in the launchd job, so the two cases never blur.
+
+**Or let Claude Code do it.** Drop [`skill/SKILL.md`](skill/SKILL.md) into
+`~/.claude/skills/clync/SKILL.md` and say `/clync install` — the skill walks the
+prerequisites, clone, and setup, then supersedes its own bootstrap copy with a
+symlink to the repo. One file to share; no other bootstrap needed.
 
 Search is core, not an optional extra — `uv sync` (which `setup` runs for you)
 pulls in the BGE-M3 embedder + Postgres client along with everything else.
@@ -265,3 +290,13 @@ this Mac only.
   calls for a full first pass across all topics; `dream run` (nightly) stays
   cheap by construction, but a topic added or a charter materially rewritten
   needs a fresh `backfill` to catch it up.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Your synced history never leaves your machine: it lives in clync's own contained
+Postgres cluster under `~/.local/share/clync/`, outside this repo. Nothing in
+this repository contains or is derived from any real conversation content — the
+ablation experiments ship aggregate numbers only, and their query sets stay
+local by the rule in `experiments/reranker_ablation/.gitignore`.

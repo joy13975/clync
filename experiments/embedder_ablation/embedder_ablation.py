@@ -351,7 +351,7 @@ def cmd_report(args) -> None:
     L = []
     W = L.append
     W("# Embedder ablation — BGE-M3 (fp16 & int8) vs Qwen3-Embedding-0.6B\n")
-    W(f"Corpus: clync Work, identical to the reranker ablation ({n} queries, "
+    W(f"Corpus: a private clync corpus, identical to the reranker ablation ({n} queries, "
       f"same chunks). topk={TOPK}, RRF k={RRF_K}. Dense scored by cosine; BGE sparse "
       f"by learned-weight dot; hybrid = dense+sparse RRF. int8 = ONNX-Runtime "
       f"quantized BGE-M3 on CPU (same tokenizer/heads as fp16).\n")

@@ -1,4 +1,7 @@
 #!/bin/zsh
 # Convenience wrapper so you can run `clync <cmd>` from anywhere.
 # Symlink onto your PATH, e.g.:  ln -s ~/code/clync/clync ~/.local/bin/clync
-exec uv run --project /path/to/clync python /path/to/clync/clync.py "$@"
+# ${0:A:h} = this script's own dir with symlinks resolved, so the wrapper finds
+# the repo through the symlink rather than assuming any install location.
+REPO=${0:A:h}
+exec uv run --project "$REPO" python "$REPO/clync.py" "$@"

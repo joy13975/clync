@@ -10,6 +10,42 @@ top of those sits a **derived layer** of distilled positions (ADR 0004).
 Prefer the **MCP tools** (already registered); fall back to the `clync` CLI
 only if the tools are unavailable in this session.
 
+## Install / repair — `/clync install`
+
+Run this when the user says `/clync install`, or when the `mcp__clync__*` tools
+are **absent** from this session — that means clync itself is not installed and
+this file is a shared bootstrap copy. Do NOT run it because a search came back
+empty; an empty result is a freshness question (`clync sync`), not an install
+problem.
+
+1. **Prerequisites.** macOS + Chrome only. Install what is missing:
+   `brew install uv postgresql@17 pgvector`. clync provisions its **own**
+   contained PG17 cluster under `~/.local/share/clync/` — it never touches an
+   existing Postgres install, its data, or its port. `claude` must be on PATH
+   (setup registers the MCP server through it; the Dream layer runs `claude -p`).
+2. **Clone.** Default `~/code/clync`; ask only if the user wants it elsewhere.
+   `git clone https://github.com/joy13975/clync.git ~/code/clync`
+3. **Ask which Chrome profile** is logged in to claude.ai, by its **display
+   name** (Chrome's own profile name, e.g. `Person 1`). A wrong name fails loud
+   and prints the available names, so a wrong guess is cheap — but ask rather
+   than inventing one. If the user does not use claude.ai in Chrome, omit
+   `--profile` entirely: setup then wires a **local-only** install (Claude Code
+   + Codex sessions), and the nightly job skips the network legs instead of
+   failing them.
+4. **Wire it up** — one command does deps, the `clync` CLI on PATH, MCP
+   registration, the daily launchd sync, and both skills:
+   `cd ~/code/clync && uv run python clync.py setup --profile "<ChromeProfile>"`
+   If this file is a bootstrap copy at `~/.claude/skills/clync/`, setup
+   supersedes it with a symlink into the repo so the skill stops drifting from
+   the code.
+5. **Verify and seed.** `uv run python clync.py doctor`, then `clync sync` for
+   the first pull. The first index downloads the BGE-M3 embedder, so it is slow.
+   Report what `doctor` actually prints — never assume the install succeeded.
+6. **Say a restart is required.** The `mcp__clync__*` tools and the `clync-ops`
+   skill load only in a **new** Claude Code session.
+
+For troubleshooting an install that already exists, use the `clync-ops` skill.
+
 ## Which tool
 
 **Start with `search_history` for everything.** It searches BOTH layers in one call —

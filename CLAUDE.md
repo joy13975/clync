@@ -18,12 +18,14 @@ This file is an index — the actual documentation lives in these:
 | `mcp_server.py` (docstring) | The MCP tools: `search_history` (default — distilled positions AND raw transcripts in one call), the `search_insights` / `search_transcripts` drill-downs, and `get_conversation`. |
 | `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, RRF-fused dense+sparse query. |
 | `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p` (no API billing). Two separate run modes: incremental nightly, explicit bulk backfill. |
+| [LICENSE](LICENSE) | MIT. Nothing in this repo may contain or derive from real conversation content — see the rule in `experiments/reranker_ablation/.gitignore`. |
 | [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004). |
 
 ## One-command setup
 
 ```sh
 clync setup --profile <ChromeProfile>     # or export CLYNC_PROFILE
+clync setup                               # local-only: Claude Code + Codex, no claude.ai
 ```
 
 Installs deps, the `clync` CLI wrapper, the MCP registration, the daily launchd

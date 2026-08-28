@@ -126,7 +126,7 @@ Two things nobody in the baseline does, and which matter most here:
    of facts. This corpus is a *dialogue*: some statements are the user's assertions,
    some are Claude proposals he endorsed, and some are Claude proposals he
    **rejected**. Flattening those produces a knowledge base that confidently
-   attributes to the user things he argued against. See D5.
+   attributes to the user things they argued against. See D5.
 2. **Falsification before promotion.** No baseline tries to *refute* a candidate
    insight before durably storing it. Given the repo's own rules (evidence gates,
    adversarial review, "be the skeptic"), a refute pass is the natural bar. See D6.
@@ -362,9 +362,9 @@ the transcript:
 
 | stance | meaning |
 |---|---|
-| `user_asserted` | the user stated it himself |
+| `user_asserted` | the user stated it themselves |
 | `user_endorsed` | Claude proposed, the user explicitly accepted / adopted / merged it |
-| `user_rejected` | Claude proposed, the user pushed back — **kept**, because knowing what he rejected and why is knowledge |
+| `user_rejected` | Claude proposed, the user pushed back — **kept**, because knowing what they rejected and why is knowledge |
 | `co_derived` | reached jointly, no clean attribution |
 | `claude_proposed` | in the transcript but never adjudicated — lowest trust |
 

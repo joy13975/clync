@@ -1,0 +1,34 @@
+[
+  {
+    "id": "q01",
+    "query": "generic helper for paginating an sdk's list endpoints",
+    "lang": "en",
+    "type": "semantic-paraphrase",
+    "difficulty": "easy",
+    "target_conv_uuid": "00000000-0000-4000-8000-000000000001"
+  },
+  {
+    "id": "q02",
+    "query": "what does that retrieval-augmentation paper actually claim",
+    "lang": "en",
+    "type": "exact-term",
+    "difficulty": "easy",
+    "target_conv_uuid": "00000000-0000-4000-8000-000000000002"
+  },
+  {
+    "id": "q03",
+    "query": "the plant-propagation thread, was it worth doing",
+    "lang": "en",
+    "type": "vague",
+    "difficulty": "hard",
+    "target_conv_uuid": "00000000-0000-4000-8000-000000000003"
+  },
+  {
+    "id": "q04",
+    "query": "社内向けドキュメントのテンプレート作成",
+    "lang": "ja",
+    "type": "cross-lingual",
+    "difficulty": "easy",
+    "target_conv_uuid": "00000000-0000-4000-8000-000000000004"
+  }
+]

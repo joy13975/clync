@@ -34,6 +34,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from curl_cffi import requests as creq
 
 PROFILE_ENV = "CLYNC_PROFILE"  # deployment sets this (e.g. in the launchd plist)
+LOCAL_ONLY_ENV = "CLYNC_LOCAL_ONLY"  # set by an install that DELIBERATELY has no
+# claude.ai profile, so a *missing* profile stays a loud error while a *chosen*
+# Claude-Code-only install runs its local legs without nagging every night.
 CHROME_DIR = Path.home() / "Library/Application Support/Google/Chrome"
 
 # Runtime state root (DB cluster, downloaded images, scheduled log). Everything
@@ -49,11 +52,32 @@ FILES_DIR = DATA_HOME / "files"
 PG_DIR = DATA_HOME / "pg"
 PG_DATA = PG_DIR / "data"
 PG_LOG = PG_DIR / "postmaster.log"
-PG_BIN = Path(os.environ.get("CLYNC_PG_BIN", "/opt/homebrew/opt/postgresql@17/bin"))
+PG17_BIN_CANDIDATES = (
+    "/opt/homebrew/opt/postgresql@17/bin",   # Homebrew, Apple Silicon
+    "/usr/local/opt/postgresql@17/bin",      # Homebrew, Intel
+)
+
+
+def _default_pg_bin() -> str:
+    """First PG17 bin dir that actually holds `initdb`, among the known Homebrew
+    prefixes. $CLYNC_PG_BIN overrides for any other layout (MacPorts, Postgres.app,
+    a source build). On a total miss we return the first candidate so that `_pg()`
+    raises its own actionable error rather than failing somewhere less obvious."""
+    for c in PG17_BIN_CANDIDATES:
+        if (Path(c) / "initdb").exists():
+            return c
+    return PG17_BIN_CANDIDATES[0]
+
+
+PG_BIN = Path(os.environ.get("CLYNC_PG_BIN") or _default_pg_bin())
 PG_PORT = int(os.environ.get("CLYNC_PG_PORT", "54329"))
 PG_DB = os.environ.get("CLYNC_PG_DB", "clync")
 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_DB):
     raise SystemExit(f"invalid $CLYNC_PG_DB {PG_DB!r} — must match [A-Za-z_][A-Za-z0-9_]*")
+# The cluster's superuser: initdb CREATES this role, so every client — psycopg
+# and the psql subprocesses alike — must connect AS it rather than inheriting
+# libpq's OS-user default, which diverges wherever $USER is unset (launchd,
+# cron, CI, containers) and leaves initdb and psql disagreeing about the role.
 PG_USER = os.environ.get("USER", "postgres")
 
 HOST = "https://claude.ai"
@@ -131,7 +155,7 @@ def _decrypt_cookie(enc: bytes, key: bytes) -> str:
 
 
 def resolve_profile_dir(display_name: str) -> Path:
-    """Map a Chrome profile *display name* (e.g. 'Work') to its directory."""
+    """Map a Chrome profile *display name* (e.g. 'Person 1') to its directory."""
     local_state = json.loads((CHROME_DIR / "Local State").read_text())
     cache = local_state.get("profile", {}).get("info_cache", {})
     matches = [d for d, info in cache.items() if info.get("name") == display_name]
@@ -473,9 +497,14 @@ def _pg(binary: str) -> str:
 
 
 def _vector_control_present() -> bool:
-    share = PG_BIN.parent / "share" / "postgresql@17" / "extension" / "vector.control"
-    alt = Path("/opt/homebrew/share/postgresql@17/extension/vector.control")
-    return share.exists() or alt.exists()
+    # Homebrew keeps it either under the versioned formula prefix or in the
+    # brew-wide share dir; both are derived from PG_BIN so a non-default
+    # $CLYNC_PG_BIN keeps working.
+    roots = [PG_BIN.parent]
+    if len(PG_BIN.parents) > 2:
+        roots.append(PG_BIN.parents[2])
+    return any((r / "share" / "postgresql@17" / "extension" / "vector.control").exists()
+               for r in roots)
 
 
 def cluster_running() -> bool:
@@ -590,11 +619,13 @@ def ensure_cluster(*, rebuild_derived: bool = False) -> None:
             check=True, capture_output=True)
     start_cluster()
     exists = subprocess.run(
-        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-d", "postgres",
+        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-U", PG_USER,
+         "-d", "postgres",
          "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'"],
         capture_output=True, text=True, check=True).stdout.strip()
     if exists != "1":
         subprocess.run([_pg("psql"), "-h", "localhost", "-p", str(PG_PORT),
+                        "-U", PG_USER,
                         "-d", "postgres", "-c", f'CREATE DATABASE "{PG_DB}"'],
                        check=True, capture_output=True)
     with connect_pg() as con:
@@ -936,9 +967,11 @@ def _ingest_local(source: str, kind: str, iter_files, parse_session, full: bool,
     `full` re-parses every file. Also reconciles deletions WITHIN this source: a
     file removed from disk loses its unit/messages and its watermark row (mirror
     of the claude.ai upstream-deletion purge — never degrade silently to stale
-    data). An unavailable root raises (in `iter_files`, before any store
-    mutation) — a missing source is an error, never evidence of deletion. No
-    network / cookies. Returns stats. Fails loud on a store error.
+    data). An unavailable root raises (from `iter_files`, before any store
+    mutation) whenever this source HAS stored watermarks — a vanished root is an
+    error, never evidence of deletion. With no watermarks at all the producing
+    tool is not installed here, nothing can be purged, and the leg is skipped.
+    No network / cookies. Returns stats. Fails loud on a store error.
 
     `out_of_scope_marker` is the sentinel a parser returns for a file it examined
     but deliberately skipped by scope (e.g. codex.OUT_OF_SCOPE for a non-terminal
@@ -947,13 +980,30 @@ def _ingest_local(source: str, kind: str, iter_files, parse_session, full: bool,
     producer rename that pushes the whole corpus out of scope shows up as
     out_of_scope==files_parsed with sessions_ingested==0, never a silent healthy
     run. A source with no scope sentinel leaves the default (matches nothing)."""
-    files = list(iter_files())  # raises on a missing root, before the store is touched
     con = connect()
     # Only THIS source's watermarks — so a cross-source path never reads as
     # "deleted" and gets its unit purged during reconciliation.
     state = {r["file_path"]: (r["mtime"], r["size"]) for r in con.execute(
         "SELECT file_path, mtime, size FROM cc_sync_state WHERE source=%s",
         (source,)).fetchall()}
+    try:
+        files = list(iter_files())  # raises on a missing root, before any mutation
+    except FileNotFoundError:
+        # A missing root is only AMBIGUOUS when there is a stored corpus to
+        # reconcile against. With no watermarks for this source, the producing
+        # tool is simply not installed on this machine (a very common first run:
+        # no Codex CLI, or Claude Code never used in a project) — there is
+        # nothing deletion reconciliation could purge, so skip the leg. With
+        # watermarks present, a vanished root WOULD purge the stored corpus:
+        # stay loud, which is the case the guard exists for.
+        if state:
+            con.close()
+            raise
+        con.close()
+        print(f"[{source}] source not installed on this machine (no session root, "
+              f"nothing stored) -> skipped")
+        return {"files_parsed": 0, "unchanged": 0, "sessions_ingested": 0,
+                "out_of_scope": 0, "sessions_removed": 0, "sessions_in_db": 0}
     ingested = skipped = sessions = out_of_scope = 0
     try:
         for path in files:
@@ -1131,7 +1181,7 @@ def _index_after_sync(full: bool) -> None:
           f"chunks={stats['chunks']} removed_units={stats['removed_units']}")
 
 
-def _sync_all(profile: str, org_ref: str | None, full: bool, download_files: bool,
+def _sync_all(profile: str | None, org_ref: str | None, full: bool, download_files: bool,
               do_index: bool, notify_fail: bool) -> Exception | None:
     """Run the network legs (claude.ai then ChatGPT, cookie/network — each may
     fail) then ALWAYS the local ingests (Claude Code + Codex CLI, no network), then
@@ -1143,9 +1193,17 @@ def _sync_all(profile: str, org_ref: str | None, full: bool, download_files: boo
     silent)."""
     ensure_cluster()
     net_errs: list[Exception] = []
-    for label, run in (("claude.ai", lambda: run_sync(
-                            profile, org_ref, full, download_files=download_files)),
-                       ("ChatGPT", lambda: ingest_chatgpt(profile, full=full))):
+    # profile=None is a Claude-Code-only install: there is no cookie jar to read,
+    # so the network legs are SKIPPED rather than attempted-and-failed.
+    legs = () if profile is None else (
+        ("claude.ai", lambda: run_sync(
+            profile, org_ref, full, download_files=download_files)),
+        ("ChatGPT", lambda: ingest_chatgpt(profile, full=full)),
+    )
+    if profile is None:
+        print("no Chrome profile configured -> local-only sync "
+              "(Claude Code + Codex sessions)")
+    for label, run in legs:
         try:
             run()
         except Exception as e:                # captured, re-raised by caller (loud)
@@ -1272,9 +1330,13 @@ def cmd_scheduled(args) -> int:
     """Entry point for the launchd job: sync, notify LOUDLY on failure, and warn
     (but do not error) when a prior daily run was missed because the Mac was down."""
     profile = args.profile or os.environ.get(PROFILE_ENV)
-    if not profile:
-        notify("fail", "clync sync failed", f"${PROFILE_ENV} is not set")
-        raise RuntimeError(f"${PROFILE_ENV} is not set")
+    if not profile and not os.environ.get(LOCAL_ONLY_ENV):
+        # No profile AND no explicit local-only marker = a broken install, not a
+        # configuration. Stay loud.
+        notify("fail", "clync sync failed",
+               f"neither ${PROFILE_ENV} nor ${LOCAL_ONLY_ENV} is set")
+        raise RuntimeError(f"neither ${PROFILE_ENV} nor ${LOCAL_ONLY_ENV} is set")
+    profile = profile or None
     ensure_cluster()
     # Detect a missed prior run before this one updates last_success.
     con = connect()
@@ -1609,12 +1671,14 @@ def cmd_doctor(args) -> int:
 
 def cmd_install(args) -> int:
     """Write + load a self-contained launchd LaunchAgent for the daily sync."""
-    profile = _require_profile(args)
+    profile = args.profile or None
     hour, minute = (int(x) for x in args.at.split(":"))
     SCHED_LOG.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     # A login shell resolves `uv` on PATH (pyenv shims aren't reliable under launchd).
     cmd = f"cd {REPO_DIR} && exec uv run python clync.py scheduled"
+    env_entry = (f"<key>{PROFILE_ENV}</key><string>{profile}</string>" if profile
+                 else f"<key>{LOCAL_ONLY_ENV}</key><string>1</string>")
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1623,7 +1687,7 @@ def cmd_install(args) -> int:
   <key>ProgramArguments</key>
     <array><string>/bin/zsh</string><string>-lc</string><string>{cmd}</string></array>
   <key>EnvironmentVariables</key><dict>
-    <key>{PROFILE_ENV}</key><string>{profile}</string>
+    {env_entry}
   </dict>
   <key>StartCalendarInterval</key><dict>
     <key>Hour</key><integer>{hour}</integer>
@@ -1664,10 +1728,39 @@ OPS_SKILL_LINK = Path.home() / ".claude/skills/clync-ops"  # operate/troubleshoo
 MCP_NAME = "clync"
 
 
+def _skill_name(md: Path) -> str | None:
+    """The `name:` field from a skill's YAML frontmatter, or None if absent."""
+    if not md.is_file():
+        return None
+    for line in md.read_text(errors="replace").splitlines()[:20]:
+        if line.startswith("name:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _is_bootstrap_copy(link: Path, target: Path) -> bool:
+    """True when `link` is a standalone COPY of this repo's skill dir — the file a
+    user drops into ~/.claude/skills/ so that `/clync install` exists BEFORE the
+    repo does. Recognised narrowly: a real directory whose only entry is SKILL.md,
+    declaring the same skill `name:` as the target's own. Anything else is the
+    user's real file and must never be clobbered."""
+    if link.is_symlink() or not link.is_dir():
+        return False
+    if [p.name for p in link.iterdir()] != ["SKILL.md"]:
+        return False
+    name = _skill_name(link / "SKILL.md")
+    return name is not None and name == _skill_name(target / "SKILL.md")
+
+
 def _relink(link: Path, target: Path) -> None:
-    """Idempotently point a symlink at target; refuse to clobber a real file."""
+    """Idempotently point a symlink at target; refuse to clobber a real file. The
+    one exception is a bootstrap COPY of this repo's own skill dir, which install
+    deliberately supersedes with the live symlink so the skill stops drifting."""
     if link.is_symlink():
         link.unlink()
+    elif _is_bootstrap_copy(link, target):
+        shutil.rmtree(link)
+        print(f"  (superseded the bootstrap skill copy at {link})")
     elif link.exists():
         raise RuntimeError(f"{link} exists and is not a symlink — refusing to overwrite.")
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -1677,8 +1770,11 @@ def _relink(link: Path, target: Path) -> None:
 def cmd_setup(args) -> int:
     """One command to wire everything up from the repo: deps, CLI, MCP, scheduler,
     skill. Every artifact is defined in this repo and symlinked/registered out;
-    `clync unsetup` reverses it."""
-    _require_profile(args)
+    `clync unsetup` reverses it. A missing --profile is a deliberate
+    Claude-Code-only install: everything is wired except the claude.ai/ChatGPT
+    legs, which have no cookie jar to read."""
+    print("mode: both sources" if args.profile else
+          "mode: local Claude Code + Codex only (no --profile given)")
 
     subprocess.run(["uv", "sync", "--quiet"], cwd=REPO_DIR, check=True)
     print("✓ deps synced (uv)")

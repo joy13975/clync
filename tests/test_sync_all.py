@@ -105,3 +105,34 @@ def test_sync_all_app_failure_still_ingests_and_indexes_cc(pg_test_db, tmp_path,
     # cc ran despite the app failure, and the index picked it up
     cc_hits = {h["unit_id"] for h in search.hybrid_search("", source="claude_code", topk=50)}
     assert "sess-1" in cc_hits
+
+
+def test_sync_all_local_only_skips_network_legs_entirely(pg_test_db, tmp_path,
+                                                        monkeypatch, mock_embed):
+    """A Claude-Code-only install (profile=None) must SKIP the network legs rather
+    than attempt-and-fail them: no cookie read, no client construction, no nightly
+    error — while local ingest + index still run and stay searchable."""
+    search = pg_test_db
+
+    def _boom(*a, **k):
+        raise AssertionError("network leg must not run without a Chrome profile")
+
+    monkeypatch.setattr(clync, "read_auth_cookies", _boom)
+    monkeypatch.setattr(clync, "run_sync", _boom)
+    monkeypatch.setattr(clync, "ingest_chatgpt", _boom)
+    _wire_cc(tmp_path, monkeypatch)
+    _wire_codex(tmp_path, monkeypatch)
+
+    err = clync._sync_all(None, None, full=True, download_files=False,
+                          do_index=True, notify_fail=False)
+    assert err is None                                  # nothing failed; nothing skipped loudly
+
+    con = clync.connect()
+    try:
+        kinds = {r["source"] for r in con.execute(
+            "SELECT DISTINCT source FROM units").fetchall()}
+        assert kinds == {"claude_code", "codex_cli"}     # local sources only
+    finally:
+        con.close()
+    cc_hits = {h["unit_id"] for h in search.hybrid_search("", source="claude_code", topk=50)}
+    assert "sess-1" in cc_hits                          # and indexed/searchable

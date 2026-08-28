@@ -104,7 +104,7 @@ human + assistant text ≈ 20%. So:
 ### 5. Scope: interactive sessions only; subagents excluded.
 
 - **`entrypoint == "cli"` only.** `sdk-cli` / `sdk-py` are programmatic batch runs
-  (the redacted-repo harness alone is 2,383 such files), not conversations. `entrypoint`
+  (a single batch harness accounted for 2,383 such files), not conversations. `entrypoint`
   is a typed event field — a principled filter with **no hardcoded personal paths**.
   It is stored as a facet, so batch runs are filterable-*in* later, not discarded.
 - **Subagents out of scope.** `subagents/agent-*.jsonl` are not ingested; the

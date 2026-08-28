@@ -1,6 +1,6 @@
 # Embedder ablation — BGE-M3 (fp16 & int8) vs Qwen3-Embedding-0.6B
 
-Corpus: clync Work, identical to the reranker ablation (20 queries, same chunks). topk=10, RRF k=60. Dense scored by cosine; BGE sparse by learned-weight dot; hybrid = dense+sparse RRF. int8 = ONNX-Runtime quantized BGE-M3 on CPU (same tokenizer/heads as fp16).
+Corpus: a private clync corpus, identical to the reranker ablation (20 queries, same chunks). topk=10, RRF k=60. Dense scored by cosine; BGE sparse by learned-weight dot; hybrid = dense+sparse RRF. int8 = ONNX-Runtime quantized BGE-M3 on CPU (same tokenizer/heads as fp16).
 
 Backs [ADR 0002](../../docs/adr/0002-embedder-choice.md).
 

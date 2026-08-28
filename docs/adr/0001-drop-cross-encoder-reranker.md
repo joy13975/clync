@@ -14,7 +14,7 @@ keep the top-10. A reranker adds real cost — it cannot be precomputed/indexed
 (a cross-encoder scores every query×doc pair at query time). We needed to know
 whether it earns that cost on **this** corpus before wiring it into production.
 
-We ran an offline ablation on the real Work corpus (20 queries, 16 EN / 4 JA;
+We ran an offline ablation on a private real-world corpus (20 queries, 16 EN / 4 JA;
 ZH unevaluable — the sole ZH conversation is a body-less server-side stub).
 Both arms drew from the **identical** 50-shortlist so only the reranker varied.
 Relevance graded 0–3 by blind, clean-context Sonnet judges (one grade per

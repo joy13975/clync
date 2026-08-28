@@ -308,7 +308,7 @@ def cmd_report(args) -> None:
     lines = []
     W = lines.append
     W("# Reranker ablation — results\n")
-    W(f"Corpus: clync Work ({n} queries). pre_topk={PRE_TOPK}, topk={TOPK}, RRF k={RRF_K}. "
+    W(f"Corpus: a private clync corpus ({n} queries). pre_topk={PRE_TOPK}, topk={TOPK}, RRF k={RRF_K}. "
       f"Embedder {EMBED_MODEL}, reranker {RERANK_MODEL}.\n")
     W("Benchmark backing [ADR 0001](../../docs/adr/0001-drop-cross-encoder-reranker.md). "
       "Reproduce (needs the local clync DB + the gitignored data/ artifacts): "

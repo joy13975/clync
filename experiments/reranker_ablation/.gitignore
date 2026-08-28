@@ -6,11 +6,13 @@ __pycache__/
 # conversation text. Never commit corpus content to a repo with a remote.
 cache/
 
-# Raw-content data artifacts (conversation snippets, digests, titles, grades).
-# Kept LOCAL only. queries.json (the abstracted query set) IS committed as the
-# reproducible deliverable; the report .md carries only aggregate numbers.
-data/candidates.json
-data/allowed_targets.json
-data/judge_targets.json
-data/results.json
-data/judgments.json
+# Raw-content data artifacts, kept LOCAL only.
+#
+# The rule is content-derived, not per-file: anything that reveals what the
+# corpus CONTAINS stays out of the repo. That includes the QUERY SET — a query's
+# wording describes its target conversation just as surely as a snippet does, so
+# queries.json is local-only despite being an "abstracted" deliverable. Only
+# aggregate numbers ship, in the report .md. queries.example.json documents the
+# schema with synthetic entries.
+data/*.json
+!data/queries.example.json

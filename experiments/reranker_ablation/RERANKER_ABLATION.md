@@ -1,6 +1,6 @@
 # Reranker ablation — results
 
-Corpus: clync Work (20 queries). pre_topk=50, topk=10, RRF k=60. Embedder BAAI/bge-m3, reranker BAAI/bge-reranker-v2-m3.
+Corpus: a private clync corpus (20 queries). pre_topk=50, topk=10, RRF k=60. Embedder BAAI/bge-m3, reranker BAAI/bge-reranker-v2-m3.
 
 Benchmark backing [ADR 0001](../../docs/adr/0001-drop-cross-encoder-reranker.md). Reproduce (needs the local clync DB + the gitignored data/ artifacts): `uv run python ablation.py candidates && … embed && … run && … judge-targets`, judge the pairs, then `… report`.
 
