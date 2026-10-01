@@ -1,8 +1,7 @@
 # clync — guide for Claude Code
 
-clync syncs the user's **claude.ai** conversation history *and* local **Claude
-Code** sessions into a contained Postgres/pgvector store and exposes it to
-Claude Code over MCP. macOS + Chrome only.
+See [README.md](README.md) for supported history sources, MCP clients,
+requirements, and embedding costs.
 
 ## Docs index
 
@@ -10,14 +9,14 @@ This file is an index — the actual documentation lives in these:
 
 | Doc | What's in it |
 |---|---|
-| [README.md](README.md) | **Start here.** What it is, one-command setup, all CLI commands, config, architecture, and limitations. |
+| [README.md](README.md) | **Start here.** Supported sources, manual quick start, MCP clients, embedding costs, Dream, and data handling. |
 | [skill/SKILL.md](skill/SKILL.md) | The auto-firing Claude Code skill — when/how to query the user's history (both sources) via MCP. |
 | [skill-ops/SKILL.md](skill-ops/SKILL.md) | The `clync-ops` skill — invoked to run/troubleshoot sync, index, search, doctor from the shell. |
 | `clync.py` (module docstring + `--help`) | Sync engine, cookie/Cloudflare handling, the contained Postgres store, CLI. |
 | `cc.py` (module docstring) | Local Claude Code session ingest: JSONL parsing, cleaning, metadata extraction. |
 | `mcp_server.py` (docstring) | The MCP tools: `search_history` (default — distilled positions AND raw transcripts in one call), the `search_insights` / `search_transcripts` drill-downs, and `get_conversation`. |
 | `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, RRF-fused dense+sparse query. |
-| `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p` (no API billing). Two separate run modes: incremental nightly, explicit bulk backfill. |
+| `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p`. Two separate run modes: incremental nightly, explicit bulk backfill. |
 | [LICENSE](LICENSE) | MIT. Nothing in this repo may contain or derive from real conversation content — see the rule in `experiments/reranker_ablation/.gitignore`. |
 | [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004). |
 
