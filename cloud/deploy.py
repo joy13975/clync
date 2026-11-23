@@ -686,10 +686,11 @@ def _encrypt_unit_group(
     units: list[dict[str, Any]],
     msgs: list[dict[str, Any]],
     chunks: list[dict[str, Any]],
-) -> tuple[list[str], list[str]]:
-    """Return (unit_records, child_records) so units ingest before parallel child batches."""
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (unit_records, msg_records, chunk_records) for FK-safe, HNSW-safe batching."""
     unit_records: list[str] = []
-    child_records: list[str] = []
+    msg_records: list[str] = []
+    chunk_records: list[str] = []
     for u in units:
         meta_json = json.dumps(
             {
@@ -722,7 +723,7 @@ def _encrypt_unit_group(
         if m["idx"] is None:
             continue
         payload = json.dumps({"sender": m["sender"], "text": m["text"] or ""})
-        child_records.append(
+        msg_records.append(
             json.dumps(
                 {
                     "t": "msg",
@@ -748,7 +749,7 @@ def _encrypt_unit_group(
                 }
             )
             perm_sparse = cipher.permute_sparse_literal(c["sparse"])
-            child_records.append(
+            chunk_records.append(
                 json.dumps(
                     {
                         "t": "chunk",
@@ -768,7 +769,7 @@ def _encrypt_unit_group(
                     }
                 )
             )
-    return unit_records, child_records
+    return unit_records, msg_records, chunk_records
 
 
 def _upload_and_ingest_batch(
@@ -879,9 +880,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                     "FROM chunks WHERE unit_id = ANY(%s)",
                     (w_ids,),
                 ).fetchall()
-                unit_recs, child_recs = _encrypt_unit_group(cipher, w_units, msgs, chunks)
+                unit_recs, msg_recs, chunk_recs = _encrypt_unit_group(cipher, w_units, msgs, chunks)
 
-                # Ingest units first so FK references exist before parallel child batches run.
+                # Ingest units first so FK references exist before child batches run.
                 unit_ing = _upload_and_ingest_batch(
                     owner=args.owner,
                     profile=profile,
@@ -894,10 +895,12 @@ def cmd_push(args: argparse.Namespace) -> int:
                 for k in total_ingested:
                     total_ingested[k] += unit_ing.get(k, 0)
 
-                child_batches = [
-                    child_recs[i : i + batch_size] for i in range(0, len(child_recs), batch_size)
-                ]
-                futs = [
+                msg_batches = [msg_recs[i : i + batch_size] for i in range(0, len(msg_recs), batch_size)]
+                chunk_batches = [chunk_recs[i : i + batch_size] for i in range(0, len(chunk_recs), batch_size)]
+
+                # Messages have no HNSW index so always ingest in parallel; chunks parallelize
+                # only when HNSW indexes are dropped (live HNSW writers contend on graph locks).
+                msg_futs = [
                     pool.submit(
                         _upload_and_ingest_batch,
                         owner=args.owner,
@@ -905,15 +908,46 @@ def cmd_push(args: argparse.Namespace) -> int:
                         region=state["region"],
                         bucket=state["staging_bucket"],
                         lambda_arn=state["lambda_arn"],
-                        tag=f"w{w_idx:03d}-b{b_idx:03d}",
+                        tag=f"w{w_idx:03d}-m{b_idx:03d}",
                         batch=batch,
                     )
-                    for b_idx, batch in enumerate(child_batches)
+                    for b_idx, batch in enumerate(msg_batches)
                 ]
-                for fut in futs:
-                    ing = fut.result()
-                    for k in total_ingested:
-                        total_ingested[k] += ing.get(k, 0)
+                if drop_hnsw_first:
+                    chunk_futs = [
+                        pool.submit(
+                            _upload_and_ingest_batch,
+                            owner=args.owner,
+                            profile=profile,
+                            region=state["region"],
+                            bucket=state["staging_bucket"],
+                            lambda_arn=state["lambda_arn"],
+                            tag=f"w{w_idx:03d}-c{b_idx:03d}",
+                            batch=batch,
+                        )
+                        for b_idx, batch in enumerate(chunk_batches)
+                    ]
+                    for fut in msg_futs + chunk_futs:
+                        ing = fut.result()
+                        for k in total_ingested:
+                            total_ingested[k] += ing.get(k, 0)
+                else:
+                    for fut in msg_futs:
+                        ing = fut.result()
+                        for k in total_ingested:
+                            total_ingested[k] += ing.get(k, 0)
+                    for b_idx, batch in enumerate(chunk_batches):
+                        ing = _upload_and_ingest_batch(
+                            owner=args.owner,
+                            profile=profile,
+                            region=state["region"],
+                            bucket=state["staging_bucket"],
+                            lambda_arn=state["lambda_arn"],
+                            tag=f"w{w_idx:03d}-c{b_idx:03d}",
+                            batch=batch,
+                        )
+                        for k in total_ingested:
+                            total_ingested[k] += ing.get(k, 0)
 
                 for u in w_units:
                     pushed_units[u["unit_id"]] = u["updated_at"].isoformat() if u.get("updated_at") else ""
@@ -922,7 +956,7 @@ def cmd_push(args: argparse.Namespace) -> int:
                 _save_state(args.owner, state)
                 print(
                     f"  wave {w_idx + 1}/{n_waves}: +{len(w_units)} units, +{len(msgs)} msgs, +{len(chunks)} chunks "
-                    f"({1 + len(child_batches)} batch(es), elapsed {time.perf_counter() - t_start:.1f}s)",
+                    f"({1 + len(msg_batches) + len(chunk_batches)} batch(es), elapsed {time.perf_counter() - t_start:.1f}s)",
                     flush=True,
                 )
 

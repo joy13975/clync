@@ -697,7 +697,15 @@ def _handle_ingest(con: psycopg.Connection, params: dict[str, Any]) -> dict[str,
                     "source_hmac=EXCLUDED.source_hmac, repo_hmac=EXCLUDED.repo_hmac, "
                     "project_hmac=EXCLUDED.project_hmac, sender_hmac=EXCLUDED.sender_hmac, "
                     "lang_hmac=EXCLUDED.lang_hmac, updated_at=EXCLUDED.updated_at, "
-                    "payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse"
+                    "payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse "
+                    "WHERE chunks.dense IS DISTINCT FROM EXCLUDED.dense "
+                    "   OR chunks.sparse IS DISTINCT FROM EXCLUDED.sparse "
+                    "   OR chunks.updated_at IS DISTINCT FROM EXCLUDED.updated_at "
+                    "   OR chunks.source_hmac IS DISTINCT FROM EXCLUDED.source_hmac "
+                    "   OR chunks.repo_hmac IS DISTINCT FROM EXCLUDED.repo_hmac "
+                    "   OR chunks.project_hmac IS DISTINCT FROM EXCLUDED.project_hmac "
+                    "   OR chunks.sender_hmac IS DISTINCT FROM EXCLUDED.sender_hmac "
+                    "   OR chunks.lang_hmac IS DISTINCT FROM EXCLUDED.lang_hmac"
                 )
                 counts["chunks"] = len(chunk_rows)
         con.commit()
