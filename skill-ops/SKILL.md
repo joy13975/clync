@@ -49,6 +49,7 @@ with `$CLYNC_PG_BIN`).
 | Mine existing history into a topic | `clync dream backfill [--topic T] [--max-calls N]` | Explicit only, never scheduled — this is the expensive pass (order 100-200 calls for a full first pass across all topics). Resumable: a capped run picks up where it stopped. Also the right tool after adding a topic or rewriting a charter. |
 | Dream-first recall from the shell | `clync dream recall "<query>" [--topic T] [--limit N] [--as-of ISO] [--evidence]` | Tiered output: TOPIC / COVERAGE / DIGEST / INSIGHTS / RAW TRANSCRIPTS. `--as-of` reads bi-temporal history (positions held then, not now); `--evidence` prints the quoted source text behind each insight. |
 | Dream layer health | `clync dream status` | Watermark, per-topic table (active/superseded/contested insight counts, last dig time), model-usage totals by stage, failed-queue count. |
+| Connect / list / ask a `clync-share` Lambda | `clync connect <lambda-arn> [--profile P]` · `clync shares` · `clync ask <alias> "<q>"` · `clync disconnect <alias>` | Live IAM handshake + persists `$CLYNC_DATA_HOME/shares.json`; reload MCP clients to expose `ask_<alias>`, or call `clync ask` directly from CLI. |
 
 ## Dream layer operations
 

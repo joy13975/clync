@@ -1,6 +1,6 @@
 ---
 name: clync
-description: "Search the user's own conversations and coding sessions: live fuzzy lexical search across Claude Code, Codex, OpenCode v2, Pi and Grok Build without embeddings, plus archived claude.ai/ChatGPT history and distilled positions. Use for finding a past session, recovering a decision, recalling what the user said, or asking what they think or concluded. NOT for web search."
+description: "Search the user's own conversations and coding sessions (live fuzzy lexical search across Claude Code, Codex, OpenCode v2, Pi and Grok Build without embeddings, plus archived claude.ai/ChatGPT history and distilled positions) and ask connected clync-share teammate endpoints (`ask_<alias>`). Use for finding a past session, recovering a decision, recalling what the user said, asking what they think or concluded, or asking a connected teammate's shared archive. NOT for web search."
 allowed-tools: mcp__clync__search_sessions, mcp__clync__read_session, mcp__clync__search_history, mcp__clync__search_insights, mcp__clync__search_transcripts, mcp__clync__get_conversation, Bash
 ---
 
@@ -31,6 +31,10 @@ its parent is `<repo>`. Do not run sync/index/setup to answer a query.
 | `search_transcripts` | `clync search "<question>" --sender user --per-unit 5` |
 | `get_conversation` | `clync read '<unit-id>' --from-idx <lo> --to-idx <hi> --sender user` |
 | `search_history` | `clync dream recall "<question>" --evidence` |
+| `ask_<alias>` (connected share) | `clync ask <alias> "<question>"` |
+| `resolve_citation` (owner share) | `clync resolve-citation <handle>` |
+
+To connect a teammate's `clync-share` Lambda ARN: `clync connect <lambda-arn> [--profile <aws-profile>] [--as <alias>]`, then reload MCP clients to expose `ask_<alias>` (or use `clync ask <alias> "<question>"` immediately over CLI). Check configured endpoints with `clync shares`.
 
 Carry over the requested facets, bounds and sender; omit example filters not requested.
 For insights-only reads, use the recall output's labelled INSIGHTS section. Archived
@@ -64,6 +68,8 @@ Reach for a narrower tool only to drill down after that first call:
 | More positions, without transcript noise | `search_insights` |
 | Raw search narrowed by repo / project / branch / date, or to the user's OWN turns | `search_transcripts` |
 | One conversation, whole or a window around a hit | `get_conversation` |
+| Ask a connected teammate's shared archive (redacted + opaque citations) | `ask_<alias>` (MCP) or `clync ask <alias> "<question>"` (CLI) |
+| Resolve an opaque citation handle (`clync-<owner>-<id>`) back to raw turns (owner only) | `resolve_citation` (MCP) or `clync resolve-citation <handle>` (CLI) |
 
 Do NOT try to answer a "what do I think" question by reading raw transcripts
 yourself and summarizing. That is what the distilled layer already did, with a
