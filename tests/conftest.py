@@ -3,6 +3,8 @@ a throwaway database (`clync_pytest`) inside the already-running contained clust
 and the Claude Code root is redirected to a tmp dir."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import clync
@@ -90,3 +92,23 @@ def _sandbox_codex_root(tmp_path_factory, monkeypatch):
     `cc.CC_ROOT` per-test by the same convention.)"""
     import codex
     monkeypatch.setattr(codex, "CODEX_ROOT", tmp_path_factory.mktemp("codex_root_sandbox"))
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_pi_root(tmp_path, monkeypatch):
+    root = tmp_path / "pi-root"
+    root.mkdir()
+    monkeypatch.setenv("CLYNC_PI_ROOT", str(root))
+    monkeypatch.delenv("PI_CODING_AGENT_SESSION_DIR", raising=False)
+    if "pi_source" in sys.modules:
+        monkeypatch.setattr(sys.modules["pi_source"], "PI_ROOT", root)
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_artiport_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLYNC_ARTIPORT_CONFIG", str(tmp_path / "unconfigured-artiport.json"))
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_opencode_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLYNC_OPENCODE_CONFIG", str(tmp_path / "unconfigured-opencode.json"))

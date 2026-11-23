@@ -16,9 +16,9 @@ def test_repo_and_worktree_reused_from_cc():
     # codex.py imports cc._repo_and_worktree rather than duplicating it (SSOT).
     assert codex._repo_and_worktree is cc._repo_and_worktree
     assert codex._repo_and_worktree(
-        "/Users/j/code/example-repo/.claude/worktrees/some-branch/sub/dir"
-    ) == ("example-repo", "some-branch")
-    assert codex._repo_and_worktree("/Users/j/code/clync") == ("clync", None)
+        "/Users/example/code/example-repo/.claude/worktrees/fix-precision/sub/dir"
+    ) == ("example-repo", "fix-precision")
+    assert codex._repo_and_worktree("/Users/example/code/clync") == ("clync", None)
     assert codex._repo_and_worktree(None) == (None, None)
 
 
@@ -89,14 +89,14 @@ def _rollout_lines(session_id="019b08b8-bfea-7542-af4d-8e75278b2251", originator
     return [
         _line(timestamp="2026-01-01T00:00:00.000Z", type="session_meta", payload={
             "id": session_id, "timestamp": "2026-01-01T00:00:00.000Z",
-            "cwd": "/Users/j/code/clync", "originator": originator,
+            "cwd": "/Users/example/code/clync", "originator": originator,
             "cli_version": "0.66.0", "instructions": "repo guidelines..."}),
         _line(timestamp="2026-01-01T00:00:01.000Z", type="response_item", payload={
             "type": "message", "role": "user", "content": [
                 {"type": "input_text", "text": "<environment_context>\n  <cwd>/x</cwd>\n"
                                                 "</environment_context>"}]}),
         _line(timestamp="2026-01-01T00:00:02.000Z", type="turn_context", payload={
-            "cwd": "/Users/j/code/clync", "model": "gpt-5.1-codex", "effort": "medium"}),
+            "cwd": "/Users/example/code/clync", "model": "gpt-5.1-codex", "effort": "medium"}),
         _line(timestamp="2026-01-01T00:00:03.000Z", type="response_item", payload={
             "type": "message", "role": "user", "content": [
                 {"type": "input_text", "text": "how do I design X"}]}),
@@ -135,7 +135,7 @@ def test_parse_session_cleaning_and_metadata(tmp_path):
     assert ("user", "text") in kinds
     assert ("assistant", "reasoning") in kinds
     assert any(rd.startswith("tool_use:") for _, rd in kinds)
-    assert ("user", "tool_result") in kinds
+    assert (cc.NO_ORIGIN_SENDER, "tool_result") in kinds
     assert ("assistant", "text") in kinds
 
     # title = first real user prompt, truncated
@@ -148,6 +148,10 @@ def test_parse_session_cleaning_and_metadata(tmp_path):
     # pure tool_result carries no embed signal
     tool_result_msg = next(m for m in s.messages if m.role_detail == "tool_result")
     assert tool_result_msg.embed_text == ""
+    # A tool's output is the machine's, whatever slot the rollout files it in. The
+    # user's senders are a read filter now, so one of these under a user sender
+    # renders the machine's stdout as something the user said.
+    assert tool_result_msg.sender not in cc.SENDER_ROLES["user"]
     # everything else reuses `text` for embedding
     text_msg = next(m for m in s.messages if m.role_detail == "text")
     assert text_msg.embed_text is None
@@ -453,7 +457,7 @@ def test_cc_sync_state_source_migration_backfills_and_drops_default(pg_test_db):
     '<image name=[Image #1] path="/tmp/x.png"></image>',
     "# Context from my IDE setup:\n## Active file: Untitled-1",
     "<environment_context>\n<cwd>/x</cwd>\n</environment_context>",
-    "# AGENTS.md instructions for /Users/j/repo\n<INSTRUCTIONS>...",
+    "# AGENTS.md instructions for /Users/example/repo\n<INSTRUCTIONS>...",
 ])
 def test_is_injection_covers_real_corpus_wrappers(injected):
     assert codex._is_injection(injected) is True
@@ -472,7 +476,7 @@ def test_title_skips_injection_message_and_picks_real_prompt(tmp_path):
     # and the injection text must not appear in any stored message.
     lines = [
         _line(timestamp="2026-01-01T00:00:00Z", type="session_meta", payload={
-            "id": "cdx-inj", "cwd": "/Users/j/code/clync",
+            "id": "cdx-inj", "cwd": "/Users/example/code/clync",
             "originator": "codex-tui", "cli_version": "0.66.0"}),
         _line(timestamp="2026-01-01T00:00:01Z", type="response_item", payload={
             "type": "message", "role": "user", "content": [{"type": "input_text",

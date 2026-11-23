@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from cc import _TITLE_MAX, _TOOL_ARG_MAX, _TOOL_RESULT_HEAD, _repo_and_worktree
+from cc import (NO_ORIGIN_SENDER, _TITLE_MAX, _TOOL_ARG_MAX, _TOOL_RESULT_HEAD,
+                _repo_and_worktree)
 
 CODEX_ROOT = Path(os.environ.get("CLYNC_CODEX_ROOT", Path.home() / ".codex"))
 
@@ -100,7 +101,7 @@ _LEADING_TAG = re.compile(r"<([A-Za-z0-9_-]+)")
 class CodexMessage:
     msg_id: str                # synthesized: f"{session_id}-{running_index}"
     idx: int
-    sender: str                # user | assistant
+    sender: str                # one of cc.SENDER_ROLES' values, or NO_ORIGIN_SENDER
     role_detail: str           # "text" | "reasoning" | "tool_use:<name>" | "tool_result"
     text: str                  # display rendering
     created_at: str | None
@@ -250,7 +251,11 @@ def _clean_response_item(payload: dict) -> tuple[str, str, str] | None:
                 _tool_call_line(payload.get("name"), payload.get("input") or ""))
 
     if ptype in ("function_call_output", "custom_tool_call_output"):
-        return ("user", "tool_result", _render_tool_output(_output_text(payload.get("output"))))
+        # A rollout files a tool's output in the user slot, the way a Claude Code
+        # transcript does. It is the machine's output either way, and the sender is
+        # a read filter, so it carries the sender that means "no human wrote this".
+        return (NO_ORIGIN_SENDER, "tool_result",
+                _render_tool_output(_output_text(payload.get("output"))))
 
     return None    # e.g. ghost_snapshot, agent_message, web_search_call: out of scope
 

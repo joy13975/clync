@@ -4,18 +4,19 @@ description: Operate and troubleshoot the clync sync + hybrid-search tool — ru
 allowed-tools: Bash
 ---
 
-clync syncs the user's claude.ai chats **and** local Claude Code sessions into
-one contained Postgres/pgvector cluster — the single source of truth *and* the
-hybrid semantic+lexical search index. This skill runs and troubleshoots those
-operations from the shell.
+clync syncs the user's chats and local coding sessions into one contained Postgres/pgvector
+cluster — the single source of truth *and* the hybrid semantic+lexical search
+index. This skill runs and troubleshoots those operations from the shell.
 
-## Two sources, one sync
+## Raw sources, one sync
 
-`clync sync` runs claude.ai (network/cookies — fails loud if the profile's
-cookies are stale) **then** local Claude Code ingest (`~/.claude/projects/**/*.jsonl`,
-no network — runs even if the claude.ai leg failed), **then** indexes once. To
-ingest Claude Code sessions only, without touching claude.ai/network at all,
-use `clync sync-cc [--full]`; to sync claude.ai only, use `clync sync-app`.
+`clync sync` runs claude.ai and ChatGPT (network/cookies — each fails loud)
+**then** local Claude Code + Codex CLI + Pi ingest (no network), **then** indexes
+once. To ingest local sessions only, use `clync sync-cc [--full]`,
+`clync sync-codex [--full]` or `clync sync-pi [--full]`; to
+sync one web source only, use `clync sync-app` or `clync sync-chatgpt`.
+Configured OpenCode and Artiport sources also join the sync. See README for their
+configuration and scope; configured-source failures do not block the other sources.
 
 Search is **core** — the BGE-M3 embedder + Postgres client ship with the base
 install (`uv sync`, no extras). There is no `--extra search` step anymore; a
@@ -32,15 +33,17 @@ with `$CLYNC_PG_BIN`).
 
 | Goal | Command | Notes |
 |---|---|---|
-| Sync both sources | `clync sync --profile <ChromeProfile>` | claude.ai then local Claude Code ingest then index. Needs the Chrome profile (or `$CLYNC_PROFILE`) for the claude.ai leg only. `--no-index` to skip indexing, `--full` to refetch/re-parse all. |
-| Sync claude.ai chats only | `clync sync-app --profile <ChromeProfile> [--full] [--no-index]` | claude.ai leg + index; no local Claude Code ingest. Fails loud on stale cookies. |
+| Sync all sources | `clync sync --claude-profile <ClaudeProfile> --chatgpt-profile <ChatGPTProfile>` | claude.ai + ChatGPT from their selected profiles, then local Claude Code + Codex CLI ingest and index. `--no-index` skips indexing; `--full` refetches/re-parses all. |
+| Sync claude.ai chats only | `clync sync-app --claude-profile <ChromeProfile> [--full] [--no-index]` | claude.ai leg + index; no local ingest. Fails loud on stale cookies. |
 | Ingest local Claude Code sessions only | `clync sync-cc [--full] [--no-index]` | No network/cookies needed. Only `entrypoint=="cli"` (interactive) sessions are ingested; subagent transcripts are never read. |
+| Ingest Pi sessions only | `clync sync-pi [--full] [--no-index]` | Reads native JSONL under `CLYNC_PI_ROOT` or the default Pi sessions root. Primary tree history only; no child/tool-output bodies. User-role text is `pi_user`, not verified human authorship. |
+| Ingest OpenCode root sessions only | `clync sync-opencode [--full] [--no-index]` | Requires OpenCode v2; no child/subagent traces, synthetic messages, or tool-result bodies are stored. Active sessions retry on the next sync. |
 | Rebuild the index only | `clync index [--full]` | No network. `--full` re-embeds everything; default is incremental by per-unit content signature. |
-| Search from the shell | `clync search ["<natural query>"] [--source all\|claude_ai\|claude_code] [--repo R] [--worktree W] [--branch B] [--project P] [--model M] [--since/--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | Natural language, not FTS; empty query browses by recency. Returns best chunk per unit with a fused score. A facet that doesn't apply to `--source` fails loud. |
-| List recent units | `clync list [--limit N] [--source all\|claude_ai\|claude_code]` | Most recently updated units, either source. |
+| Search from the shell | `clync search ["<natural query>"] [--source all\|claude_ai\|claude_code\|codex_cli\|chatgpt\|dream] [--repo R] [--worktree W] [--branch B] [--project P] [--model M] [--sender user\|assistant] [--per-unit N] [--since/--until DATE] [--sort relevance\|recency] [--limit N] [--lang en\|ja\|zh]` | Natural language, not FTS; empty query browses by recency. Returns the best chunk per unit (`--per-unit N` for more) with its sender, position and fused score. `--sender user` restricts to the user's own turns, which the assistant's otherwise outrank. A facet that doesn't apply to `--source` fails loud. |
+| List recent units | `clync list [--limit N] [--source all\|claude_ai\|claude_code\|codex_cli\|chatgpt\|dream]` | Most recently updated units, either source. |
 | Health check | `clync doctor` | Reports store (chat/doc/cc counts), search deps, cluster running, indexed chunk count. Exit 1 + a PROBLEMS list if anything's off. |
 | Scheduler status / last sync | `clync status` | Shows last successful sync + launchd state + recent scheduled-run log. |
-| First-time setup / teardown | `clync setup --profile <P>` · `clync unsetup` | setup wires CLI+MCP+scheduler+both skills+cluster; unsetup reverses it, keeping the store + cluster data. |
+| First-time setup / teardown | `clync setup --claude-profile <ClaudeProfile> --chatgpt-profile <ChatGPTProfile>` · `clync unsetup` | setup wires CLI+MCP+scheduler+both skills+cluster; unsetup reverses it, keeping the store + cluster data. |
 | List dream topics | `clync dream topics [--seed] [--all]` | `--seed` inserts the built-in starter topics if not already present; default shows only `active` topics, `--all` includes `proposed`/`retired` too. |
 | Run the nightly (incremental) dream pass | `clync dream run [--max-calls N]` | Triage-gated: only units changed since the watermark are looked at. Digs batch ACROSS nights - a topic is dug once 3 units are pending or the oldest has waited 7 days - so a run that digs nothing is normal, not broken; it prints the deferred backlog. Runs automatically inside `clync scheduled`, right after sync+index — you normally don't invoke it by hand except to test/inspect. The very first run does nothing but initialize the watermark by design (see Troubleshooting). |
 | Mine existing history into a topic | `clync dream backfill [--topic T] [--max-calls N]` | Explicit only, never scheduled — this is the expensive pass (order 100-200 calls for a full first pass across all topics). Resumable: a capped run picks up where it stopped. Also the right tool after adding a topic or rewriting a charter. |
@@ -82,10 +85,11 @@ subscription's rate limits, same as any interactive session.
    session run via `sdk-cli`/`sdk-py`, or a subagent transcript, is out of
    scope by design (ADR 0003), not a bug.
 4. **MCP `search_history` in Claude Code returns stale results / stale tool description** → the MCP server is a long-lived subprocess that loaded the code at session start. **Restart the Claude Code session** to pick up the current code (this also reaps stale `mcp_server.py` processes). The CLI always runs current code.
-5. **Stale results after new chats or coding sessions** → the daily scheduled sync may not have run (Mac asleep). `clync sync --profile <P>` now, or check `clync status`.
+5. **Stale results after new chats or coding sessions** → the daily scheduled sync may not have run (Mac asleep). Run `clync sync --claude-profile <ClaudeProfile> --chatgpt-profile <ChatGPTProfile>` now, or check `clync status`.
 6. **Dream run reports it hit a throttle / was cut short** → this is expected, not a defect — the subscription's rate limit was hit, the run stopped cleanly and recorded its state. Just re-run `clync dream run` (or `clync dream backfill`) later; it resumes from where it stopped rather than re-doing work.
 7. **`clync dream status` shows failed queue items (or `clync doctor`'s `dream` line has a nonzero failed count)** → inspect with `clync dream status`; a failed item keeps its raw error, so read that before re-running. Re-running the same `dream run`/`backfill` retries the outstanding work.
 8. **A topic has `active=0` in `clync dream topics`/`status`** → it has never been distilled. Run `clync dream backfill --topic <id>` to mine it — the nightly `dream run` only digs topics that triage flags as touched by *new* activity, it does not backfill history.
 9. **First `clync dream run` appears to do nothing** → by design. On the very first run there's no watermark yet, so it only initializes the watermark and reports that history mining is `dream backfill`'s job, not the nightly pass's. Use `clync dream backfill` to mine existing history.
+10. **A sync makes the machine unusable** → embedding is the heavy step, capped at `$CLYNC_RESOURCE_FRACTION` of the logical CPUs (default half). Lower it for a quieter run: `CLYNC_RESOURCE_FRACTION=0.25 clync index`. If the GPU is what is being starved, `CLYNC_EMBED_DEVICE=cpu` keeps the run off it entirely — slower, and the only real bound, since Metal has no utilisation fraction (README "Staying out of the way").
 
 Fail-loud everywhere: auth/HTTP/cluster/schema errors raise and exit non-zero — never assume a silent success. Cite the conversation/session name when reporting a search hit; if search is empty, say so rather than inventing history.

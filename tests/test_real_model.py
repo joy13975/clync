@@ -14,7 +14,7 @@ def test_real_model_retrieves_the_right_conversation(pg_test_db):
           ["give me a function that paginates boto3 results generically for all endpoints"])
     _seed("greet", "Japanese greeting", T1, ["おはようございます、今日は良い天気ですね"])
     _seed("memo", "Role change memo", T1,
-          ["please proof-read this memo about my transition off the team lead role"])
+          ["please proof-read this memo about my transition off the coordinator role"])
     search.build_index(full=True)
 
     hits = search.hybrid_search("aws sdk pagination helper", topk=3)
@@ -29,13 +29,15 @@ def test_real_model_daily_chain_embeds_both_sources(pg_test_db, tmp_path, monkey
     import cc
     import clync
     from tests.test_cc import _cli_events, _write_session
+    from tests.test_chatgpt import _FakeCGPTClient, _wire_cgpt
     from tests.test_sync import _FakeClient, _conv, _wire
 
     search = pg_test_db     # no mock_embed -> real embeddings end to end
     per_org = {"org1": {"convs": [_conv(
         "c1", "2026-02-01T00:00:00+00:00",
         "how do I paginate boto3 results generically across all aws endpoints")]}}
-    _wire(monkeypatch, _FakeClient(per_org), [{"uuid": "org1", "name": "Org2"}])
+    _wire(monkeypatch, _FakeClient(per_org), [{"uuid": "org1", "name": "Example Org"}])
+    _wire_cgpt(monkeypatch, _FakeCGPTClient([]))   # the third leg runs, and has nothing
     _write_session(tmp_path / "proj" / "sess-1.jsonl", _cli_events())
     monkeypatch.setattr(cc, "CC_ROOT", tmp_path)
 
@@ -47,3 +49,27 @@ def test_real_model_daily_chain_embeds_both_sources(pg_test_db, tmp_path, monkey
     assert app and app[0]["unit_id"] == "c1"
     cc_hits = {h["unit_id"] for h in search.hybrid_search("design session", source="claude_code", topk=5)}
     assert "sess-1" in cc_hits
+
+
+@pytest.mark.slow
+def test_the_real_embedder_runs_inside_the_resource_cap():
+    """The cap is only worth anything if torch actually honours it once the real
+    model is loaded — it reads OpenMP's count at import but sizes its own two pools
+    itself. Checked in a subprocess: the pools are process-global and set once, so
+    a test sharing this process with an already-loaded torch proves nothing."""
+    import os
+    import subprocess
+    import sys
+
+    import clync
+
+    probe = ("import clync, search; clync.RESOURCE_FRACTION = 0.25;"
+             " search._embed(['a decision about clamps'], max_length=64);"
+             " import torch; print(torch.get_num_threads(), torch.get_num_interop_threads())")
+    env = {k: v for k, v in os.environ.items() if k not in clync._THREAD_VARS}
+    r = subprocess.run([sys.executable, "-c", probe],
+                       cwd=os.path.dirname(os.path.dirname(__file__)),
+                       env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    want = str(max(1, (os.cpu_count() or 1) // 4))
+    assert r.stdout.split() == [want, want], r.stdout

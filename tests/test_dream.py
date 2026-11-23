@@ -10,6 +10,7 @@ attribution, non-circularity, bi-temporal supersession, fail-loud — not access
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -548,6 +549,45 @@ def test_worker_never_persists_a_session(monkeypatch):
     assert seen["argv"][seen["argv"].index("--tools") + 1] == ""
 
 
+@pytest.mark.parametrize("use_helper", [True, False])
+def test_worker_authenticates_with_user_provider_settings(tmp_path, monkeypatch, use_helper):
+    key = "fixture-credential"
+    config = {"env": {"ANTHROPIC_BASE_URL": "https://provider.invalid"},
+              "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "false"}]}]}}
+    if use_helper:
+        config["apiKeyHelper"] = f"printf {key}"
+    else:
+        config["env"]["ANTHROPIC_API_KEY"] = key
+    (tmp_path / "settings.json").write_text(json.dumps(config))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    real_run = subprocess.run
+
+    def authenticated_cli(argv, **kwargs):
+        env = kwargs.get("env", os.environ)
+        settings = (json.loads(argv[argv.index("--settings") + 1])
+                    if "--settings" in argv else {})
+        if ("--setting-sources" not in argv
+                or argv[argv.index("--setting-sources") + 1]):
+            settings = config | settings
+        for group in settings.get("hooks", {}).get("SessionStart", []):
+            for hook in group["hooks"]:
+                result = real_run(hook["command"], shell=True, env=env, capture_output=True)
+                if result.returncode:
+                    return _proc("SessionStart hook failed", result.returncode)
+        credential = env.get("ANTHROPIC_API_KEY")
+        if settings.get("apiKeyHelper"):
+            credential = real_run(settings["apiKeyHelper"], shell=True, env=env,
+                                  capture_output=True, text=True, check=True).stdout
+        if credential != key or env.get("ANTHROPIC_BASE_URL") != config["env"]["ANTHROPIC_BASE_URL"]:
+            return _proc(json.dumps({"is_error": True, "result": "Not logged in"}), 1)
+        return _proc(json.dumps({"subtype": "success", "structured_output": {"answer": "pong"}}))
+
+    monkeypatch.setattr(subprocess, "run", authenticated_cli)
+    out, _ = dream._run_worker("Reply pong.", {}, system="Answer tersely.")
+    assert out == {"answer": "pong"}
+
+
 def test_failed_call_is_recorded_then_reraised(store, monkeypatch):
     def _boom(*a, **k):
         raise dream.DreamError("kaboom")
@@ -979,7 +1019,7 @@ def test_recall_rejects_uninterpretable_as_of_and_limit_with_advice(store):
 
 
 def test_recall_searches_both_layers_by_default_and_labels_them_separately(
-        store, pg_test_db, mock_embed):
+        store, pg_test_db, mock_embed, monkeypatch):
     """The default surface must not make the caller pick a layer: a real question is
     usually both "what did I conclude" and "where did I conclude it". The two stay in
     LABELLED sections rather than one ranking — an insight is scored over a
@@ -987,8 +1027,13 @@ def test_recall_searches_both_layers_by_default_and_labels_them_separately(
     a stray tool log outrank a distilled position while calling both relevance."""
     _persist_one(store)
     pg_test_db.build_index()
+    from unittest.mock import Mock
+    embed = Mock(wraps=pg_test_db._embed)
+    monkeypatch.setattr(pg_test_db, "_embed", embed)
     r = dream.recall(store, "bugs layer prevented")
     assert r["insights"], "the distilled layer must be searched"
+    assert r["raw"], "the raw layer must share the same query embedding"
+    assert embed.call_count == 1, "one query must be embedded only once"
     assert r["include_raw"] is True
     lines = "\n".join(dream.format_recall(r))
     assert "INSIGHTS" in lines and "RAW TRANSCRIPTS" in lines
@@ -1485,7 +1530,8 @@ def test_cmd_scheduled_notifies_loud_and_exits_on_isolated_failure(monkeypatch):
               "calls": 2, "changed": 1, "topics_touched": ["t1"]}
     monkeypatch.setattr(dream, "run_incremental", lambda con: report)
 
-    rc = clync.cmd_scheduled(types.SimpleNamespace(profile="p", org=None))
+    rc = clync.cmd_scheduled(types.SimpleNamespace(
+        claude_profile="ClaudeProfile", chatgpt_profile="ChatGPTProfile", org=None, no_dream=False))
     assert rc == 1
     assert any(level == "fail" for level, _, _ in calls), calls
 

@@ -57,11 +57,11 @@ def test_sync_stores_chats_projects_docs_as_units(pg_test_db, monkeypatch):
                       "created_at": "2026-01-01T00:00:00+00:00",
                       "updated_at": "2026-01-02T00:00:00+00:00"}],
         "docs": {"p1": [{"uuid": "d1", "file_name": "audit.md",
-                         "content": "CNX guy notes",
+                         "content": "example guy notes",
                          "created_at": "2026-01-01T00:00:00+00:00"}]},
     }}
     client = _FakeClient(per_org)
-    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Org2"}])
+    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Example Org"}])
 
     stats = clync.run_sync("prof", None, full=False, download_files=False)
     assert stats["fetched"] == 2 and stats["projects"] == 1 and stats["project_docs"] == 1
@@ -76,7 +76,7 @@ def test_sync_stores_chats_projects_docs_as_units(pg_test_db, monkeypatch):
         # the knowledge doc is a retrievable project_doc unit + one message
         assert _one(con, "SELECT kind FROM units WHERE unit_id='d1'")["kind"] == "project_doc"
         assert _one(con, "SELECT text FROM messages WHERE unit_id='d1'"
-                    )["text"] == "CNX guy notes"
+                    )["text"] == "example guy notes"
     finally:
         con.close()
 
@@ -112,7 +112,7 @@ def test_sync_purges_project_deleted_upstream(pg_test_db, monkeypatch):
                          "created_at": "2026-01-01T00:00:00+00:00"}]},
     }}
     client = _FakeClient(per_org)
-    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Org2"}])
+    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Example Org"}])
 
     clync.run_sync("prof", None, full=False, download_files=False)
     con = clync.connect()
@@ -143,7 +143,7 @@ def test_sync_purges_project_deleted_upstream(pg_test_db, monkeypatch):
 def test_sync_incremental_skips_unchanged(pg_test_db, monkeypatch):
     per_org = {"org1": {"convs": [_conv("c1", "2026-01-01T00:00:00+00:00", "body")]}}
     client = _FakeClient(per_org)
-    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Org2"}])
+    _wire(monkeypatch, client, [{"uuid": "org1", "name": "Example Org"}])
 
     clync.run_sync("prof", None, full=False, download_files=False)      # first: fetches c1
     assert client.fetched == ["c1"]
@@ -163,7 +163,7 @@ def test_sync_scrubs_nul_bytes_everywhere(pg_test_db, monkeypatch):
     conv["chat_messages"][0]["attachments"] = [
         {"file_name": "x.log", "extracted_content": "head\x00tail"}]
     per_org = {"org1": {"convs": [conv]}}
-    _wire(monkeypatch, _FakeClient(per_org), [{"uuid": "org1", "name": "Org2"}])
+    _wire(monkeypatch, _FakeClient(per_org), [{"uuid": "org1", "name": "Example Org"}])
 
     stats = clync.run_sync("prof", None, full=False, download_files=False)
     assert stats["fetched"] == 1
@@ -183,8 +183,8 @@ def test_sync_scrubs_nul_bytes_everywhere(pg_test_db, monkeypatch):
 def test_read_profile_cookies_reads_ciphertext_stored_as_text(tmp_path, monkeypatch):
     """Some Chrome profiles store encrypted_value with TEXT storage class, and
     sqlite3's default text_factory then tries to UTF-8 decode the ciphertext and
-    raises OperationalError before decryption is ever attempted (observed on the
-    'AWS Work' profile). The read must hand the raw bytes to the decryptor."""
+    raises OperationalError before decryption is ever attempted. The read must
+    hand the raw bytes to the decryptor."""
     import sqlite3
 
     cipher = b"v10" + bytes(range(0x80, 0xC0))       # not valid UTF-8
@@ -207,5 +207,27 @@ def test_read_profile_cookies_reads_ciphertext_stored_as_text(tmp_path, monkeypa
 
     monkeypatch.setattr(clync, "_decrypt_cookie", _fake_decrypt)
 
-    assert clync._read_profile_cookies("prof", "%chatgpt.com%") == {"tok": "plaintext"}
+    assert clync._read_profile_cookies("prof", "chatgpt.com") == {"tok": "plaintext"}
     assert seen == [cipher]                          # bytes, not a decode attempt
+
+
+def test_image_identifier_cannot_escape_the_download_directory(pg_test_db, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    files = tmp_path / 'files'
+    monkeypatch.setattr(clync, 'FILES_DIR', files)
+    conv = _conv('chat', '2026-01-01T00:00:00+00:00', 'image upload')
+    conv['chat_messages'][0]['files'] = [{
+        'file_uuid': '../escaped', 'file_kind': 'image', 'preview_url': '/preview',
+    }]
+    client = SimpleNamespace(get_file=lambda url: ('image/webp', b'image bytes'))
+    with clync.connect() as con:
+        clync.upsert_conversation(con, 'org', conv)
+        import pytest
+        with pytest.raises(ValueError, match='identifier'):
+            clync.sync_files(con, client, conv, download=True)
+    assert not (tmp_path / 'escaped.webp').exists()
+    conv['chat_messages'][0]['files'][0]['file_uuid'] = 'safe-id'
+    with clync.connect() as con:
+        assert clync.sync_files(con, client, conv, download=True) == 1
+    assert (files / 'safe-id.webp').read_bytes() == b'image bytes'

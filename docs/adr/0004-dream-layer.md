@@ -71,8 +71,9 @@ is dead on arrival; the layer must be **retrieval-driven**.
 
 ### The constraint that shapes everything: no API quota
 
-There is no Anthropic API billing and there will not be. The only available
-inference is the **local `claude` CLI under the existing subscription OAuth**.
+At design time, the available inference was the **local `claude` CLI under
+subscription OAuth**. Current authentication and billing are documented in
+README's Dream section.
 This was verified, not assumed (2026-07-26, `claude` 2.1.220):
 
 ```sh
@@ -113,7 +114,7 @@ What the field currently does, and where this design deliberately diverges:
 | Background consolidation while idle, strong model for the consolidation pass | Letta **sleep-time compute**; Supermemory **Dynamic Dreaming** | Adopt. Opus for every knowledge judgement; nightly launchd pass after sync+index. |
 | Reflections written back into the *same* retrievable stream as observations | Stanford **Generative Agents** | Adopt. Insights become `units` → indexed by `search.py` for free. |
 | Retrieval = relevance + recency + importance | **Generative Agents** (linear, α=1) | Adopt recency bias in the *dig*, but reject an opaque score blend at query time (see D8). |
-| Bi-temporal validity; contradictions **close a validity window** instead of deleting | **Zep / Graphiti** | Adopt, at insight level. the user's positions evolve — "you used to think X; since May you think Y" is the valuable answer, not an overwrite. |
+| Bi-temporal validity; contradictions **close a validity window** instead of deleting | **Zep / Graphiti** | Adopt, at insight level. The user's positions evolve — "you used to think X; since May you think Y" is the valuable answer, not an overwrite. |
 | Every inference must trace to source or it is rejected | **Supermemory** | Adopt as a hard gate, not a guideline. |
 | Multi-signal promotion gates + phases, only the last phase writes durable memory, audit log | **OpenClaw dreaming** (`minScore .8`, `minRecallCount 3`, `minUniqueQueries 3`) | Adopt the gate concept; replace search-hit-count proxies with **real evidence signals** (distinct source units, time spread, stance). |
 | Recursive abstraction ladder | **RAPTOR** — but its own paper reports ~4% of summaries carry minor hallucinations, and hierarchical merging can amplify them | **Reject recursion.** Exactly ONE derived level: atomic insights from raw evidence, no summary-of-summaries at all (D2). |
@@ -362,9 +363,9 @@ the transcript:
 
 | stance | meaning |
 |---|---|
-| `user_asserted` | the user stated it themselves |
+| `user_asserted` | The user stated it |
 | `user_endorsed` | Claude proposed, the user explicitly accepted / adopted / merged it |
-| `user_rejected` | Claude proposed, the user pushed back — **kept**, because knowing what they rejected and why is knowledge |
+| `user_rejected` | Claude proposed, the user pushed back — **kept**, because knowing what he rejected and why is knowledge |
 | `co_derived` | reached jointly, no clean attribution |
 | `claude_proposed` | in the transcript but never adjudicated — lowest trust |
 

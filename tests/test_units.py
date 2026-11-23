@@ -19,11 +19,11 @@ def _fake_client(orgs):
 
 def test_resolve_orgs_defaults_to_all_chat_capable():
     client = _fake_client([
-        {"uuid": "o1", "name": "Work", "capabilities": ["chat"]},
-        {"uuid": "o2", "name": "Org2", "capabilities": ["raven", "chat"]},
-        {"uuid": "o3", "name": "Org3", "capabilities": ["api"]},
+        {"uuid": "o1", "name": "Workspace One", "capabilities": ["chat"]},
+        {"uuid": "o2", "name": "Workspace Two", "capabilities": ["raven", "chat"]},
+        {"uuid": "o3", "name": "API Workspace", "capabilities": ["api"]},
     ])
-    assert [o["name"] for o in clync.resolve_orgs(client, None)] == ["Work", "Org2"]
+    assert [o["name"] for o in clync.resolve_orgs(client, None)] == ["Workspace One", "Workspace Two"]
 
 
 def test_resolve_orgs_includes_orgs_with_unknown_capabilities():
@@ -47,10 +47,10 @@ def test_resolve_orgs_never_syncs_nothing():
 
 def test_resolve_orgs_explicit_selects_one():
     client = _fake_client([
-        {"uuid": "o1", "name": "Work", "capabilities": ["chat"]},
-        {"uuid": "o2", "name": "Org2", "capabilities": ["chat"]},
+        {"uuid": "o1", "name": "Workspace One", "capabilities": ["chat"]},
+        {"uuid": "o2", "name": "Workspace Two", "capabilities": ["chat"]},
     ])
-    assert [o["uuid"] for o in clync.resolve_orgs(client, "Org2")] == ["o2"]
+    assert [o["uuid"] for o in clync.resolve_orgs(client, "Workspace Two")] == ["o2"]
     assert [o["uuid"] for o in clync.resolve_orgs(client, "o1")] == ["o1"]
 
 
@@ -148,3 +148,58 @@ def test_pg_db_name_rejects_injection_at_import():
                        env=env, capture_output=True, text=True)
     assert r.returncode != 0
     assert "invalid $CLYNC_PG_DB" in (r.stderr + r.stdout)
+
+
+def test_resource_fraction_caps_every_pool_the_embedder_reads(monkeypatch):
+    """A sync must leave the machine usable. The embedder's stack sizes each of its
+    thread pools from the environment at load time and otherwise takes every core, so
+    the fraction has to reach ALL of them, not just torch's."""
+    import clync
+    for var in clync._THREAD_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(clync, "RESOURCE_FRACTION", 0.5)
+
+    applied = clync.limit_resources()
+    want = max(1, (os.cpu_count() or 1) // 2)
+    assert {applied[v] for v in clync._THREAD_VARS} == {str(want)}
+    # applied to the environment itself, which is where the pools read it
+    assert os.environ["OMP_NUM_THREADS"] == str(want)
+
+
+def test_an_exported_thread_count_wins_over_the_fraction(monkeypatch):
+    # The fraction is a default, not an override: a user who set a pool size meant it.
+    import clync
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    monkeypatch.setattr(clync, "RESOURCE_FRACTION", 1.0)
+    assert clync.limit_resources()["OMP_NUM_THREADS"] == "3"
+
+
+def test_a_fraction_below_one_core_still_leaves_one(monkeypatch):
+    import clync
+    for var in clync._THREAD_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(clync, "RESOURCE_FRACTION", 0.001)
+    assert clync.limit_resources()["OMP_NUM_THREADS"] == "1"
+
+
+@pytest.mark.parametrize('host,reader,auth_name', [
+    ('claude.ai', clync.read_auth_cookies, 'sessionKey'),
+    ('chatgpt.com', clync.read_chatgpt_cookies, clync.chatgpt_mod_session_cookie()),
+])
+def test_cookie_lookup_excludes_lookalike_domains(tmp_path, monkeypatch, host, reader, auth_name):
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / 'Cookies') as con:
+        con.execute('CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB)')
+        con.executemany('INSERT INTO cookies VALUES (?,?,?)', [
+            ('.' + host, auth_name, b'sk-ant-sid-legitimate'),
+            (host, 'cf_clearance', b'legitimate-clearance'),
+            (host + '.attacker.invalid', auth_name, b'sk-ant-sid-attacker'),
+            ('not' + host, 'cf_clearance', b'attacker-clearance'),
+        ])
+    monkeypatch.setattr(clync, 'resolve_profile_dir', lambda profile: tmp_path)
+    monkeypatch.setattr(clync, '_safe_storage_key', lambda: b'unused')
+    monkeypatch.setattr(clync, '_decrypt_cookie', lambda value, key: value.decode())
+    cookies = reader('Test profile')
+    assert cookies[auth_name] == 'sk-ant-sid-legitimate'
+    assert cookies['cf_clearance'] == 'legitimate-clearance'

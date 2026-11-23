@@ -3,9 +3,7 @@ name = "clync"
 version = "0.2.0"
 description = "Headless sync of claude.ai chats + local Claude Code sessions into a contained Postgres/pgvector store, hybrid-searchable over MCP."
 requires-python = ">=3.11"
-# Search is core (ADR 0003): the BGE-M3 embedder + Postgres client ship with the
-# base install — the contained PG17+pgvector cluster is clync's single source of
-# truth AND search index, so there is no lighter search-free mode to preserve.
+# Archive dependencies; the standalone live CLI uses the standard library and rg.
 dependencies = [
     "cryptography>=42",
     "curl_cffi>=0.7",

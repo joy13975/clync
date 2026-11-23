@@ -253,7 +253,10 @@ class _ScriptedSession:
 
     def get(self, url, **kw):
         self.calls += 1
-        return self._responses.pop(0) if self._responses else _FakeResp(200)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _scripted_client(monkeypatch, responses):
@@ -264,7 +267,147 @@ def _scripted_client(monkeypatch, responses):
     return c
 
 
+def test_request_browser_identity_matches_impersonation():
+    import json
+    import re
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    class CaptureHeaders(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(dict(self.headers)).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    with HTTPServer(('127.0.0.1', 0), CaptureHeaders) as server:
+        server.timeout = 1
+        client = chatgpt.ChatGPTClient({})
+        thread = Thread(target=server.handle_request, daemon=True)
+        try:
+            thread.start()
+            headers = client._request(
+                f'http://127.0.0.1:{server.server_port}/', bearer=None).json()
+        finally:
+            client._s.close()
+            thread.join(timeout=5)
+        assert not thread.is_alive()
+        headers = {k.lower(): v for k, v in headers.items()}
+        chrome = re.search(r'Chrome/(\d+)', headers['user-agent']).group(1)
+        chromium = re.search(r'"Chromium";v="(\d+)"', headers['sec-ch-ua']).group(1)
+        assert chrome == chromium
+
+
+@pytest.mark.parametrize('challenge', [False, True])
+def test_forbidden_is_not_diagnosed_as_expired_login(monkeypatch, challenge):
+    response = _FakeResp(403, '<html>Just a moment...</html>' if challenge else
+                         '{"detail":"Forbidden"}')
+    response.headers['Content-Type'] = 'text/html' if challenge else 'application/json'
+    if challenge:
+        response.headers['cf-mitigated'] = 'challenge'
+    client = _scripted_client(monkeypatch, [response] * chatgpt._MAX_ATTEMPTS)
+    url = f'{chatgpt.CHATGPT_HOST}/backend-api/conversations'
+    with pytest.raises(RuntimeError) as exc:
+        client._request(url, bearer='secret-token')
+    error = str(exc.value)
+    assert url in error
+    assert '403' in error
+    assert 'expired' not in error
+    assert 'LOG IN' not in error
+    assert 'secret-token' not in error
+    assert client._s.calls == chatgpt._MAX_ATTEMPTS
+    if challenge:
+        assert 'Cloudflare challenge' in error
+    else:
+        assert 'Forbidden' in error
+
+
+def test_request_survives_observed_cloudflare_retry_exhaustion(monkeypatch):
+    import time
+    response = _FakeResp(403, '<html>Cloudflare challenge</html>')
+    response.headers.update({'Content-Type': 'text/html; charset=UTF-8',
+                             'cf-mitigated': 'challenge'})
+    client = _scripted_client(monkeypatch, [response] * 8 + [
+        _FakeResp(200, '{"items": [{"id": "recovered"}], "total": 1}')])
+    sleeps = []
+    monkeypatch.setattr(time, 'sleep', sleeps.append)
+    monkeypatch.setattr(chatgpt, 'REQUEST_PACING_S', 0)
+    page = client._request(
+        f'{chatgpt.CHATGPT_HOST}/backend-api/conversations?offset=0&limit=100&order=updated',
+        bearer='secret-token').json()
+    assert page['items'][0]['id'] == 'recovered'
+    assert client._s.calls == 9
+    assert sleeps == [4, 8, 16, 32, 60, 60, 60, 60]
+
+
 _JWKS_503 = '{"detail":"Unable to fetch authentication verification keys."}'
+
+
+def _timeout():
+    from curl_cffi.const import CurlECode
+    from curl_cffi.requests.exceptions import Timeout
+    return Timeout(
+        "Failed to perform, curl: (28) Operation timed out after 30002 milliseconds "
+        "with 0 bytes received.", CurlECode.OPERATION_TIMEDOUT)
+
+
+def test_request_retries_timeout_and_http_failure_then_succeeds(monkeypatch, caplog):
+    import time
+    unavailable = _FakeResp(503, _JWKS_503)
+    unavailable.headers["Retry-After"] = "7"
+    c = _scripted_client(monkeypatch, [
+        _timeout(), unavailable, _timeout(), _FakeResp(200, '{"items": [1]}')])
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    monkeypatch.setattr(chatgpt, "REQUEST_PACING_S", 0)
+    assert c._request("https://x/backend-api/conversations", bearer="t").json() == {
+        "items": [1]}
+    assert c._s.calls == 4
+    assert sleeps == [4.0, 7.0, 8.0]
+    assert "timed out" in caplog.text
+
+
+def test_request_persistent_timeout_fails_with_cause_and_endpoint(monkeypatch):
+    failure = _timeout()
+    c = _scripted_client(monkeypatch, [failure] * chatgpt._MAX_ATTEMPTS)
+    url = "https://x/backend-api/conversations"
+    with pytest.raises(RuntimeError, match="timed out") as exc:
+        c._request(url, bearer="secret-token")
+    assert c._s.calls == chatgpt._MAX_ATTEMPTS
+    assert exc.value.__cause__ is failure
+    assert url in str(exc.value)
+    assert "secret-token" not in str(exc.value)
+
+
+@pytest.mark.parametrize("timeout_first", [True, False])
+def test_timeout_and_http_errors_share_attempt_budget(monkeypatch, timeout_first):
+    errors = [_timeout(), _FakeResp(503, _JWKS_503)]
+    responses = (errors if timeout_first else errors[::-1]) * chatgpt._MAX_ATTEMPTS
+    c = _scripted_client(monkeypatch, responses)
+    with pytest.raises(RuntimeError):
+        c._request("https://x/backend-api/conversations", bearer="t")
+    assert c._s.calls == chatgpt._MAX_ATTEMPTS
+
+
+def test_request_does_not_retry_certificate_errors(monkeypatch):
+    from curl_cffi.requests.exceptions import CertificateVerifyError
+    failure = CertificateVerifyError("certificate invalid")
+    c = _scripted_client(monkeypatch, [failure])
+    with pytest.raises(CertificateVerifyError) as exc:
+        c._request("https://x/backend-api/conversations", bearer="t")
+    assert exc.value is failure
+    assert c._s.calls == 1
+
+
+@pytest.mark.parametrize("status", [400, 401])
+def test_timeout_does_not_make_permanent_http_errors_retryable(monkeypatch, status):
+    c = _scripted_client(monkeypatch, [_timeout(), _FakeResp(status), _FakeResp(200)])
+    with pytest.raises(RuntimeError, match=str(status)):
+        c._request("https://x/backend-api/conversations", bearer="t")
+    assert c._s.calls == 2
 
 
 def test_request_retries_a_backend_5xx_then_succeeds(monkeypatch):
@@ -387,3 +530,150 @@ def test_ingest_chatgpt_reconcile_scoped_to_source(pg_test_db, monkeypatch):
             "SELECT COUNT(*) n FROM units WHERE source='claude_ai'").fetchone()["n"] == 1
     finally:
         con.close()
+
+
+def _project_client(monkeypatch, pages, pairs):
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+    client = chatgpt.ChatGPTClient({}, 'prof')
+    monkeypatch.setattr(client, '_access_token', lambda: 'test-token')
+
+    def request(url, *, bearer):
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query)
+        page = query.get('cursor', query.get('offset', [None]))[0]
+        key = (parsed.path.removeprefix('/backend-api'), None if page == '0' else page)
+        response = pages[key]
+        if isinstance(response, Exception):
+            raise response
+        return _FakeResp(200, json.dumps(response))
+
+    monkeypatch.setattr(client, '_request', request)
+    monkeypatch.setattr(client, 'get_conversation', _FakeCGPTClient(pairs).get_conversation)
+    _wire_cgpt(monkeypatch, client)
+    return client
+
+
+def _project(pid, name):
+    return {'gizmo': {'gizmo': {'id': pid, 'display': {'name': name}}},
+            'conversations': {'items': [], 'cursor': None}}
+
+
+def test_project_threads_paginate_merge_and_remain_searchable(pg_test_db, mock_embed, monkeypatch):
+    search = pg_test_db
+    pairs = [_pair(f'project-{i}', '2026-08-15T05:00:00Z', 'project budget', f'answer {i}')
+             for i in range(3)]
+    ordinary = _pair('ordinary', '2026-08-15T05:00:00Z', 'loose question', 'loose answer')
+    # Shapes from the live sidebar and per-project endpoints; identities are anonymized.
+    pages = {
+        ('/conversations', None): {'items': [ordinary[0], pairs[0][0]], 'total': 2},
+        ('/gizmos/snorlax/sidebar', None): {
+            'items': [_project('g-p-one', 'Finance')], 'cursor': 'projects+next='},
+        ('/gizmos/snorlax/sidebar', 'projects+next='): {
+            'items': [_project('g-p-two', 'House')], 'cursor': None},
+        ('/gizmos/g-p-one/conversations', None): {
+            'items': [pairs[0][0]], 'cursor': 'threads+next='},
+        ('/gizmos/g-p-one/conversations', 'threads+next='): {
+            'items': [pairs[1][0]], 'cursor': None},
+        ('/gizmos/g-p-two/conversations', None): {'items': [pairs[2][0]], 'cursor': None},
+    }
+    client = _project_client(monkeypatch, pages, [ordinary, *pairs])
+    stats = clync.ingest_chatgpt('prof')
+    assert stats['conversations_in_db'] == 4
+    assert stats['fetched'] == 4
+    search.build_index()
+    hits = search.hybrid_search('budget', source='chatgpt', project='Finance', topk=10)
+    assert {h['unit_id'] for h in hits} == {'project-0', 'project-1'}
+    with clync.connect() as con:
+        assert con.execute("SELECT count(*) AS n FROM messages WHERE unit_id='project-1'").fetchone()['n'] == 2
+
+    # Renaming/moving a project does not necessarily change a conversation's update_time.
+    pages[('/gizmos/snorlax/sidebar', None)]['items'][0] = _project('g-p-one', 'Renamed')
+    pages[('/gizmos/g-p-one/conversations', None)]['items'] = []
+    pages[('/conversations', None)]['items'] = [ordinary[0], pairs[0][0]]
+    monkeypatch.setattr(client, 'get_conversation', lambda cid: pytest.fail('unchanged detail fetched'))
+    stats = clync.ingest_chatgpt('prof')
+    assert stats['unchanged'] == 4 and stats['conversations_removed'] == 0
+    search.build_index()
+    assert {h['unit_id'] for h in search.hybrid_search(
+        'budget', source='chatgpt', project='Renamed', topk=10)} == {'project-1'}
+    assert {h['unit_id'] for h in search.hybrid_search(
+        '', source='chatgpt', project='none', topk=10)} == {'ordinary', 'project-0'}
+
+
+@pytest.mark.parametrize('broken', [
+    RuntimeError('project endpoint unavailable'),
+    {'cursor': None},
+    {'items': [], 'cursor': 'repeated'},
+    'truncated general listing',
+])
+def test_incomplete_listing_cannot_delete_stored_threads(pg_test_db, monkeypatch, broken):
+    pair = _pair('preserved', '2026-08-15T05:00:00Z', 'important prompt', 'important answer')
+    with monkeypatch.context() as seed_patch:
+        _wire_cgpt(seed_patch, _FakeCGPTClient([pair]))
+        clync.ingest_chatgpt('prof')
+    pages = {
+        ('/conversations', None): {'items': [], 'total': 0},
+        ('/gizmos/snorlax/sidebar', None): {
+            'items': [_project('g-p-one', 'Finance')], 'cursor': None},
+        ('/gizmos/g-p-one/conversations', None): broken,
+        ('/gizmos/g-p-one/conversations', 'repeated'): broken,
+    }
+    if broken == 'truncated general listing':
+        pages[('/conversations', None)] = {'items': [], 'total': 1}
+        pages[('/gizmos/snorlax/sidebar', None)] = {'items': [], 'cursor': None}
+    _project_client(monkeypatch, pages, [])
+    with pytest.raises((RuntimeError, KeyError, ValueError)):
+        clync.ingest_chatgpt('prof')
+    with clync.connect() as con:
+        assert con.execute("SELECT count(*) AS n FROM messages WHERE unit_id=%s",
+                           (pair[0]['id'],)).fetchone()['n'] == 2
+
+
+def test_general_pagination_uses_total_when_server_returns_short_pages(monkeypatch):
+    pairs = [_pair(str(i), '2026-08-15T05:00:00Z', 'question', 'answer') for i in range(2)]
+    pages = {
+        ('/conversations', None): {'items': [pairs[0][0]], 'total': 2},
+        ('/conversations', '1'): {'items': [pairs[1][0]], 'total': 2},
+        ('/gizmos/snorlax/sidebar', None): {'items': [], 'cursor': None},
+    }
+    client = _project_client(monkeypatch, pages, pairs)
+    assert [c['id'] for c in client.iter_conversations()] == [p[0]['id'] for p in pairs]
+
+
+def test_general_pagination_refreshes_the_reported_total(monkeypatch):
+    pairs = [_pair(str(i), '2026-08-15T05:00:00Z', 'question', 'answer') for i in range(201)]
+    pages = {
+        ('/conversations', None): {'items': [p[0] for p in pairs[:100]], 'total': 101},
+        ('/conversations', '100'): {'items': [p[0] for p in pairs[100:200]], 'total': 201},
+        ('/conversations', '200'): {'items': [pairs[200][0]], 'total': 201},
+        ('/gizmos/snorlax/sidebar', None): {'items': [], 'cursor': None},
+    }
+    client = _project_client(monkeypatch, pages, pairs)
+    assert [c['id'] for c in client.iter_conversations()] == [p[0]['id'] for p in pairs]
+
+
+def test_projects_only_import_preserves_ordinary_history_and_reconciles_moves(pg_test_db, monkeypatch):
+    ordinary = _pair('ordinary', '2026-08-15T05:00:00Z', 'ordinary prompt', 'ordinary answer')
+    moved = _pair('moved', '2026-08-15T05:00:00Z', 'moved prompt', 'moved answer')
+    deleted = _pair('deleted', '2026-08-15T05:00:00Z', 'deleted prompt', 'deleted answer')
+    for meta, _ in (moved, deleted):
+        meta.update(project_uuid='g-p-one', project_name='Finance')
+    _wire_cgpt(monkeypatch, _FakeCGPTClient([ordinary, moved, deleted]))
+    clync.ingest_chatgpt('prof')
+
+    moved[0].update(project_uuid=None, project_name=None)
+    new_project = _pair('new-project', '2026-08-16T05:00:00Z', 'new budget', 'new answer')
+    new_project[0].update(project_uuid='g-p-one', project_name='Finance')
+    new_ordinary = _pair('new-ordinary', '2026-08-16T05:00:00Z', 'outside scope', 'not imported')
+    _wire_cgpt(monkeypatch, _FakeCGPTClient([moved, new_project, new_ordinary]))
+    stats = clync.ingest_chatgpt('prof', projects_only=True)
+    assert stats['fetched'] == 1 and stats['unchanged'] == 1
+    assert stats['conversations_removed'] == 1
+    with clync.connect() as con:
+        rows = con.execute("SELECT unit_id, project_uuid FROM units WHERE source='chatgpt'").fetchall()
+        assert {r['unit_id']: r['project_uuid'] for r in rows} == {
+            'ordinary': None, 'moved': None, 'new-project': new_project[0]['project_uuid']}
+        assert con.execute("SELECT text FROM messages WHERE unit_id=%s AND sender='user'",
+                           (ordinary[0]['id'],)).fetchone()['text'] == 'ordinary prompt'

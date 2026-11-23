@@ -1,14 +1,22 @@
-"""clync — headless history sync + hybrid search.
+"""clync — history sync, semantic archive, and live lexical session finding.
 
-Two sources, one contained store (ADR 0003):
-  * claude.ai chats — reads auth cookies live from a named Chrome profile, clears
-    Cloudflare via curl_cffi TLS impersonation, upserts conversations + project
-    docs (incremental by `updated_at`).
+Raw sources, one contained store (ADR 0003):
+  * claude.ai chats — reads auth cookies live from the selected Chrome profile,
+    clears Cloudflare via curl_cffi TLS impersonation, and upserts conversations
+    + project docs (incremental by `updated_at`).
+  * ChatGPT web history — reads auth cookies live from the selected Chrome
+    profile and upserts conversations (see chatgpt.py).
   * local Claude Code sessions — cleaned + metadata-extracted from
     `~/.claude/projects/**/*.jsonl` (see cc.py); no network / cookies.
+  * local Codex CLI sessions — parsed from `~/.codex/**/*.jsonl` (see codex.py);
+    no network / cookies.
+  * local Pi sessions — cleaned by pi_source.py; no network / cookies.
+  * configured OpenCode v2 root transcripts (opencode_source.py) and Artiport
+    artifacts (artiport_source.py); see README for setup and scope.
 
-Both land in a contained Postgres 17 + pgvector cluster (single source of truth
+Archive sources land in a contained Postgres 17 + pgvector cluster (single source of truth
 AND search index) as unified `units` + `messages`, embedded by search.py.
+The independent `sessions` commands read native sources without that archive.
 
 Fail-loud by contract: any auth/HTTP/schema problem raises and the process exits
 non-zero. The scheduled path additionally surfaces failures as a macOS
@@ -20,23 +28,25 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
+import shlex
 import shutil
 import sqlite3          # Chrome's cookie store is SQLite; clync's own store is Postgres
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from curl_cffi import requests as creq
-
-PROFILE_ENV = "CLYNC_PROFILE"  # deployment sets this (e.g. in the launchd plist)
-LOCAL_ONLY_ENV = "CLYNC_LOCAL_ONLY"  # set by an install that DELIBERATELY has no
-# claude.ai profile, so a *missing* profile stays a loud error while a *chosen*
-# Claude-Code-only install runs its local legs without nagging every night.
+# Network sources use separate Chrome identities: Claude.ai is the work account,
+# while ChatGPT is the personal account. Keeping these as distinct settings makes
+# an accidental cross-account sync impossible at the scheduler boundary.
+CLAUDE_PROFILE_ENV = "CLYNC_CLAUDE_PROFILE"
+CHATGPT_PROFILE_ENV = "CLYNC_CHATGPT_PROFILE"
 CHROME_DIR = Path.home() / "Library/Application Support/Google/Chrome"
 
 # Runtime state root (DB cluster, downloaded images, scheduled log). Everything
@@ -53,19 +63,15 @@ PG_DIR = DATA_HOME / "pg"
 PG_DATA = PG_DIR / "data"
 PG_LOG = PG_DIR / "postmaster.log"
 PG17_BIN_CANDIDATES = (
-    "/opt/homebrew/opt/postgresql@17/bin",   # Homebrew, Apple Silicon
-    "/usr/local/opt/postgresql@17/bin",      # Homebrew, Intel
+    "/opt/homebrew/opt/postgresql@17/bin",
+    "/usr/local/opt/postgresql@17/bin",
 )
 
 
 def _default_pg_bin() -> str:
-    """First PG17 bin dir that actually holds `initdb`, among the known Homebrew
-    prefixes. $CLYNC_PG_BIN overrides for any other layout (MacPorts, Postgres.app,
-    a source build). On a total miss we return the first candidate so that `_pg()`
-    raises its own actionable error rather than failing somewhere less obvious."""
-    for c in PG17_BIN_CANDIDATES:
-        if (Path(c) / "initdb").exists():
-            return c
+    for candidate in PG17_BIN_CANDIDATES:
+        if (Path(candidate) / "initdb").exists():
+            return candidate
     return PG17_BIN_CANDIDATES[0]
 
 
@@ -74,11 +80,31 @@ PG_PORT = int(os.environ.get("CLYNC_PG_PORT", "54329"))
 PG_DB = os.environ.get("CLYNC_PG_DB", "clync")
 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", PG_DB):
     raise SystemExit(f"invalid $CLYNC_PG_DB {PG_DB!r} — must match [A-Za-z_][A-Za-z0-9_]*")
-# The cluster's superuser: initdb CREATES this role, so every client — psycopg
-# and the psql subprocesses alike — must connect AS it rather than inheriting
-# libpq's OS-user default, which diverges wherever $USER is unset (launchd,
-# cron, CI, containers) and leaves initdb and psql disagreeing about the role.
 PG_USER = os.environ.get("USER", "postgres")
+PG_LOCALE = "en_US.UTF-8"
+
+# Share of the machine's CPUs a sync may take. The embedder is the heavy consumer
+# and sizes itself to the whole machine unless told otherwise.
+RESOURCE_FRACTION = float(os.environ.get("CLYNC_RESOURCE_FRACTION", "0.5"))
+# Every thread-pool knob the embedder's stack reads at load time: torch/OpenMP,
+# Apple's vecLib, numexpr, and the Rust tokenizer's rayon pool.
+_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "RAYON_NUM_THREADS")
+
+
+def limit_resources() -> dict[str, str]:
+    """Cap this process's CPU share to `RESOURCE_FRACTION`, and return the counts in
+    force. Call it BEFORE importing torch: the thread pools are sized at load time
+    from these variables and ignore a later change. An explicitly exported value
+    always wins — this sets a default, it does not override config.
+
+    CPU only. Metal exposes no utilisation fraction, so the GPU is bounded by
+    running the embedder on the CPU instead (`$CLYNC_EMBED_DEVICE`); its watermark
+    ratios bound memory, not utilisation."""
+    threads = max(1, int((os.cpu_count() or 1) * RESOURCE_FRACTION))
+    for var in _THREAD_VARS:
+        os.environ.setdefault(var, str(threads))
+    return {v: os.environ[v] for v in _THREAD_VARS}
 
 HOST = "https://claude.ai"
 BASE = f"{HOST}/api"
@@ -93,13 +119,12 @@ AUTH_COOKIE_NAMES = ("sessionKey", "cf_clearance")
 REQUEST_PACING_S = 0.4  # polite gap between requests so a large sync isn't rate-limited
 DEFAULT_TOPK = 10       # SSOT for the default result count (CLI, MCP tool, search.TOPK)
 # SSOT for the `source` facet values (CLI argparse choices + search validation).
-# `all` deliberately means RAW ONLY (claude_ai + claude_code + codex_cli + chatgpt).
 # The Dream layer (ADR 0004) is reachable via source='dream' or the combined
 # `search_history` surface, never by accident: that keeps every pre-existing query's
 # meaning intact AND makes non-circularity the default — the dig cannot retrieve its
 # own output.
-VALID_SOURCES = ("all", "claude_ai", "claude_code", "codex_cli", "chatgpt", "dream")
-RAW_SOURCES = ("claude_ai", "claude_code", "codex_cli", "chatgpt")
+RAW_SOURCES = ("claude_ai", "claude_code", "codex_cli", "chatgpt", "artiport", "opencode", "pi")
+VALID_SOURCES = ("all", *RAW_SOURCES, "dream")
 
 
 def resolve_sources(source: str) -> list[str]:
@@ -113,13 +138,17 @@ def resolve_sources(source: str) -> list[str]:
 
 REPO_DIR = Path(__file__).resolve().parent
 LAUNCHD_LABEL = "io.clync.sync"
+NO_DREAM_FLAG = "--no-dream"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+PG_LAUNCHD_LABEL = "io.clync.postgres"
+PG_PLIST_PATH = PLIST_PATH.with_name(f"{PG_LAUNCHD_LABEL}.plist")
 SCHED_LOG = DATA_HOME / "scheduled.log"
 LATE_THRESHOLD_H = 25  # a >25h gap since last success means a daily run was missed
 
 
 # --------------------------------------------------------------------------- #
-# Chrome cookie extraction (auth cookies are per-Chrome-profile, hence --profile)
+# Chrome cookie extraction (auth cookies are per-Chrome-profile; each network
+# source has its own explicit profile flag)
 # --------------------------------------------------------------------------- #
 def _safe_storage_key() -> bytes:
     out = subprocess.run(
@@ -136,6 +165,7 @@ def _safe_storage_key() -> bytes:
 
 
 def _decrypt_cookie(enc: bytes, key: bytes) -> str:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     if enc[:3] != b"v10":
         raise RuntimeError(
             f"Cookie encryption prefix {enc[:3]!r} is not the decryptable 'v10' "
@@ -155,7 +185,7 @@ def _decrypt_cookie(enc: bytes, key: bytes) -> str:
 
 
 def resolve_profile_dir(display_name: str) -> Path:
-    """Map a Chrome profile *display name* (e.g. 'Person 1') to its directory."""
+    """Map a Chrome profile *display name* (e.g. 'Research') to its directory."""
     local_state = json.loads((CHROME_DIR / "Local State").read_text())
     cache = local_state.get("profile", {}).get("info_cache", {})
     matches = [d for d, info in cache.items() if info.get("name") == display_name]
@@ -167,7 +197,7 @@ def resolve_profile_dir(display_name: str) -> Path:
     return CHROME_DIR / matches[0]
 
 
-def _read_profile_cookies(profile_display_name: str, host_like: str,
+def _read_profile_cookies(profile_display_name: str, host: str,
                           names: tuple[str, ...] | None = None,
                           tolerant: bool = False) -> dict[str, str]:
     """Live-read + decrypt a Chrome profile's cookies for a host. `names` limits
@@ -185,17 +215,16 @@ def _read_profile_cookies(profile_display_name: str, host_like: str,
     # CAST(... AS BLOB) is load-bearing: some profiles store encrypted_value with
     # TEXT storage class, and sqlite3's default text_factory then tries to UTF-8
     # decode the ciphertext and raises OperationalError before we ever decrypt it
-    # (observed: the 'AWS Work' profile -> "Could not decode to UTF-8 column
-    # 'encrypted_value'"). The CAST keeps `name` a str while forcing bytes here.
+    # The CAST keeps `name` a str while forcing bytes here.
     if names:
         placeholders = ",".join("?" * len(names))
         sql = ("SELECT name, CAST(encrypted_value AS BLOB) FROM cookies "
-               f"WHERE host_key LIKE ? AND name IN ({placeholders})")
-        params: tuple = (host_like, *names)
+               f"WHERE host_key IN (?, ?) AND name IN ({placeholders})")
+        params: tuple = (host, "." + host, *names)
     else:
         sql = ("SELECT name, CAST(encrypted_value AS BLOB) FROM cookies "
-               "WHERE host_key LIKE ?")
-        params = (host_like,)
+               "WHERE host_key IN (?, ?)")
+        params = (host, "." + host)
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "Cookies"  # copy to dodge Chrome's live lock
         shutil.copy2(cookies_db, snapshot)
@@ -220,7 +249,7 @@ def read_auth_cookies(profile_display_name: str) -> dict[str, str]:
     Read fresh every run, so sessionKey + cf_clearance are always as current as
     the browser's last claude.ai activity — that is the freshness mechanism.
     """
-    cookies = _read_profile_cookies(profile_display_name, "%claude.ai%",
+    cookies = _read_profile_cookies(profile_display_name, "claude.ai",
                                     AUTH_COOKIE_NAMES)
     if "sessionKey" not in cookies:
         raise RuntimeError(
@@ -238,7 +267,7 @@ def read_chatgpt_cookies(profile_display_name: str) -> dict[str, str]:
     cookies ride along; the session-token cookie is the load-bearing credential
     and its absence fails loud. Read fresh every run for freshness (mirror of
     read_auth_cookies)."""
-    cookies = _read_profile_cookies(profile_display_name, "%chatgpt.com%",
+    cookies = _read_profile_cookies(profile_display_name, "chatgpt.com",
                                     names=None, tolerant=True)
     base = chatgpt_mod_session_cookie()
     # next-auth splits an oversized session token into <name>.0, <name>.1, …
@@ -265,6 +294,7 @@ def chatgpt_mod_session_cookie() -> str:
 # --------------------------------------------------------------------------- #
 class ClaudeClient:
     def __init__(self, cookies: dict[str, str], profile: str | None = None):
+        from curl_cffi import requests as creq
         self._s = creq.Session()
         for name, value in cookies.items():
             self._s.cookies.set(name, value, domain=".claude.ai")
@@ -378,14 +408,18 @@ def resolve_orgs(client: ClaudeClient, org_ref: str | None) -> list[dict]:
 # no-join filtering). The vector `chunks`/`indexed_units` tables are created by
 # search.ensure_index_schema (it owns DENSE_DIM/SPARSE_DIM); this module owns the
 # raw store + cluster lifecycle.
-RAW_SCHEMA = """
+# Shared predicate for messages that can be rendered/embedded (SSOT for partial
+# index below and Dream's renderability checks).
+NONEMPTY_MSG_SQL = "btrim(coalesce(embed_text, text, '')) <> ''"
+
+RAW_SCHEMA = f"""
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS units (
     unit_id      text PRIMARY KEY,
-    kind         text NOT NULL,          -- chat | project_doc | cc_session | codex_session | chatgpt
-    source       text NOT NULL,          -- claude_ai | claude_code | codex_cli | chatgpt
+    kind         text NOT NULL,
+    source       text NOT NULL,
     title        text,
     summary      text,
     model        text,
@@ -431,6 +465,8 @@ CREATE TABLE IF NOT EXISTS messages (
     raw         jsonb,
     PRIMARY KEY (unit_id, msg_id)
 );
+CREATE INDEX IF NOT EXISTS idx_messages_nonempty
+    ON messages(unit_id, sender) WHERE {NONEMPTY_MSG_SQL};
 
 CREATE TABLE IF NOT EXISTS projects (
     uuid        text PRIMARY KEY,
@@ -456,10 +492,8 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_unit ON files(unit_id);
 
--- Per-file incremental watermark for the local file-based ingests (Claude Code
--- AND Codex CLI): a transcript is re-parsed only when its mtime/size changes. The
--- `source` column partitions the two — each ingest loads and reconciles only its
--- own source's rows, so file_paths and deletion reconciliation never cross sources.
+-- Per-file incremental watermarks are partitioned by `source`; deletion
+-- reconciliation must never cross sources.
 CREATE TABLE IF NOT EXISTS cc_sync_state (
     file_path  text PRIMARY KEY,
     mtime      double precision,
@@ -497,9 +531,6 @@ def _pg(binary: str) -> str:
 
 
 def _vector_control_present() -> bool:
-    # Homebrew keeps it either under the versioned formula prefix or in the
-    # brew-wide share dir; both are derived from PG_BIN so a non-default
-    # $CLYNC_PG_BIN keeps working.
     roots = [PG_BIN.parent]
     if len(PG_BIN.parents) > 2:
         roots.append(PG_BIN.parents[2])
@@ -513,16 +544,72 @@ def cluster_running() -> bool:
     return r.returncode == 0
 
 
+def postgres_command() -> list[str]:
+    return [_pg("postgres"), "-D", str(PG_DATA), "-p", str(PG_PORT),
+            "-c", "listen_addresses=localhost", "-c", f"unix_socket_directories={PG_DIR}"]
+
+
 def start_cluster() -> None:
+    if (PG_PLIST_PATH.exists()
+            and plistlib.loads(PG_PLIST_PATH.read_bytes())["ProgramArguments"] == postgres_command()):
+        subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{PG_LAUNCHD_LABEL}"],
+                       check=True, capture_output=True, text=True)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready = subprocess.run(
+                [_pg("pg_isready"), "-h", "localhost", "-p", str(PG_PORT), "-d", "postgres"],
+                capture_output=True, text=True)
+            if ready.returncode == 0 and cluster_running():
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f"{PG_LAUNCHD_LABEL} did not become ready; inspect {PG_LOG}")
     if cluster_running():
         return
     PG_DIR.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [_pg("pg_ctl"), "-D", str(PG_DATA), "-l", str(PG_LOG),
-         "-o", f"-p {PG_PORT} -c listen_addresses=localhost "
-               f"-c unix_socket_directories={PG_DIR}",
+         "-o", shlex.join(postgres_command()[3:]),
          "-w", "start"],
-        check=True)
+        check=True, stdout=sys.stderr)
+
+
+def install_cluster_service() -> None:
+    init_cluster()
+    service = f"gui/{os.getuid()}/{PG_LAUNCHD_LABEL}"
+    document = {
+        "Label": PG_LAUNCHD_LABEL,
+        "ProgramArguments": postgres_command(),
+        "EnvironmentVariables": {"LC_ALL": PG_LOCALE},
+        "KeepAlive": True,
+        "StandardOutPath": str(PG_LOG),
+        "StandardErrorPath": str(PG_LOG),
+    }
+    content = plistlib.dumps(document, fmt=plistlib.FMT_XML)
+    loaded = subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0
+    if loaded and PG_PLIST_PATH.exists() and PG_PLIST_PATH.read_bytes() == content:
+        ensure_cluster()
+        return
+    if loaded:
+        unload_cluster_service()
+    else:
+        stop_cluster()
+    PG_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PG_PLIST_PATH.write_bytes(content)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PG_PLIST_PATH)],
+                   check=True, capture_output=True, text=True)
+    ensure_cluster()
+
+
+def unload_cluster_service() -> None:
+    service = f"gui/{os.getuid()}/{PG_LAUNCHD_LABEL}"
+    subprocess.run(["launchctl", "bootout", service], check=True, capture_output=True)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        loaded = subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0
+        if not loaded and not cluster_running():
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"{PG_LAUNCHD_LABEL} did not stop; inspect {PG_LOG}")
 
 
 def stop_cluster() -> bool:
@@ -534,7 +621,7 @@ def stop_cluster() -> bool:
     if not cluster_running():
         return False
     subprocess.run([_pg("pg_ctl"), "-D", str(PG_DATA), "-m", "fast", "stop"],
-                   check=True)
+                   check=True, stdout=sys.stderr)
     return True
 
 
@@ -600,14 +687,7 @@ def require_rebuild(rebuild: bool, *, layer: str, cost: str) -> None:
             f"run:  clync migrate")
 
 
-def ensure_cluster(*, rebuild_derived: bool = False) -> None:
-    """Idempotent: initdb (if absent) -> start -> create db + extensions + raw
-    schema. Also ensures the search index schema so a single call fully provisions
-    the store. Fails loud on a missing PG17/pgvector toolchain.
-
-    A derived layer whose shape is stale raises `StaleDerivedSchema` — it is NOT
-    silently rebuilt. `rebuild_derived=True` (only `clync migrate` passes it) opts
-    into the destructive rebuild."""
+def init_cluster() -> None:
     if not _vector_control_present():
         raise SystemExit(
             "pgvector not found for PG17. Install with:  brew install pgvector")
@@ -615,17 +695,20 @@ def ensure_cluster(*, rebuild_derived: bool = False) -> None:
         PG_DIR.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [_pg("initdb"), "-D", str(PG_DATA), "-U", PG_USER,
-             "--encoding=UTF8", "--locale=en_US.UTF-8", "-A", "trust"],
+             "--encoding=UTF8", f"--locale={PG_LOCALE}", "-A", "trust"],
             check=True, capture_output=True)
+
+
+def ensure_cluster(*, rebuild_derived: bool = False) -> None:
+    """Provision the store; rebuilding stale derived schemas requires explicit opt-in."""
+    init_cluster()
     start_cluster()
     exists = subprocess.run(
-        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-U", PG_USER,
-         "-d", "postgres",
+        [_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-U", PG_USER, "-d", "postgres",
          "-tAc", f"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'"],
         capture_output=True, text=True, check=True).stdout.strip()
     if exists != "1":
-        subprocess.run([_pg("psql"), "-h", "localhost", "-p", str(PG_PORT),
-                        "-U", PG_USER,
+        subprocess.run([_pg("psql"), "-h", "localhost", "-p", str(PG_PORT), "-U", PG_USER,
                         "-d", "postgres", "-c", f'CREATE DATABASE "{PG_DB}"'],
                        check=True, capture_output=True)
     with connect_pg() as con:
@@ -752,6 +835,8 @@ def sync_files(con, client: ClaudeClient, conv: dict, download: bool) -> int:
             fid = f.get("file_uuid") or f.get("uuid")
             if not fid:
                 continue
+            if Path(fid).name != fid or fid in {".", ".."}:
+                raise ValueError("Image/file identifier must be a filename component")
             row = con.execute("SELECT local_path FROM files WHERE file_uuid=%s",
                               (fid,)).fetchone()
             local = row["local_path"] if row else None
@@ -921,12 +1006,10 @@ def _same_instant(stored, remote_iso: str | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Local file-based session ingest (cookie-independent). Two sources share ONE
-# mechanism, partitioned by the `source` column of cc_sync_state:
-#   - Claude Code transcripts (see cc.py + ADR 0003)
-#   - Codex CLI rollouts       (see codex.py)
+# Local file-based session ingest (cookie-independent), partitioned by the
+# `source` column of cc_sync_state. Parsers own discovery and cleaning.
 # --------------------------------------------------------------------------- #
-def _upsert_local_session(con, s, source: str, kind: str) -> None:
+def _upsert_local_session(con, s, source: str, kind: str, *, raw: dict | None = None) -> None:
     """Write one parsed session (a CCSession / CodexSession / ChatGPTConversation
     — duck-typed on identical field names; the network-sourced ChatGPT object
     leaves the local-workspace fields None) -> a `units` row + its cleaned
@@ -948,7 +1031,7 @@ def _upsert_local_session(con, s, source: str, kind: str) -> None:
         (s.session_id, kind, source, s.title, s.summary, s.model,
          s.created_at, s.updated_at, s.repo, s.cwd, s.worktree, s.git_branch,
          s.cc_version, s.entrypoint,
-         _json({"session_id": s.session_id, "cwd": s.cwd, "repo": s.repo,
+         _json(raw if raw is not None else {"session_id": s.session_id, "cwd": s.cwd, "repo": s.repo,
                 "worktree": s.worktree, "git_branch": s.git_branch,
                 "cc_version": s.cc_version, "entrypoint": s.entrypoint}), _now()),
     )
@@ -967,11 +1050,9 @@ def _ingest_local(source: str, kind: str, iter_files, parse_session, full: bool,
     `full` re-parses every file. Also reconciles deletions WITHIN this source: a
     file removed from disk loses its unit/messages and its watermark row (mirror
     of the claude.ai upstream-deletion purge — never degrade silently to stale
-    data). An unavailable root raises (from `iter_files`, before any store
-    mutation) whenever this source HAS stored watermarks — a vanished root is an
-    error, never evidence of deletion. With no watermarks at all the producing
-    tool is not installed here, nothing can be purged, and the leg is skipped.
-    No network / cookies. Returns stats. Fails loud on a store error.
+    data). An unavailable root raises (in `iter_files`, before any store
+    mutation) — a missing source is an error, never evidence of deletion. No
+    network / cookies. Returns stats. Fails loud on a store error.
 
     `out_of_scope_marker` is the sentinel a parser returns for a file it examined
     but deliberately skipped by scope (e.g. codex.OUT_OF_SCOPE for a non-terminal
@@ -980,30 +1061,13 @@ def _ingest_local(source: str, kind: str, iter_files, parse_session, full: bool,
     producer rename that pushes the whole corpus out of scope shows up as
     out_of_scope==files_parsed with sessions_ingested==0, never a silent healthy
     run. A source with no scope sentinel leaves the default (matches nothing)."""
+    files = list(iter_files())  # raises on a missing root, before the store is touched
     con = connect()
     # Only THIS source's watermarks — so a cross-source path never reads as
     # "deleted" and gets its unit purged during reconciliation.
     state = {r["file_path"]: (r["mtime"], r["size"]) for r in con.execute(
         "SELECT file_path, mtime, size FROM cc_sync_state WHERE source=%s",
         (source,)).fetchall()}
-    try:
-        files = list(iter_files())  # raises on a missing root, before any mutation
-    except FileNotFoundError:
-        # A missing root is only AMBIGUOUS when there is a stored corpus to
-        # reconcile against. With no watermarks for this source, the producing
-        # tool is simply not installed on this machine (a very common first run:
-        # no Codex CLI, or Claude Code never used in a project) — there is
-        # nothing deletion reconciliation could purge, so skip the leg. With
-        # watermarks present, a vanished root WOULD purge the stored corpus:
-        # stay loud, which is the case the guard exists for.
-        if state:
-            con.close()
-            raise
-        con.close()
-        print(f"[{source}] source not installed on this machine (no session root, "
-              f"nothing stored) -> skipped")
-        return {"files_parsed": 0, "unchanged": 0, "sessions_ingested": 0,
-                "out_of_scope": 0, "sessions_removed": 0, "sessions_in_db": 0}
     ingested = skipped = sessions = out_of_scope = 0
     try:
         for path in files:
@@ -1071,7 +1135,31 @@ def ingest_codex(full: bool = False) -> dict:
                          out_of_scope_marker=codex.OUT_OF_SCOPE)
 
 
-def ingest_chatgpt(profile: str, full: bool = False) -> dict:
+def ingest_pi(full: bool = False) -> dict:
+    import pi_source
+    if "CLYNC_PI_ROOT" in os.environ and not os.environ["CLYNC_PI_ROOT"].strip():
+        raise ValueError("$CLYNC_PI_ROOT must name a Pi sessions directory, not be empty")
+    try:
+        pi_source.PI_ROOT.stat()
+    except FileNotFoundError as e:
+        if "CLYNC_PI_ROOT" in os.environ:
+            raise RuntimeError(f"Configured Pi source unavailable: {pi_source.PI_ROOT}") from e
+        with connect() as con:
+            known = con.execute(
+                "SELECT EXISTS (SELECT 1 FROM units WHERE source=%s) OR "
+                "EXISTS (SELECT 1 FROM cc_sync_state WHERE source=%s) AS known",
+                ("pi", "pi")).fetchone()["known"]
+        if known:
+            raise RuntimeError(
+                f"Previously archived Pi source unavailable: {pi_source.PI_ROOT}") from e
+        reason = f"unconfigured default root missing: {pi_source.PI_ROOT}"
+        print(f"[pi] skipped ({reason}); archive unchanged")
+        return {"skipped": True, "reason": reason}
+    return _ingest_local("pi", "pi_session", pi_source.iter_session_files,
+                         pi_source.parse_session, full)
+
+
+def ingest_chatgpt(profile: str, full: bool = False, projects_only: bool = False) -> dict:
     """Ingest ChatGPT web history (source=chatgpt, kind=chatgpt) via the private
     web API (cookies -> accessToken -> /backend-api). NETWORK/cookies — fails loud
     on an expired login (mirror of the claude.ai leg, NOT the cookie-independent
@@ -1086,9 +1174,12 @@ def ingest_chatgpt(profile: str, full: bool = False) -> dict:
     fetched = skipped = removed = 0
     try:
         stored = {r["unit_id"]: r["updated_at"] for r in con.execute(
-            "SELECT unit_id, updated_at FROM units WHERE kind='chatgpt'").fetchall()}
+            "SELECT unit_id, updated_at FROM units WHERE kind='chatgpt' "
+            "AND (NOT %s OR project_uuid IS NOT NULL)", (projects_only,)).fetchall()}
         remote = list(client.iter_conversations())
         remote_ids = {c["id"] for c in remote}
+        if projects_only:
+            remote = [c for c in remote if c.get("project_uuid") or c["id"] in stored]
         print(f"[chatgpt] conversations: {len(remote)} remote | "
               f"{len(stored)} already stored")
         for c in remote:
@@ -1096,11 +1187,16 @@ def ingest_chatgpt(profile: str, full: bool = False) -> dict:
             if (not full and cid in stored
                     and _same_instant(stored[cid], chatgpt._iso(c.get("update_time")))):
                 skipped += 1
-                continue
-            conv = chatgpt.linearize(client.get_conversation(cid), c)
-            _upsert_local_session(con, conv, "chatgpt", "chatgpt")
+            else:
+                conv = chatgpt.linearize(client.get_conversation(cid), c)
+                _upsert_local_session(con, conv, "chatgpt", "chatgpt")
+                fetched += 1
+            project = (c.get("project_uuid"), c.get("project_name"))
+            con.execute(
+                "UPDATE units SET project_uuid=%s, project_name=%s, synced_at=%s "
+                "WHERE unit_id=%s AND (project_uuid, project_name) IS DISTINCT FROM (%s,%s)",
+                (*project, _now(), cid, *project))
             con.commit()
-            fetched += 1
         # Reconcile deletions WITHIN source=chatgpt only (kind guards the scope).
         dead = [u for u in stored if u not in remote_ids]
         if dead:
@@ -1149,16 +1245,26 @@ def notify(level: str, title: str, message: str) -> None:
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
-def _require_profile(args) -> str:
-    if not args.profile:
+def _require_profile(args, *, attr: str, env: str) -> str:
+    profile = getattr(args, attr, None)
+    if not profile:
         raise RuntimeError(
-            f"No Chrome profile given. Pass --profile NAME or set ${PROFILE_ENV}."
+            f"No Chrome profile given. Pass --{attr.replace('_', '-')} NAME "
+            f"or set ${env}."
         )
-    return args.profile
+    return profile
+
+
+def _require_claude_profile(args) -> str:
+    return _require_profile(args, attr="claude_profile", env=CLAUDE_PROFILE_ENV)
+
+
+def _require_chatgpt_profile(args) -> str:
+    return _require_profile(args, attr="chatgpt_profile", env=CHATGPT_PROFILE_ENV)
 
 
 def cmd_whoami(args) -> int:
-    profile = _require_profile(args)
+    profile = _require_claude_profile(args)
     orgs = resolve_orgs(ClaudeClient(read_auth_cookies(profile), profile), args.org)
     print(f"Chrome profile : {profile}")
     print(f"Orgs to sync   : {len(orgs)}")
@@ -1178,32 +1284,39 @@ def _index_after_sync(full: bool) -> None:
         notify("fail", "clync index failed", str(e))
         raise
     print(f"[index] reindexed_units={stats['reindexed_units']} "
-          f"chunks={stats['chunks']} removed_units={stats['removed_units']}")
+          f"chunks={stats['chunks']} removed_units={stats['removed_units']} "
+          f"dropped_chunks={stats['dropped_chunks']} "
+          f"repositioned_chunks={stats['repositioned_chunks']}")
 
 
-def _sync_all(profile: str | None, org_ref: str | None, full: bool, download_files: bool,
-              do_index: bool, notify_fail: bool) -> Exception | None:
-    """Run the network legs (claude.ai then ChatGPT, cookie/network — each may
-    fail) then ALWAYS the local ingests (Claude Code + Codex CLI, no network), then
-    index. Each network leg's failure is captured INDEPENDENTLY and RETURNED for the
-    caller to re-raise (fail-loud) — but only after the local ingests + index run,
-    so one stale/expired cookie never blocks the other network leg OR local-session
-    capture. A local-ingest or index failure is not captured — it raises immediately
+def _sync_all(claude_profile: str, org_ref: str | None, full: bool,
+              download_files: bool, do_index: bool, notify_fail: bool,
+              *, chatgpt_profile: str | None = None) -> Exception | None:
+    """Run both network legs with their source-specific profiles, then ALWAYS the
+    local ingests (Claude Code + Codex CLI + Pi, no network), then index. Each network
+    leg's failure is captured INDEPENDENTLY and RETURNED for the caller to re-raise
+    (fail-loud) — but only after the local ingests + index run, so one stale/expired
+    cookie never blocks the other network leg OR local-session capture. A
+    local-ingest or index failure is not captured — it raises immediately
     (notifying first on the scheduled path, so an unattended failure is never
-    silent)."""
+    silent). The optional ChatGPT profile preserves the internal test helper's
+    single-profile call shape; all CLI and scheduled callers pass it explicitly."""
+    if chatgpt_profile is None:
+        chatgpt_profile = claude_profile
     ensure_cluster()
     net_errs: list[Exception] = []
-    # profile=None is a Claude-Code-only install: there is no cookie jar to read,
-    # so the network legs are SKIPPED rather than attempted-and-failed.
-    legs = () if profile is None else (
-        ("claude.ai", lambda: run_sync(
-            profile, org_ref, full, download_files=download_files)),
-        ("ChatGPT", lambda: ingest_chatgpt(profile, full=full)),
-    )
-    if profile is None:
-        print("no Chrome profile configured -> local-only sync "
-              "(Claude Code + Codex sessions)")
-    for label, run in legs:
+    sources = [("claude.ai", lambda: run_sync(
+                            claude_profile, org_ref, full,
+                            download_files=download_files)),
+                       ("ChatGPT", lambda: ingest_chatgpt(chatgpt_profile,
+                                                           full=full))]
+    import artiport_source
+    if artiport_source.config_path().exists():
+        sources.append(("Artiport", lambda: artiport_source.ingest(full=full)))
+    import opencode_source
+    if opencode_source.config_path().exists():
+        sources.append(("OpenCode", lambda: opencode_source.ingest(full=full)))
+    for label, run in sources:
         try:
             run()
         except Exception as e:                # captured, re-raised by caller (loud)
@@ -1215,6 +1328,7 @@ def _sync_all(profile: str | None, org_ref: str | None, full: bool, download_fil
     try:
         ingest_cc(full=full)
         ingest_codex(full=full)
+        ingest_pi(full=full)
     except Exception as e:
         if notify_fail:
             notify("fail", "clync local ingest failed", str(e))
@@ -1229,9 +1343,10 @@ def _sync_all(profile: str | None, org_ref: str | None, full: bool, download_fil
 
 
 def cmd_sync(args) -> int:
-    err = _sync_all(_require_profile(args), args.org, args.full,
+    err = _sync_all(_require_claude_profile(args), args.org, args.full,
                     download_files=not args.no_files, do_index=not args.no_index,
-                    notify_fail=False)
+                    notify_fail=False,
+                    chatgpt_profile=_require_chatgpt_profile(args))
     if err:
         raise err
     return 0
@@ -1241,7 +1356,7 @@ def cmd_sync_app(args) -> int:
     """Sync claude.ai (the app) ONLY — network/cookies, fails loud — then index.
     No local Claude Code ingest."""
     ensure_cluster()
-    run_sync(_require_profile(args), args.org, args.full,
+    run_sync(_require_claude_profile(args), args.org, args.full,
              download_files=not args.no_files)
     if not args.no_index:
         _index_after_sync(args.full)
@@ -1266,10 +1381,38 @@ def cmd_sync_codex(args) -> int:
     return 0
 
 
+def cmd_sync_pi(args) -> int:
+    """Ingest local Pi sessions ONLY (no network/cookies), then index."""
+    ensure_cluster()
+    ingest_pi(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
+def cmd_sync_artiport(args) -> int:
+    import artiport_source
+    ensure_cluster()
+    artiport_source.ingest(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
+def cmd_sync_opencode(args) -> int:
+    import opencode_source
+    ensure_cluster()
+    opencode_source.ingest(full=args.full)
+    if not args.no_index:
+        _index_after_sync(args.full)
+    return 0
+
+
 def cmd_sync_chatgpt(args) -> int:
     """Sync ChatGPT web history ONLY — network/cookies, fails loud — then index."""
     ensure_cluster()
-    ingest_chatgpt(_require_profile(args), full=args.full)
+    ingest_chatgpt(_require_chatgpt_profile(args), full=args.full,
+                   projects_only=args.projects_only)
     if not args.no_index:
         _index_after_sync(args.full)
     return 0
@@ -1284,7 +1427,9 @@ def cmd_index(args) -> int:
         notify("fail", "clync index failed", str(e))
         raise
     print(f"reindexed_units={stats['reindexed_units']} chunks={stats['chunks']} "
-          f"removed_units={stats['removed_units']}")
+          f"removed_units={stats['removed_units']} "
+          f"dropped_chunks={stats['dropped_chunks']} "
+          f"repositioned_chunks={stats['repositioned_chunks']}")
     return 0
 
 
@@ -1329,14 +1474,12 @@ def cmd_migrate(args) -> int:
 def cmd_scheduled(args) -> int:
     """Entry point for the launchd job: sync, notify LOUDLY on failure, and warn
     (but do not error) when a prior daily run was missed because the Mac was down."""
-    profile = args.profile or os.environ.get(PROFILE_ENV)
-    if not profile and not os.environ.get(LOCAL_ONLY_ENV):
-        # No profile AND no explicit local-only marker = a broken install, not a
-        # configuration. Stay loud.
-        notify("fail", "clync sync failed",
-               f"neither ${PROFILE_ENV} nor ${LOCAL_ONLY_ENV} is set")
-        raise RuntimeError(f"neither ${PROFILE_ENV} nor ${LOCAL_ONLY_ENV} is set")
-    profile = profile or None
+    try:
+        claude_profile = _require_claude_profile(args)
+        chatgpt_profile = _require_chatgpt_profile(args)
+    except RuntimeError as e:
+        notify("fail", "clync sync failed", str(e))
+        raise
     ensure_cluster()
     # Detect a missed prior run before this one updates last_success.
     con = connect()
@@ -1349,14 +1492,18 @@ def cmd_scheduled(args) -> int:
         gap = datetime.now(timezone.utc) - datetime.fromisoformat(last)
         if gap > timedelta(hours=LATE_THRESHOLD_H):
             late_gap_h = gap.total_seconds() / 3600
-    err = _sync_all(profile, args.org, full=False, download_files=True,
-                    do_index=True, notify_fail=True)
+    err = _sync_all(claude_profile, args.org, full=False, download_files=True,
+                    do_index=True, notify_fail=True,
+                    chatgpt_profile=chatgpt_profile)
     if late_gap_h is not None:
         notify("warn", "clync ran late",
                f"previous scheduled sync was missed (~{late_gap_h:.0f}h gap) — "
                "Mac was likely asleep/off. Synced now.")
     if err:
         raise err
+    if args.no_dream:
+        print("[scheduled] sync and index ok; dream disabled")
+        return 0
     # The nightly dream pass runs INSIDE this job, immediately after sync+index,
     # rather than as a second launchd job at a later hour: the dig is only as good
     # as the index it queries, and sequencing it here makes that ordering true by
@@ -1401,14 +1548,84 @@ def cmd_search(args) -> int:
     results = search.hybrid_search(
         args.query, topk=args.limit, source=args.source, project=args.project,
         model=args.model, repo=args.repo, worktree=args.worktree, branch=args.branch,
-        session=args.session, since=args.since, until=args.until, sort=args.sort,
-        lang=args.lang)
+        session=args.session, sender=args.sender, since=args.since, until=args.until,
+        sort=args.sort, lang=args.lang, per_unit=args.per_unit)
     if not results:
         print("(no matches)")
     for r in results:
         snippet = r["text"].replace("\n", " ")[:200]
+        at = "" if r["msg_idx"] is None else f"  msg_idx={r['msg_idx']}"
+        who = "" if r["sender"] is None else f"  sender={r['sender']}"
         print(f"\n• [{r['source']}] {r['unit_name'] or '(untitled)'}  "
-              f"[{r['unit_id']}]  score={r['score']:.4f}\n  {snippet}")
+              f"[{r['unit_id']}]{who}{at}  score={r['score']:.4f}\n  {snippet}")
+    return 0
+
+
+class ConversationNotFoundError(LookupError):
+    pass
+
+
+def read_conversation(uuid: str, from_idx: int | None = None,
+                      to_idx: int | None = None, sender: str | None = None) -> str:
+    import cc
+    senders = cc.resolve_sender_role(sender) if sender else None
+    con = connect()
+    try:
+        u = con.execute(
+            "SELECT kind, source, title, summary, model, updated_at, repo, cwd, "
+            "worktree, git_branch, cc_version, project_name, msg_count "
+            "FROM units WHERE unit_id=%s", (uuid,)).fetchone()
+        if not u:
+            raise ConversationNotFoundError(f"No unit with uuid {uuid!r} in the local store.")
+        window = "" if from_idx is None else " AND idx >= %(lo)s"
+        window += "" if to_idx is None else " AND idx <= %(hi)s"
+        window += "" if senders is None else " AND sender = ANY(%(senders)s)"
+        msgs = con.execute(
+            "SELECT idx, sender, role_detail, text, created_at FROM messages "
+            "WHERE unit_id=%(uuid)s" + window + " ORDER BY idx",
+            {"uuid": uuid, "lo": from_idx, "hi": to_idx, "senders": senders}).fetchall()
+        files = con.execute(
+            "SELECT file_kind, file_name, local_path FROM files WHERE unit_id=%s",
+            (uuid,)).fetchall()
+    finally:
+        con.close()
+
+    if u["cwd"] is not None:
+        meta = (f"source={u['source']} repo={u['repo']} model={u['model']} "
+                f"worktree={u['worktree']} branch={u['git_branch']}\n"
+                f"cwd={u['cwd']}\n")
+        if u["cc_version"] is not None:
+            meta += f"cc_version={u['cc_version']}\n"
+    else:
+        meta = (f"source={u['source']} model={u['model']} "
+                f"project={u['project_name'] or '(none)'}\n"
+                f"summary: {u['summary'] or '(none)'}\n")
+    header = f"# {u['title'] or '(untitled)'}\nupdated={u['updated_at']}\n{meta}"
+    if files:
+        header += "attached files:\n" + "\n".join(
+            f"  - [{f['file_kind']}] {f['file_name']}"
+            + (f" -> {f['local_path']}" if f['local_path'] else " (not downloaded)")
+            for f in files
+        ) + "\n"
+    if not msgs:
+        header += f"messages none of {u['msg_count']}\n"
+    elif sender:
+        header += (f"messages: {len(msgs)} {sender} turn(s) spanning "
+                   f"{msgs[0]['idx']}-{msgs[-1]['idx']} of {u['msg_count']}\n")
+    else:
+        header += f"messages {msgs[0]['idx']}-{msgs[-1]['idx']} of {u['msg_count']}\n"
+    body = "\n\n".join(
+        f"## [{m['idx']}] {m['sender']}"
+        + (f" [{m['role_detail']}]" if m["role_detail"] else "")
+        + f" ({m['created_at']})\n{m['text']}"
+        for m in msgs
+    )
+    return f"{header}\n{body}"
+
+
+def cmd_read(args) -> int:
+    ensure_cluster()
+    print(read_conversation(args.uuid, args.from_idx, args.to_idx, args.sender))
     return 0
 
 
@@ -1610,6 +1827,8 @@ def cmd_doctor(args) -> int:
             ndoc = _n("SELECT COUNT(*) n FROM units WHERE kind='project_doc'")
             ncc = _n("SELECT COUNT(*) n FROM units WHERE kind='cc_session'")
             ncodex = _n("SELECT COUNT(*) n FROM units WHERE kind='codex_session'")
+            nopencode = _n("SELECT COUNT(*) n FROM units WHERE source='opencode'")
+            npi = _n("SELECT COUNT(*) n FROM units WHERE source='pi'")
             nchatgpt = _n("SELECT COUNT(*) n FROM units WHERE kind='chatgpt'")
             nmsg = _n("SELECT COUNT(*) n FROM messages")
             nfile = _n("SELECT COUNT(*) n FROM files")
@@ -1619,9 +1838,12 @@ def cmd_doctor(args) -> int:
             con.close()
         print(f"store       : {PG_DB}@localhost:{PG_PORT}\n"
               f"              {nchat} chats, {ndoc} project docs, {ncc} cc sessions, "
-              f"{ncodex} codex sessions, {nchatgpt} chatgpt sessions, "
+              f"{ncodex} codex sessions, {nopencode} opencode sessions, {npi} pi sessions, "
+              f"{nchatgpt} chatgpt sessions, "
               f"{nmsg} messages, {nfile} files ({ndl} images), last_success={last}")
         print(f"search index: ok ({st['chunks']} chunks indexed)")
+        if st.get("pgvector_warning"):
+            print(f"              note: {st['pgvector_warning']}")
         if last:
             gap = datetime.now(timezone.utc) - datetime.fromisoformat(last)
             if gap > timedelta(hours=LATE_THRESHOLD_H):
@@ -1636,8 +1858,12 @@ def cmd_doctor(args) -> int:
             con.close()
         n_active_topics = sum(1 for r in dst["topics"] if r["status"] == "active")
         n_active_insights = sum(r["active"] for r in dst["topics"])
+        failed_queue = dst["usage"]["failed"]
         print(f"dream       : {n_active_topics} active topic(s), {n_active_insights} "
-              f"active insight(s), {dst['usage']['failed']} failed queue item(s)")
+              f"active insight(s), {failed_queue} failed queue item(s)")
+        if failed_queue:
+            problems.append(f"dream has {failed_queue} failed queue item(s) — "
+                            "run `clync dream status` and retry the failed work.")
 
     try:
         import mcp_server  # noqa: F401 — self-test that deps resolve + server builds
@@ -1645,20 +1871,60 @@ def cmd_doctor(args) -> int:
     except Exception as e:
         problems.append(f"MCP server import failed: {e}")
 
-    loaded = subprocess.run(
+    store_job = subprocess.run(
+        ["launchctl", "print", f"gui/{os.getuid()}/{PG_LAUNCHD_LABEL}"],
+        capture_output=True, text=True)
+    print(f"store job   : {'loaded' if store_job.returncode == 0 else 'NOT loaded'} "
+          f"({PG_LAUNCHD_LABEL})")
+    if store_job.returncode != 0:
+        problems.append("store has no launchd supervision — run `clync install`.")
+
+    launchd = subprocess.run(
         ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
         capture_output=True, text=True,
-    ).returncode == 0
-    print(f"launchd job : {'loaded' if loaded else 'NOT loaded'} ({LAUNCHD_LABEL})")
+    )
+    loaded = launchd.returncode == 0
+    last_exit_match = re.search(r"^\s*last exit code = (-?\d+)\s*$",
+                                launchd.stdout, re.MULTILINE)
+    last_exit = int(last_exit_match.group(1)) if last_exit_match else None
+    suffix = f", last_exit={last_exit}" if last_exit is not None else ""
+    print(f"launchd job : {'loaded' if loaded else 'NOT loaded'} ({LAUNCHD_LABEL}{suffix})")
     if not loaded:
         problems.append("scheduler not installed — run `clync install`.")
+    elif last_exit not in (None, 0):
+        problems.append(f"last scheduled run exited {last_exit} — "
+                        "run `clync status` and inspect scheduled.log.")
 
-    reg = subprocess.run(["claude", "mcp", "get", "clync"],
-                         capture_output=True, text=True)
-    if reg.returncode == 0:
-        print("MCP register: registered with Claude Code")
+    if args.mcp_client == "opencode":
+        route = "/api/mcp?" + urlencode({"location[directory]": str(Path.cwd())})
+        reg = subprocess.run(["opencode", "api", "get", route],
+                             capture_output=True, text=True, check=True, timeout=30)
+        servers = json.loads(reg.stdout)["data"]
+        server = next((s for s in servers if s["name"] == MCP_NAME), None)
+        state = server["status"]["status"] if server else "not registered"
+        print(f"MCP OpenCode: {state}")
+        if state != "connected":
+            problems.append(f"OpenCode MCP {state} — see README 'Connect an assistant'.")
     else:
-        problems.append("MCP server not registered — see README for `claude mcp add`.")
+        client = args.mcp_client
+        if client == "claude":
+            reg = subprocess.run([client, "mcp", "get", MCP_NAME],
+                                 capture_output=True, text=True, check=False)
+            if reg.returncode != 0:
+                problems.append("Claude Code MCP not registered — see README.")
+            path, parse, key = Path.home() / ".claude.json", json.loads, "mcpServers"
+        else:
+            path, parse, key = Path.home() / ".codex/config.toml", tomllib.loads, "mcp_servers"
+        registration = None
+        if path.exists():
+            registration = parse(path.read_text()).get(key, {}).get(MCP_NAME)
+        if registration:
+            print(f"MCP register: registered with {client}")
+            if not shutil.which(registration["command"]):
+                problems.append(f"{client} MCP executable missing: {registration['command']} "
+                                "— re-register clync (see README).")
+        elif client == "codex":
+            problems.append("Codex MCP not registered — see README.")
 
     if problems:
         print("\nPROBLEMS:")
@@ -1670,34 +1936,32 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_install(args) -> int:
-    """Write + load a self-contained launchd LaunchAgent for the daily sync."""
-    profile = args.profile or None
+    """Install the supervised database and daily sync LaunchAgents."""
+    claude_profile = _require_claude_profile(args)
+    chatgpt_profile = _require_chatgpt_profile(args)
     hour, minute = (int(x) for x in args.at.split(":"))
+    install_cluster_service()
     SCHED_LOG.parent.mkdir(parents=True, exist_ok=True)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     # A login shell resolves `uv` on PATH (pyenv shims aren't reliable under launchd).
-    cmd = f"cd {REPO_DIR} && exec uv run python clync.py scheduled"
-    env_entry = (f"<key>{PROFILE_ENV}</key><string>{profile}</string>" if profile
-                 else f"<key>{LOCAL_ONLY_ENV}</key><string>1</string>")
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>{LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-    <array><string>/bin/zsh</string><string>-lc</string><string>{cmd}</string></array>
-  <key>EnvironmentVariables</key><dict>
-    {env_entry}
-  </dict>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>{hour}</integer>
-    <key>Minute</key><integer>{minute}</integer>
-  </dict>
-  <key>StandardOutPath</key><string>{SCHED_LOG}</string>
-  <key>StandardErrorPath</key><string>{SCHED_LOG}</string>
-</dict></plist>
-"""
-    PLIST_PATH.write_text(plist)
+    cmd = f"cd {shlex.quote(str(REPO_DIR))} && exec uv run python clync.py scheduled"
+    if args.no_dream:
+        cmd += f" {NO_DREAM_FLAG}"
+    # Serialize through plistlib rather than interpolating XML: the shell
+    # command contains `&&`, and arbitrary paths/profiles may contain XML
+    # metacharacters. A malformed plist makes launchd state misleading.
+    plist = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": ["/bin/zsh", "-lc", cmd],
+        "EnvironmentVariables": {
+            CLAUDE_PROFILE_ENV: claude_profile,
+            CHATGPT_PROFILE_ENV: chatgpt_profile,
+        },
+        "StartCalendarInterval": {"Hour": hour, "Minute": minute},
+        "StandardOutPath": str(SCHED_LOG),
+        "StandardErrorPath": str(SCHED_LOG),
+    }
+    PLIST_PATH.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_XML))
     uid = os.getuid()
     subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"],
                    capture_output=True, text=True)  # idempotent: ignore "not loaded"
@@ -1706,7 +1970,8 @@ def cmd_install(args) -> int:
     if r.returncode != 0:
         raise RuntimeError(f"launchctl bootstrap failed: {r.stderr.strip()}")
     print(f"Installed {LAUNCHD_LABEL}: daily at {hour:02d}:{minute:02d}, "
-          f"profile={profile!r}\n  plist: {PLIST_PATH}\n  log:   {SCHED_LOG}")
+          f"claude_profile={claude_profile!r}, chatgpt_profile={chatgpt_profile!r}\n"
+          f"  plist: {PLIST_PATH}\n  log:   {SCHED_LOG}")
     print("Missed runs (Mac asleep/off) run once on wake and fire a 'ran late' "
           "warning; failures fire a modal+sound alert.")
     return 0
@@ -1718,6 +1983,13 @@ def cmd_uninstall(args) -> int:
                    capture_output=True, text=True)
     if PLIST_PATH.exists():
         PLIST_PATH.unlink()
+    if PG_PLIST_PATH.exists():
+        service = f"gui/{os.getuid()}/{PG_LAUNCHD_LABEL}"
+        if subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0:
+            unload_cluster_service()
+        else:
+            stop_cluster()
+        PG_PLIST_PATH.unlink()
     print(f"Uninstalled {LAUNCHD_LABEL}.")
     return 0
 
@@ -1728,39 +2000,10 @@ OPS_SKILL_LINK = Path.home() / ".claude/skills/clync-ops"  # operate/troubleshoo
 MCP_NAME = "clync"
 
 
-def _skill_name(md: Path) -> str | None:
-    """The `name:` field from a skill's YAML frontmatter, or None if absent."""
-    if not md.is_file():
-        return None
-    for line in md.read_text(errors="replace").splitlines()[:20]:
-        if line.startswith("name:"):
-            return line.split(":", 1)[1].strip()
-    return None
-
-
-def _is_bootstrap_copy(link: Path, target: Path) -> bool:
-    """True when `link` is a standalone COPY of this repo's skill dir — the file a
-    user drops into ~/.claude/skills/ so that `/clync install` exists BEFORE the
-    repo does. Recognised narrowly: a real directory whose only entry is SKILL.md,
-    declaring the same skill `name:` as the target's own. Anything else is the
-    user's real file and must never be clobbered."""
-    if link.is_symlink() or not link.is_dir():
-        return False
-    if [p.name for p in link.iterdir()] != ["SKILL.md"]:
-        return False
-    name = _skill_name(link / "SKILL.md")
-    return name is not None and name == _skill_name(target / "SKILL.md")
-
-
 def _relink(link: Path, target: Path) -> None:
-    """Idempotently point a symlink at target; refuse to clobber a real file. The
-    one exception is a bootstrap COPY of this repo's own skill dir, which install
-    deliberately supersedes with the live symlink so the skill stops drifting."""
+    """Idempotently point a symlink at target; refuse to clobber a real file."""
     if link.is_symlink():
         link.unlink()
-    elif _is_bootstrap_copy(link, target):
-        shutil.rmtree(link)
-        print(f"  (superseded the bootstrap skill copy at {link})")
     elif link.exists():
         raise RuntimeError(f"{link} exists and is not a symlink — refusing to overwrite.")
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -1770,11 +2013,9 @@ def _relink(link: Path, target: Path) -> None:
 def cmd_setup(args) -> int:
     """One command to wire everything up from the repo: deps, CLI, MCP, scheduler,
     skill. Every artifact is defined in this repo and symlinked/registered out;
-    `clync unsetup` reverses it. A missing --profile is a deliberate
-    Claude-Code-only install: everything is wired except the claude.ai/ChatGPT
-    legs, which have no cookie jar to read."""
-    print("mode: both sources" if args.profile else
-          "mode: local Claude Code + Codex only (no --profile given)")
+    `clync unsetup` reverses it."""
+    _require_claude_profile(args)
+    _require_chatgpt_profile(args)
 
     subprocess.run(["uv", "sync", "--quiet"], cwd=REPO_DIR, check=True)
     print("✓ deps synced (uv)")
@@ -1784,11 +2025,11 @@ def cmd_setup(args) -> int:
     print(f"✓ CLI: {BIN_LINK} -> clync"
           + ("" if on_path else f"   ⚠ {BIN_LINK.parent} is NOT on your PATH"))
 
-    uv = shutil.which("uv") or "uv"
     subprocess.run(["claude", "mcp", "remove", MCP_NAME], capture_output=True, text=True)
     r = subprocess.run(
         ["claude", "mcp", "add", "--scope", "user", MCP_NAME, "--",
-         uv, "run", "--project", str(REPO_DIR), "python", str(REPO_DIR / "mcp_server.py")],
+         "/bin/zsh", "-lc", 'exec uv run --project "$1" python "$1/mcp_server.py"',
+         MCP_NAME, str(REPO_DIR)],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -1823,7 +2064,8 @@ def cmd_setup(args) -> int:
     finally:
         con.close()
     print(f"✓ dream layer: schema ready, {seeded} topic(s) seeded "
-          f"(nightly pass runs inside the daily job; run `clync dream backfill` "
+          f"(nightly pass {'disabled' if args.no_dream else 'runs inside the daily job'}; "
+          f"run `clync dream backfill` "
           f"to mine existing history — that one spends real quota)")
 
     print("\nSetup complete. Open a NEW Claude Code session to load the MCP tools "
@@ -1875,31 +2117,76 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_sessions(args) -> int:
+    import live_search
+    if args.session_action == "search":
+        result = live_search.search_sessions(
+            args.query, source=args.source, repo=args.repo, sender=args.sender,
+            since=args.since, limit=args.limit, include_tools=args.include_tools,
+            include_subagents=args.include_subagents, exact=args.exact,
+            exhaustive=args.exhaustive)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json
+              else live_search.format_search(result))
+        return 0 if all(c["status"] == live_search.COMPLETE for c in result["coverage"].values()) else 2
+    result = live_search.read_session(args.reference, args.around,
+                                     context=args.context, include_tools=args.include_tools)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"{result['reference']} — {result['title']} (bounded source window)")
+        for record in result["records"]:
+            print(f"\n[{record['sender']}] {record['anchor']}\n{record['text']}")
+        if result["truncated"]:
+            print("\n[output truncated]")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+    dream_schedule = argparse.ArgumentParser(add_help=False)
+    dream_schedule.add_argument(NO_DREAM_FLAG, action="store_true",
+                                help="disable scheduled Dream inference; keep sync and indexing")
 
-    # Shared account flags, attached to the subcommands that authenticate — so
-    # `clync sync --profile X` works (a top-level flag would have to precede the
-    # subcommand, which is a footgun).
-    cred = argparse.ArgumentParser(add_help=False)
-    cred.add_argument("--profile", default=os.environ.get(PROFILE_ENV),
-                      help=f"Chrome profile display name (default: ${PROFILE_ENV})")
-    cred.add_argument("--org", help="restrict to one org name or uuid "
-                                     "(default: all chat-capable orgs)")
+    # Network sources authenticate against different accounts, so their profile
+    # flags are separate. A shared `--profile` would make cross-account sync easy
+    # to trigger accidentally and is intentionally not offered.
+    claude_cred = argparse.ArgumentParser(add_help=False)
+    claude_cred.add_argument("--claude-profile", dest="claude_profile",
+                             default=os.environ.get(CLAUDE_PROFILE_ENV),
+                             help=f"Claude.ai Chrome profile (default: ${CLAUDE_PROFILE_ENV})")
+    claude_cred.add_argument("--org", help="restrict to one org name or uuid "
+                                      "(default: all chat-capable orgs)")
 
-    sub.add_parser("whoami", parents=[cred], help="print the resolved account + org"
+    chatgpt_cred = argparse.ArgumentParser(add_help=False)
+    chatgpt_cred.add_argument("--chatgpt-profile", dest="chatgpt_profile",
+                              default=os.environ.get(CHATGPT_PROFILE_ENV),
+                              help=f"ChatGPT Chrome profile (default: ${CHATGPT_PROFILE_ENV})")
+
+    split_cred = argparse.ArgumentParser(add_help=False)
+    split_cred.add_argument("--claude-profile", dest="claude_profile",
+                            default=os.environ.get(CLAUDE_PROFILE_ENV),
+                            help=f"Claude.ai Chrome profile (default: ${CLAUDE_PROFILE_ENV})")
+    split_cred.add_argument("--chatgpt-profile", dest="chatgpt_profile",
+                            default=os.environ.get(CHATGPT_PROFILE_ENV),
+                            help=f"ChatGPT Chrome profile (default: ${CHATGPT_PROFILE_ENV})")
+    split_cred.add_argument("--org", help="restrict Claude.ai to one org name or uuid "
+                                      "(default: all chat-capable orgs)")
+
+    sub.add_parser("whoami", parents=[claude_cred], help="print the resolved Claude.ai account + org"
                    ).set_defaults(func=cmd_whoami)
 
-    sp = sub.add_parser("sync", parents=[cred],
-                        help="sync ALL sources (claude.ai + local Claude Code + Codex CLI) + index")
+    sp = sub.add_parser(
+        "sync", parents=[split_cred],
+        help="sync web and local sessions + configured sources, then index",
+    )
     sp.add_argument("--full", action="store_true", help="re-fetch/re-parse everything")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
     sp.add_argument("--no-index", action="store_true",
                      help="skip hybrid-search indexing after sync")
     sp.set_defaults(func=cmd_sync)
 
-    sp = sub.add_parser("sync-app", parents=[cred],
+    sp = sub.add_parser("sync-app", parents=[claude_cred],
                         help="sync claude.ai chats ONLY (network/cookies) + index")
     sp.add_argument("--full", action="store_true", help="re-fetch every conversation")
     sp.add_argument("--no-files", action="store_true", help="skip image downloads")
@@ -1912,11 +2199,14 @@ def main() -> int:
     sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
     sp.set_defaults(func=cmd_sync_cc)
 
-    sp = sub.add_parser("sync-chatgpt", parents=[cred],
+    sp = sub.add_parser("sync-chatgpt", parents=[chatgpt_cred],
                         help="sync ChatGPT web history ONLY (network/cookies)")
     sp.add_argument("--full", action="store_true",
                     help="re-fetch every conversation (ignore incremental watermarks)")
     sp.add_argument("--no-index", action="store_true", help="skip reindex after sync")
+    sp.add_argument("--projects-only", action="store_true",
+                     help="sync project threads and reconcile their membership; "
+                          "leave unrelated ordinary history unchanged")
     sp.set_defaults(func=cmd_sync_chatgpt)
 
     sp = sub.add_parser("sync-codex", help="ingest local Codex CLI sessions ONLY "
@@ -1925,32 +2215,52 @@ def main() -> int:
     sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
     sp.set_defaults(func=cmd_sync_codex)
 
+    sp = sub.add_parser("sync-pi", help="ingest local Pi sessions ONLY "
+                                        "(no network / cookies) + index")
+    sp.add_argument("--full", action="store_true", help="re-parse every transcript")
+    sp.add_argument("--no-index", action="store_true", help="skip indexing after ingest")
+    sp.set_defaults(func=cmd_sync_pi)
+
+    sp = sub.add_parser("sync-artiport", help="sync configured Artiport static artifacts + index")
+    sp.add_argument("--full", action="store_true", help="replay the source change feed")
+    sp.add_argument("--no-index", action="store_true", help="skip reindex after ingest")
+    sp.set_defaults(func=cmd_sync_artiport)
+
+    sp = sub.add_parser("sync-opencode", help="sync OpenCode v2 root transcripts + index")
+    sp.add_argument("--full", action="store_true", help="re-export every root session")
+    sp.add_argument("--no-index", action="store_true", help="skip indexing after sync")
+    sp.set_defaults(func=cmd_sync_opencode)
+
     sp = sub.add_parser("index", help="(re)build the hybrid-search index")
     sp.add_argument("--full", action="store_true", help="reindex every unit")
     sp.set_defaults(func=cmd_index)
 
-    sub.add_parser("scheduled", parents=[cred],
-                   help="launchd entry point (sync + loud fail/late notify)"
-                   ).set_defaults(func=cmd_scheduled)
+    sub.add_parser(
+        "scheduled", parents=[split_cred, dream_schedule],
+        help="launchd entry point (all-source sync + loud fail/late notify)",
+    ).set_defaults(func=cmd_scheduled)
 
     sub.add_parser("migrate", help="rebuild DERIVED schemas whose shape went stale "
                                    "(DESTRUCTIVE: drops embeddings/insights)"
                    ).set_defaults(func=cmd_migrate)
 
     sp = sub.add_parser("search", help="faceted hybrid (dense + sparse) semantic "
-                                       "search across claude.ai + Claude Code")
+                                       "search across all raw sources")
     sp.add_argument("query", nargs="?", default="",
                     help="natural-language query (empty => recency browse)")
     sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)
     sp.add_argument("--source", choices=VALID_SOURCES,
                     default="all", help="restrict to one source (default: all)")
-    sp.add_argument("--project", help="claude.ai project name/uuid; "
+    sp.add_argument("--project", help="claude.ai or ChatGPT project name/uuid; "
                     "'any' = in some project, 'none' = not in a project")
     sp.add_argument("--model", help="claude.ai model facet")
-    sp.add_argument("--repo", help="Claude Code repo name")
+    sp.add_argument("--repo", help="local session repo name")
     sp.add_argument("--worktree", help="Claude Code worktree name")
     sp.add_argument("--branch", help="Claude Code git branch")
-    sp.add_argument("--session", help="Claude Code session name or id")
+    sp.add_argument("--session", help="local session name or clync unit id")
+    sp.add_argument("--sender", help="whose words the hit must be: user | assistant")
+    sp.add_argument("--per-unit", type=int, default=1, dest="per_unit",
+                    help="hits one unit may contribute (default 1)")
     sp.add_argument("--since", help="only units updated on/after this ISO date")
     sp.add_argument("--until", help="only units updated on/before this ISO date")
     sp.add_argument("--sort", choices=["relevance", "recency"], default="relevance")
@@ -1958,13 +2268,45 @@ def main() -> int:
                      help="restrict to one language (default: all)")
     sp.set_defaults(func=cmd_search)
 
+    sp = sub.add_parser("read", help="read an archived conversation, optionally bounded by index/role")
+    sp.add_argument("uuid", help="unit ID returned by archived search")
+    sp.add_argument("--from-idx", type=int)
+    sp.add_argument("--to-idx", type=int)
+    sp.add_argument("--sender", choices=["user", "assistant"])
+    sp.set_defaults(func=cmd_read)
+
+    sessions = sub.add_parser("sessions", help="live lexical search; no sync, database or embeddings")
+    actions = sessions.add_subparsers(dest="session_action", required=True)
+    sp = actions.add_parser("search", help="find current native sessions with bounded typo tolerance")
+    sp.add_argument("query", help="keywords matched within one passage, not a semantic question")
+    sp.add_argument("--source", default="all", help="all or comma-separated claude_code,codex_cli,opencode,grok,pi")
+    sp.add_argument("--repo", help="repository name or exact directory component")
+    sp.add_argument("--sender", choices=["user", "assistant", "tool"])
+    sp.add_argument("--since", help="ISO date; source modification / update time")
+    sp.add_argument("--limit", type=int, default=DEFAULT_TOPK)
+    sp.add_argument("--exact", action="store_true", help="disable one-edit ASCII word matching")
+    sp.add_argument("--exhaustive", action="store_true", help="include fuzzy-only passages alongside anchored hits")
+    sp.add_argument("--include-subagents", action="store_true")
+    sp.add_argument("--include-tools", action="store_true", help="include reasoning and tool records with attribution")
+    sp.add_argument("--json", action="store_true", help="structured hits and per-source coverage")
+    sp.set_defaults(func=cmd_sessions)
+    sp = actions.add_parser("read", help="read a bounded live source window around a returned anchor")
+    sp.add_argument("reference")
+    sp.add_argument("--around", required=True, help="anchor returned by sessions search")
+    sp.add_argument("--context", type=int, default=3, help="neighboring records per side (0-10)")
+    sp.add_argument("--include-tools", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_sessions)
+
     sp = sub.add_parser("list", help="most recently updated units")
     sp.add_argument("--limit", type=int, default=20)
     sp.add_argument("--source", choices=VALID_SOURCES, default="all")
     sp.set_defaults(func=cmd_list)
 
-    sub.add_parser("doctor", help="health check store / index / launchd / MCP"
-                   ).set_defaults(func=cmd_doctor)
+    sp = sub.add_parser("doctor", help="health check store / index / launchd / MCP")
+    sp.add_argument("--mcp-client", choices=["claude", "codex", "opencode"], default="claude",
+                    help="client whose Clync registration to check (default: claude)")
+    sp.set_defaults(func=cmd_doctor)
 
     dp = sub.add_parser("dream", help="knowledge-distillation layer (ADR 0004)")
     dsub = dp.add_subparsers(dest="dream_action", required=True)
@@ -1996,7 +2338,7 @@ def main() -> int:
     dsub.add_parser("status", help="watermark, topic table, usage totals"
                     ).set_defaults(func=cmd_dream_status)
 
-    sp = sub.add_parser("setup", parents=[cred],
+    sp = sub.add_parser("setup", parents=[split_cred, dream_schedule],
                         help="one-shot install: deps, CLI, MCP, scheduler, skill")
     sp.add_argument("--at", default="09:00", help="daily sync time HH:MM (default 09:00)")
     sp.set_defaults(func=cmd_setup)
@@ -2004,11 +2346,13 @@ def main() -> int:
     sub.add_parser("unsetup", help="remove everything setup installed (keeps the DB)"
                    ).set_defaults(func=cmd_unsetup)
 
-    sp = sub.add_parser("install", parents=[cred], help="install just the daily launchd sync")
+    sp = sub.add_parser("install", parents=[split_cred, dream_schedule],
+                        help="install the supervised database and daily launchd sync")
     sp.add_argument("--at", default="09:00", help="daily time HH:MM (default 09:00)")
     sp.set_defaults(func=cmd_install)
 
-    sub.add_parser("uninstall", help="remove just the launchd sync").set_defaults(func=cmd_uninstall)
+    sub.add_parser("uninstall", help="remove launchd jobs and stop the database (keeps its data)"
+                   ).set_defaults(func=cmd_uninstall)
 
     sp = sub.add_parser("status", help="scheduled-sync status + recent run log")
     sp.add_argument("--tail", type=int, default=15, help="log lines to show")

@@ -2,121 +2,277 @@
 
 **Your AI conversations, remembered across tools.**
 
-Sync conversation history into a local archive, search it from your assistant,
-and recall cited insights without hunting through old chats.
+Search conversations and coding sessions live or from a local archive. Recover a decision,
+find the session behind a fix, or revisit your reasoning with supporting transcripts.
 
-[Quick start](#quick-start) · [Connect an assistant](#connect-an-assistant) · [Dream](#dream) · [Design](docs/adr/)
+[Sources](#sources) · [Live session search](#live-session-search) · [Quick start](#quick-start) · [Connect](#connect-an-assistant) · [Usage](#usage) · [Dream](#dream)
 
-## What it imports
+## Sources
 
-| History source | Imported content |
-|---|---|
+| Imported from | What is included |
+| --- | --- |
 | **claude.ai** | Conversations and project documents |
-| **ChatGPT** | Conversations exposed by its history-listing API |
+| **ChatGPT** | Conversations, including project threads |
 | **Claude Code** | Local interactive CLI sessions |
 | **Codex CLI** | Local interactive terminal sessions |
+| **Pi** | Local primary-session tree history, including forks and pre-compaction messages |
+| **OpenCode v2** | Local root sessions, including archives and forks (when configured) |
+| **Artiport** | Static artifact text, canonical links, revisions, and copy provenance (when configured) |
 
 > [!NOTE]
-> **Grok Build can use clync's MCP tools, but its history is not imported.**
-> MCP access and history ingestion are separate capabilities. Codex Desktop,
-> headless runs, and separate subagent transcripts are not supported history sources.
-> ChatGPT project-history discovery is not implemented.
+> **Grok Build history is not imported, but is live-searchable below.** Codex Desktop, headless runs, and
+> separate subagent transcripts are also excluded. Connecting an MCP client
+> does not add its history to clync.
 
-## Before you start
+## Live session search
 
-macOS, Python 3.11+, and Homebrew are required for the instructions below.
-Chrome is needed only for web-history sync.
+Find current **Claude Code, Codex (CLI/Desktop), OpenCode v2, Pi, and Grok Build** sessions
+without a sync, Postgres, embeddings, a content index, or a background watcher.
+The live CLI needs Python 3.11+; file-backed search also needs `rg` on PATH:
 
-> [!WARNING]
-> Indexing and relevance search run **BGE-M3 locally** and can consume substantial
-> CPU/GPU resources and memory, especially on the first import. There is currently
-> **no full embedding opt-out**. `--no-index` skips one sync's indexing;
-> it does not disable search embeddings or scheduled indexing.
+```sh
+python3 clync.py sessions search "authentcation cookie" --repo my-project
+python3 clync.py sessions search "scheduler" --source claude_code,codex_cli --json
+python3 clync.py sessions read '<reference>' --around '<anchor>'
+```
+
+Queries are lexical keywords, not semantic questions. Words are case-insensitive;
+ASCII words of length five or more tolerate one insertion, deletion, substitution,
+or adjacent transposition. Identifier separators/camel case and full-width ASCII
+are folded; Japanese keywords and JSON-escaped text are supported.
+
+For Claude Code, Codex and Pi, the fast default verifies candidate records with literal query
+anchors and independently matches session titles. If it finds nothing, it broadens to
+fuzzy candidates. **It does not enumerate every fuzzy-only match when anchored hits already
+exist.** Use `--exhaustive` for that. OpenCode and Grok verify all potentially matching
+passages, including fuzzy-only matches. `--exact` disables typo tolerance for every source.
+Matching coverage is reported separately from source availability. Reads are bounded and
+content-hashed; search again after a stale-anchor error.
+
+Default content is primary-session conversation text, including structured answers
+to questions. Claude Code SDK runs are excluded; Codex interface origin does not
+exclude Desktop sessions. `--include-subagents` includes child transcripts;
+`--include-tools` also searches reasoning and tool records with their own attribution.
+Use `--sender user` for the user's own words, `--repo` for a directory component or
+native project root name, and `--since` for file-modification/native session-update time.
+
+`CLYNC_CC_ROOT`, `CLYNC_CODEX_ROOT`, and `CLYNC_GROK_ROOT` override native roots
+(Grok's root contains `sessions/`). OpenCode uses the executable configuration described
+below and requires the local service and `lsof`. Search verifies that the service PID
+holds the configured native SQLite database open, then filters raw message/part candidates
+in a read-only snapshot before decoding them. It creates no content index or transcript copy.
+Configured executable wrappers must forward both `api get` and `debug paths db` commands.
+The supported release/schema contract is pinned in [`live_opencode.py`](live_opencode.py).
+An unsupported release/schema, remote service, or unverifiable database reports unavailable;
+there is no full-history API fallback. Hit reads still use OpenCode's projected API.
+Concurrent database commits are reported as partial coverage with snapshot results.
+Missing sources, changing files, and pending JSONL tails are explicit coverage states;
+the CLI exits **2** for partial/unavailable coverage while still returning verified hits.
+
+MCP exposes the same engine as **`search_sessions`** and **`read_session`**. Server
+startup and live requests do not initialize the archive or warm a model. Archived
+tools initialize the store on first use. Reload existing MCP clients after updating.
+Pi reads native JSONL directly using candidate-first `rg` scans, without invoking a Pi CLI.
+The default root follows `PI_CODING_AGENT_DIR` (normally `~/.pi/agent`);
+`CLYNC_PI_ROOT` overrides its sessions directory. Both grouped and flat session roots work.
+Live reads follow tree edges, not append-order siblings, and report ambiguous branches.
+Pi user-role messages are labelled `pi_user`: human authorship is not encoded in the
+source, so `--sender user` excludes them. Omit that filter to search them.
+
+`clync sync-pi` ingests primary Pi sessions and indexes them; `--no-index` skips
+embedding and `--full` reparses all sessions. Regular sync also includes Pi.
+Archive history retains entry/ancestor labels and excludes tool-output bodies and
+delegated children. Unchanged files are skipped. Duplicate session IDs or incomplete
+files fail explicitly instead of being silently indexed as complete.
 
 ## Quick start
 
-Install dependencies and keep the clone at a stable path:
+> [!WARNING]
+> Archive indexing and semantic relevance search use local embeddings and can consume substantial
+> CPU/GPU resources. There is no full embedding opt-out: `sync --no-index` skips
+> indexing for that run only; scheduled sync still indexes.
+
+Requires **macOS**, Chrome signed into both web accounts, `uv`, Python 3.11+,
+Homebrew, and Claude Code. From the cloned repository:
 
 ```sh
-brew install uv postgresql@17 pgvector
-git clone https://github.com/joy13975/clync.git
-cd clync
-uv sync
+brew install postgresql@17 pgvector
+
+# Chrome profile display names; both can use the same profile.
+export CLYNC_CLAUDE_PROFILE="Your Claude profile"
+export CLYNC_CHATGPT_PROFILE="Your ChatGPT profile"
+
+uv run python clync.py setup
+uv run python clync.py sync
+uv run python clync.py doctor
 ```
 
-Import whichever local history you have; each command also indexes it:
-
-```sh
-uv run python clync.py sync-cc
-uv run python clync.py sync-codex
-uv run python clync.py search "why we changed the authentication flow"
-```
-
-Run only the import commands whose source directories exist. These manual steps
-do not install a background schedule.
+Setup prepares the database, registers Claude Code tools and skills, and schedules
+daily sync. The separate `sync` command imports and indexes your history.
 
 <details>
-<summary>Import claude.ai or ChatGPT history</summary>
+<summary>Paths and authentication</summary>
 
-Sign in to the relevant website in Chrome, then substitute your Chrome profile's
-display name:
-
-```sh
-uv run python clync.py sync-app --profile "Person 1"
-uv run python clync.py sync-chatgpt --profile "Person 1"
-```
-
-Web sync reads that profile's existing login cookies. Expired sessions may require
-opening the website again. Both commands accept `CLYNC_PROFILE` as the default
-profile. Web APIs are unofficial and may change.
+- Full sync requires `~/.claude/projects` and `~/.codex`; override with
+  `CLYNC_CC_ROOT` and `CLYNC_CODEX_ROOT`.
+- PostgreSQL defaults to `/opt/homebrew/opt/postgresql@17/bin`. Use
+  `CLYNC_PG_BIN` for another installation with pgvector `>= 0.8.0` for PostgreSQL 17
+  (`0.8.4+` recommended for VACUUM HNSW fixes; earlier `0.8.x` runs with a warning).
+- Cookie access uses the macOS login keychain. Refresh expired web logins
+  in the selected Chrome profile.
 
 </details>
 
 ## Connect an assistant
 
-From the repository directory, register the server with your chosen client:
+**Claude Code:** open a new session after setup.
+
+**Codex:** register from the repository directory:
 
 ```sh
-# Claude Code
-claude mcp add --scope user clync -- uv run --project "$PWD" python "$PWD/mcp_server.py"
-
-# Codex
-codex mcp add clync -- uv run --project "$PWD" python "$PWD/mcp_server.py"
+codex mcp add clync -- /bin/zsh -lc \
+  'exec uv run --project "$1" python "$1/mcp_server.py"' clync "$PWD"
 ```
 
-Start a new client session, then ask it to search your history.
-**Grok Build** can import the Claude MCP registration through its
-[Claude compatibility support](https://docs.x.ai/build/features/mcp-servers#compatibility).
+**OpenCode v2:** register from the repository directory:
 
-The MCP tools provide combined insight/transcript search, separate searches of
-each layer, and full conversation retrieval. The shell `search` command searches
-raw history by default. Filter by source, repository, project, session, or dates;
-see `uv run python clync.py search --help`.
+```sh
+opencode mcp add clync --global -- /bin/zsh -lc \
+  'exec uv run --project "$1" python "$1/mcp_server.py"' clync "$PWD"
+opencode mcp list
+clync doctor --mcp-client opencode
+```
+
+OpenCode discovers compatible skills separately from MCP servers. Loading the Clync
+skill does not connect its tools, and importing OpenCode history below does not
+register an MCP client. `/mcps` manages configured connections; default Code Mode
+exposes connected tools through catalog discovery. Configuration reloads automatically.
+
+**Grok Build:** [Claude compatibility](https://docs.x.ai/build/features/mcp-servers#compatibility),
+enabled by default, discovers the registration in `~/.claude.json`.
+Other local stdio MCP clients can launch the same server command.
+The login shell resolves `uv` from the current PATH, so the registration does
+not depend on the Python environment that originally installed `uv`. `doctor`
+checks Claude Code by default; `--mcp-client codex` checks Codex registration and its
+executable, while the OpenCode check queries the current location's live connection state.
+
+Ask “Why did I choose Postgres?” or “Find the session where we fixed ChatGPT sync.”
+
+Use `search_sessions` / `read_session` for live coding-session finding.
+`search_history` returns archived insights and transcript matches; `get_conversation`
+retrieves an archived transcript.
+
+## Usage
+
+Run from the repository directory:
+
+```sh
+# Search original conversations.
+uv run python clync.py search "authentication" --repo my-project
+
+# Read an archived hit without fetching the whole conversation.
+uv run python clync.py read '<unit-id>' --from-idx 10 --to-idx 20 --sender user
+
+# Recall insights and supporting conversations.
+uv run python clync.py dream recall "local model requirements" --evidence
+
+# Check scheduled sync or browse commands.
+uv run python clync.py status
+uv run python clync.py --help
+```
+
+Use `sync-app`, `sync-chatgpt`, `sync-cc`, `sync-codex`, or `sync-opencode` for one source.
+Each command has `--help`.
+
+### OpenCode
+
+`clync sync-opencode` reads the local OpenCode v2 service through the installed
+`opencode` CLI, then indexes the imported transcripts. It uses OpenCode's existing
+authentication and service discovery; no cookies or API token are needed.
+
+To include it in ordinary and daily sync, save
+`{"command":"/absolute/path/to/opencode"}` in `$CLYNC_DATA_HOME/opencode.json`
+(default `~/.local/share/clync/opencode.json`). Use `command -v opencode` to find
+the executable. `CLYNC_OPENCODE_CONFIG` selects another configuration file.
+A configured source that becomes unavailable fails loudly without preventing
+the other sources from syncing. The standalone command can also resolve
+`opencode` from PATH when no configuration exists.
+
+Only root sessions are imported; archived sessions and forks remain included.
+Child/subagent transcripts are never exported. Synthetic/system messages,
+subagent invocations, and **all tool-result bodies are excluded from storage**,
+including raw metadata. User text, assistant prose/reasoning, compact tool intent,
+and structured user answers to questions are retained. Root sessions started
+headlessly are included: OpenCode does not expose a standard interactive-origin
+field. Binary attachments are not imported.
+
+Search with `--source opencode`; supported facets are `repo`, `session`, `model`,
+and `sender`. Session IDs in clync are prefixed with `opencode:`. In-flight exports
+are marked dirty and retried on the next sync. `--full` re-exports every root;
+`--no-index` skips indexing for that run. Imported conversations are eligible for
+Dream processing like the other transcript sources.
+
+For Artiport, save `{"url":"https://YOUR-ARTIPORT","token":"READ_ONLY_TOKEN"}` in
+`$CLYNC_DATA_HOME/artiport.json` (default `~/.local/share/clync/artiport.json`), with
+file permissions `600`. `CLYNC_ARTIPORT_CONFIG` can select another configuration
+file. One Artiport server is configured at a time; switching its instance removes
+records imported from the previous instance after verifying the new inventory.
+Run `clync sync-artiport` once; the configured server also joins the daily
+sync. Indexing does not renew artifact retention. Archived artifacts remain
+searchable; payload deletion removes their imported text and embeddings, even
+with `--no-index`. Search with `--source artiport` or the normal all-source tools.
+Artifact text is excluded from Dream distillation so expiration cannot leave a
+permanent distilled copy.
+After updating clync, reload existing MCP clients so their running server process
+loads the new source; the CLI and newly started MCP clients load it immediately.
 
 ## Dream
 
-Dream uses Claude Code to distill **stance-tagged insights with source citations**.
-It tracks revisions and can return the evidence behind a recalled insight.
+Dream distills history into cited insights, distinguishing your positions from
+assistant suggestions and recording revisions. Backfill existing history with:
 
 ```sh
-uv run python clync.py dream topics --seed
 uv run python clync.py dream backfill --max-calls 30
-uv run python clync.py dream recall "authentication decisions" --evidence
+uv run python clync.py dream status
 ```
 
-Backfill mines existing history and saves progress for later runs. The first
-incremental `dream run` initializes its watermark rather than mining the archive.
-Dream consumes Claude usage; billing depends on your Claude Code authentication.
+Backfills are resumable. Scheduled Dream runs process new activity after an
+initial watermark-only run. Dream sends transcript content through Claude Code;
+usage and billing depend on its authentication. The isolated worker uses the
+Claude user settings' `env` and `apiKeyHelper`, including a configured provider.
+It excludes other settings and retains inherited credentials when no user
+settings file exists.
 
-## Data and operation
+Use `--no-dream` with `install` or `setup` to disable scheduled Dream inference
+while keeping history sync and indexing. Explicit `dream run` and `dream backfill`
+commands remain available.
 
-The archive lives in a dedicated local PostgreSQL/pgvector cluster under
-`~/.local/share/clync`; override this with `CLYNC_DATA_HOME`.
-Embeddings run locally, but retrieved text goes to your chosen assistant, and
-Dream sends selected conversation content to Claude.
+`install` and `setup` also register a separate Postgres LaunchAgent. It starts
+the database at login and restarts it after an exit, independently of the daily
+sync. Run `clync install` once to add supervision to an existing installation;
+pass the same profiles, schedule, and Dream preference as before. `doctor`
+reports missing database supervision. `uninstall` removes both launchd jobs
+and stops the database while retaining its data.
 
-Use `--help` for commands and options. [CLAUDE.md](CLAUDE.md) indexes the code,
-skills, and operational guidance; [architecture decisions](docs/adr/) explain
-the retrieval and storage design.
+## Data and resources
 
-[MIT license](LICENSE).
+History and the index live under `~/.local/share/clync` by default
+(`CLYNC_DATA_HOME` overrides it). Embeddings run locally. Retrieved content
+is shared with the assistant that queries it.
+
+`uv run python clync.py unsetup` removes the scheduler and Claude Code integration,
+stops the database, and retains its data. Remove manually added MCP registrations
+separately.
+
+<details>
+<summary>Staying out of the way</summary>
+
+`CLYNC_RESOURCE_FRACTION` controls embedding thread counts relative to logical
+CPUs; explicit thread-pool variables take precedence.
+`CLYNC_EMBED_DEVICE=cpu` keeps embedding off the GPU.
+
+</details>
+
+---
+
+[Search guide](skill/SKILL.md) · [Architecture](docs/adr/) · [Dream design](docs/adr/0004-dream-layer.md)

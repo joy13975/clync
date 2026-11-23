@@ -4,6 +4,10 @@ Corpus: a private clync corpus (20 queries). pre_topk=50, topk=10, RRF k=60. Emb
 
 Benchmark backing [ADR 0001](../../docs/adr/0001-drop-cross-encoder-reranker.md). Reproduce (needs the local clync DB + the gitignored data/ artifacts): `uv run python ablation.py candidates && … embed && … run && … judge-targets`, judge the pairs, then `… report`.
 
+The corpus and query file are private and are not distributed. To run the harness, supply
+`data/queries.json` with your own `id`, `query`, `lang`, `type`, `difficulty`, and
+`target_conv_uuid` fields. The measurements below describe the original private dataset.
+
 ## 1. Divergence gate (label-free): does the reranker even change the top-10?
 
 | metric | mean | read |

@@ -9,10 +9,9 @@ Two levels, never recursive: insights derive only from raw transcript, digests
 only from insight rows. Derived text is never input to another derivation — that
 caps hallucination amplification at one hop.
 
-Inference runs through the **local `claude` CLI under subscription OAuth** — no
-Anthropic API key, no API billing. Every call is a pure function of its prompt:
-no tools, no MCP, no settings, no session persistence (so the worker's own
-transcripts can never be re-ingested by `sync-cc`).
+Inference runs through the local `claude` CLI; see README's Dream section for
+authentication and billing. Worker transcripts can never be re-ingested by
+`sync-cc`.
 
 Fail loud: a worker call that errors, or returns no validated `structured_output`,
 raises. A candidate insight whose citations don't resolve to real text in
@@ -33,14 +32,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from clync import (DEFAULT_TOPK, RAW_SOURCES, _json, _now, connect_pg, get_meta,
-                   require_rebuild, set_meta, sql_statements)
+import cc
+from clync import (DEFAULT_TOPK, NONEMPTY_MSG_SQL, RAW_SOURCES, _json, _now,
+                   connect_pg, get_meta, require_rebuild, set_meta,
+                   sql_statements)
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -68,11 +71,11 @@ STATUS_ACTIVE, STATUS_SUPERSEDED, STATUS_RETRACTED = "active", "superseded", "re
 # is allowed to read. Enforced at the query, not by convention: that is what makes
 # the layer non-circular.
 #
-# The two sources label the user's turns DIFFERENTLY — claude.ai says 'human',
-# Claude Code says 'user' (verified against the live store). Hardcoding either one
-# silently empties the skeleton for the other source's entire corpus, so this set
-# is the SSOT for "a turn the user wrote".
-USER_SENDERS = ("human", "user")
+# The sources label the user's turns DIFFERENTLY, and a new channel of theirs can
+# appear at any time, so "a turn the user wrote" is resolved from `cc.SENDER_ROLES`
+# rather than listed again here. Hardcoding one spelling silently empties the
+# skeleton for another source's entire corpus.
+USER_SENDERS = cc.resolve_sender_role("user")
 
 TRIAGE_SKELETON_CHARS = 1200     # per unit, for the batched triage call
 DIG_BATCH_UNITS = 6              # candidate units per distill call
@@ -426,18 +429,8 @@ def ensure_dream_schema(*, rebuild: bool = False) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The worker: headless `claude -p` under subscription auth
+# The worker
 # --------------------------------------------------------------------------- #
-# Measured 2026-07-26 (claude 2.1.220), as total prefill (input + cache_creation +
-# cache_read): these flags take per-call overhead from 76,068 tokens (bare
-# `claude -p`) to 9,209, and replacing the system prompt takes it to a 515 floor.
-# With this layer's real system prompts + schemas a call prefills ~1.6-2.1k.
-# `--strict-mcp-config` +
-# `--setting-sources ""` + `--disable-slash-commands` strip MCP tool schemas,
-# user settings and skills; `--system-prompt` replaces Claude Code's own prompt.
-# `--no-session-persistence` writes NO transcript under ~/.claude/projects, which
-# is what stops `sync-cc` re-ingesting the worker's output. `--bare` is NOT usable
-# here: its auth is strictly ANTHROPIC_API_KEY, never OAuth.
 _WORKER_FLAGS = (
     "--output-format", "json",
     "--tools", "",
@@ -462,7 +455,14 @@ def _run_worker(prompt: str, schema: dict, *, system: str,
             *_WORKER_FLAGS]
     if effort:
         argv += ["--effort", effort]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    env = os.environ.copy()
+    settings_file = Path(env.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "settings.json"
+    if settings_file.exists():
+        settings = json.loads(settings_file.read_text())
+        env.update(settings.get("env", {}))
+        if settings.get("apiKeyHelper"):
+            argv += ["--settings", json.dumps({"apiKeyHelper": settings["apiKeyHelper"]})]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
     if proc.returncode != 0:
         # A non-zero exit yields raw CLI stderr, never the structured result JSON, so a
         # substrate limit here can only be recognised by the marker fallback.
@@ -670,7 +670,7 @@ def skeleton(con, unit_id: str) -> str:
     if u["kind"] == "project_doc":
         where, params = "m.unit_id=%s", (unit_id,)
     else:
-        where, params = "m.unit_id=%s AND m.sender = ANY(%s)", (unit_id, list(USER_SENDERS))
+        where, params = "m.unit_id=%s AND m.sender = ANY(%s)", (unit_id, USER_SENDERS)
     rows = con.execute(
         f"SELECT {_TEXT} AS t FROM messages m WHERE {where} ORDER BY m.idx",
         params).fetchall()
@@ -1959,6 +1959,7 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
     # five-times-asserted position must not rank as if they were the same object.
     ids: list[str] = []
     no_match = False
+    query_embedding = search._embed([query], max_length=512) if query.strip() else None
     if query.strip():
         # RRF scores are rank-only (they cannot say "nothing here is relevant"),
         # so the floor is on dense cosine similarity, applied by retrieval
@@ -1968,7 +1969,8 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
         # failure the stance machinery exists to prevent.
         ids = [r["unit_id"] for r in
                search.hybrid_search(query, topk=limit * 4, source=DREAM_SOURCE,
-                                    min_dense_sim=MIN_DENSE_SIM)]
+                                    min_dense_sim=MIN_DENSE_SIM,
+                                    query_embedding=query_embedding)]
         no_match = not ids
     where = ["i.status = %(status)s"] if not as_of else [
         # Window-only PLUS not-retracted: supersession always closes the window
@@ -2016,7 +2018,8 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
     # both ("what did I decide, and where did I decide it"), and making the caller
     # choose a tool is making it guess. `include_raw=False` backs the
     # insights-only drill-down, which must not pay for a transcript search.
-    raw = (search.hybrid_search(query, topk=limit, source="all")
+    raw = (search.hybrid_search(query, topk=limit, source="all",
+                                query_embedding=query_embedding)
            if include_raw and query.strip() else [])
 
     # --- coverage: the gap is information the caller MUST have. Silence about what
@@ -2031,7 +2034,7 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
         newer = con.execute(
             "SELECT count(*) AS n FROM units WHERE source = ANY(%(sources)s) "
             f"AND {_LEARNED_AT_SQL} > %(since)s AND {_RENDERABLE_SQL}",
-            {"sources": list(RAW_SOURCES), "senders": list(USER_SENDERS),
+            {"sources": list(RAW_SOURCES), "senders": USER_SENDERS,
              "since": topic["last_dig_at"]}).fetchone()["n"]
         if newer:
             cov.append(f"{newer} raw unit(s) changed since this topic was last dug "
@@ -2054,7 +2057,7 @@ def recall(con, query: str = "", *, topic_id: str | None = None,
             total_msgs = con.execute(
                 "SELECT count(*) AS n FROM messages WHERE unit_id IN "
                 "(SELECT DISTINCT unit_id FROM dream_attempted WHERE topic_id=%s) "
-                "AND btrim(coalesce(embed_text, text, '')) <> ''",
+                f"AND {NONEMPTY_MSG_SQL}",
                 (topic["topic_id"],)).fetchone()["n"]
             if read["msgs"] < total_msgs:
                 cov.append(
@@ -2163,8 +2166,11 @@ def format_recall(result: dict, *, requested_topic: str | None = None,
         out.append("  (none)")
     for r in result["raw"]:
         snippet = r["text"].replace("\n", " ")[:200]
+        # WHOSE words the snippet is. Without it a raw hit reads as the user's
+        # position when it can equally be what was said TO them.
+        who = f"  sender={r['sender']}" if r.get("sender") else ""
         out.append(f"\n- [{r['source']}] {r['unit_name'] or '(untitled)'}  "
-                   f"[{r['unit_id']}]  score={r['score']:.4f}\n  {snippet}")
+                   f"[{r['unit_id']}]{who}  score={r['score']:.4f}\n  {snippet}")
     return out
 
 
@@ -2271,7 +2277,7 @@ def _calls_made(con) -> int:
 _RENDERABLE_SQL = (
     "EXISTS (SELECT 1 FROM messages m WHERE m.unit_id = units.unit_id "
     "AND (units.kind = 'project_doc' OR m.sender = ANY(%(senders)s)) "
-    "AND btrim(coalesce(m.embed_text, m.text, '')) <> '')")
+    f"AND {NONEMPTY_MSG_SQL})")
 
 # The watermark compares against when clync LEARNED of a unit, never only when
 # the SOURCE last touched it: `updated_at` is source-authored (NULL for project
@@ -2287,7 +2293,7 @@ def _changed_units(con, since: str) -> tuple[list[str], list[str]]:
 
     `skipped_empty` is the changed units excluded because nothing in them is
     renderable — returned so the run REPORT shows the skip instead of hiding it."""
-    params = {"sources": list(RAW_SOURCES), "senders": list(USER_SENDERS),
+    params = {"sources": list(RAW_SOURCES), "senders": USER_SENDERS,
               "since": since}
     base = ("SELECT unit_id FROM units WHERE source = ANY(%(sources)s) "
             "AND (msg_count IS NULL OR msg_count > 0) "

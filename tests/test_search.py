@@ -39,12 +39,14 @@ def _seed_project(project_uuid, name, docs, org="org1"):
     con.close()
 
 
-def _seed_cc(unit_id, title, repo, texts, worktree=None, branch=None):
-    """Insert a Claude Code session unit directly (bypasses file parsing)."""
+def _seed_cc(unit_id, title, repo, texts, worktree=None, branch=None, senders=None):
+    """Insert a Claude Code session unit directly (bypasses file parsing).
+    `senders` pairs with `texts` when a test needs turns of differing authorship."""
     import cc
-    msgs = [cc.CCMessage(msg_id=f"{unit_id}-m{i}", idx=i, sender="user",
+    senders = senders or [cc.HUMAN_SENDER] * len(texts)
+    msgs = [cc.CCMessage(msg_id=f"{unit_id}-m{i}", idx=i, sender=s,
                          role_detail="text", text=t, created_at=T1)
-            for i, t in enumerate(texts)]
+            for i, (t, s) in enumerate(zip(texts, senders))]
     s = cc.CCSession(session_id=unit_id, title=title, summary=None,
                      created_at=T1, updated_at=T1, repo=repo, cwd=f"/x/{repo}",
                      worktree=worktree, git_branch=branch, cc_version="2.1.0",
@@ -89,8 +91,9 @@ def test_build_index_watermark_gone_and_stale_zero_chunk(pg_test_db, mock_embed)
 
     _seed("A", "Alpha", T2, ["alpha rewritten"])                     # stale
     _delete("B")                                                     # gone
+    assert all(hit["unit_id"] != "B" for hit in search.hybrid_search("beta"))
     st = search.build_index(full=False)
-    assert st["reindexed_units"] == 1 and st["removed_units"] == 1
+    assert st["reindexed_units"] == 1
     assert _pg_units(search) == {"A"}
 
     # a stale unit that now yields ZERO chunks must still be purged AND advance its
@@ -118,7 +121,7 @@ def test_hybrid_search_collapse_topk_and_lang(pg_test_db, mock_embed):
 
 def test_faceted_source_repo_and_project(pg_test_db, mock_embed):
     search = pg_test_db
-    _seed_project("p1", "Work", [("doc1", "audit.md", "cnx audit body")])
+    _seed_project("p1", "Work", [("doc1", "audit.md", "example audit body")])
     _seed("chat1", "planning", T1, ["chat body"], project_uuid="p1")
     _seed("chat2", "loose", T1, ["other body"])              # no project
     _seed_cc("ccs1", "clync design", "clync", ["postgres schema body"])
@@ -171,14 +174,14 @@ def test_empty_query_recency_browse(pg_test_db, mock_embed):
 
 def test_project_docs_and_project_chats_are_indexed(pg_test_db, mock_embed):
     search = pg_test_db
-    _seed_project("p1", "Work", [("doc1", "audit.md", "CNX infrastructure audit")])
-    _seed("chat1", "CNX sour guy dance", T1, ["about the cnx guy"], project_uuid="p1")
+    _seed_project("p1", "Work", [("doc1", "audit.md", "example infrastructure audit")])
+    _seed("chat1", "example sour guy dance", T1, ["about the example guy"], project_uuid="p1")
     st = search.build_index(full=False)
     assert st["reindexed_units"] == 2
 
-    hits = {h["unit_id"]: h["unit_name"] for h in search.hybrid_search("cnx", topk=10)}
+    hits = {h["unit_id"]: h["unit_name"] for h in search.hybrid_search("example", topk=10)}
     assert "doc1" in hits and hits["doc1"] == "[Work] audit.md"
-    assert "chat1" in hits and hits["chat1"] == "[Work] CNX sour guy dance"
+    assert "chat1" in hits and hits["chat1"] == "[Work] example sour guy dance"
 
 
 def test_project_rename_reindexes_on_incremental(pg_test_db, mock_embed):
@@ -314,6 +317,7 @@ def test_stale_chunks_column_set_is_replaced(pg_test_db, mock_embed):
     con.execute("DROP TABLE chunks")
     con.execute("CREATE TABLE chunks (chunk_id text PRIMARY KEY, unit_id text, "
                 "conv_name text, text text)")                  # drifted shape
+    con.execute("ALTER TABLE indexed_units DROP CONSTRAINT indexed_units_unit_id_fkey")
     con.execute("INSERT INTO indexed_units VALUES ('stale-unit', 'sig', 'ts')")
     con.commit()
     con.close()
@@ -362,3 +366,254 @@ def test_null_updated_at(pg_test_db, mock_embed):
     assert search.hybrid_search("anything", topk=10)
     search.build_index(full=True)
     assert "A" in _pg_units(search)
+
+
+def test_only_the_changed_message_is_re_embedded(pg_test_db, mock_embed, monkeypatch):
+    """Staleness is per CHUNK, not per unit. A chunk's text is the exact string
+    embedded, so an untouched message keeps byte-identical text and must keep its
+    vectors. Deciding it per unit made one edited message re-embed its whole
+    session."""
+    search = pg_test_db
+    _seed("u", "Long session", T1, [f"message number {i} about scheduling" for i in range(20)])
+    search.build_index(full=False)
+
+    embedded: list[str] = []
+    real = search._embed
+    monkeypatch.setattr(search, "_embed",
+                        lambda texts, max_length: (embedded.extend(texts),
+                                                   real(texts, max_length))[1])
+
+    con = clync.connect()
+    con.execute("UPDATE messages SET text=%s WHERE unit_id='u' AND idx=7",
+                ("message number 7 now says something else entirely",))
+    con.commit()
+    con.close()
+
+    stats = search.build_index(full=False)
+    assert len(embedded) == 1, f"re-embedded {len(embedded)} chunks, want only idx 7's"
+    assert "something else entirely" in embedded[0]
+    assert stats["chunks"] == 1
+    # the other 19 messages are still retrievable, on the vectors they already had
+    hits = {h["msg_idx"] for h in
+            search.hybrid_search("message about scheduling", topk=25, per_unit=25)}
+    assert len(hits) == 20
+
+
+def test_a_unit_column_change_refreshes_chunks_without_re_embedding(pg_test_db,
+                                                                    mock_embed,
+                                                                    monkeypatch):
+    """A units column folded into no chunk's embedded text — git_branch, worktree,
+    model, updated_at — still reaches every chunk row, without re-embedding (the text,
+    and so the vectors, did not change). Left unrefreshed, a facet search on the new
+    value misses the session while the watermark already records it, and the next
+    incremental run does not repair it."""
+    search = pg_test_db
+    _seed_cc("u", "Branchy", "repo", ["scheduling body one", "scheduling body two"],
+             branch="main")
+    search.build_index(full=False)
+
+    embedded: list[str] = []
+    real = search._embed
+    monkeypatch.setattr(search, "_embed",
+                        lambda texts, max_length: (embedded.extend(texts),
+                                                   real(texts, max_length))[1])
+
+    con = clync.connect()
+    con.execute("UPDATE units SET git_branch='feat' WHERE unit_id='u'")
+    con.commit()
+    con.close()
+
+    search.build_index(full=False)
+    assert embedded == [], "a metadata-only change must not re-embed"
+    with search.connect_pg() as pg:
+        branches = {r["git_branch"] for r in
+                    pg.execute("SELECT git_branch FROM chunks WHERE unit_id='u'")}
+    assert branches == {"feat"}, "every chunk row must carry the new branch"
+
+    def on_branch(b):
+        return {h["unit_id"] for h in search.hybrid_search(
+            "scheduling body", topk=20, source="claude_code", branch=b)}
+    assert on_branch("feat") == {"u"}       # the new value finds it
+    assert on_branch("main") == set()       # the old value no longer does
+    assert search.build_index(full=False)["reindexed_units"] == 0   # settled
+
+
+def test_a_renumbered_text_stable_message_is_repositioned_without_re_embed(pg_test_db,
+                                                                           mock_embed,
+                                                                           monkeypatch):
+    """A chunk's `msg_idx`/`created_at` come from its message, not its `text` and not
+    its unit, so neither the per-chunk text check nor the per-unit metadata signature
+    catches a text-stable message that is renumbered. Left unrepaired, chunks.msg_idx
+    diverges from messages.idx, and every consumer of the position (window reads,
+    dream ranges) trusts the stale number."""
+    search = pg_test_db
+    _seed_cc("u", "Renumber", "repo", [f"turn number {i} content" for i in range(5)])
+    search.build_index(full=False)
+
+    embedded: list[str] = []
+    real = search._embed
+    monkeypatch.setattr(search, "_embed",
+                        lambda texts, max_length: (embedded.extend(texts),
+                                                   real(texts, max_length))[1])
+
+    # Drop idx 1 and shift the survivors down one — they keep their (msg_id, text),
+    # so only their position moves.
+    con = clync.connect()
+    con.execute("DELETE FROM messages WHERE unit_id='u' AND idx=1")
+    con.execute("UPDATE messages SET idx = idx - 1 WHERE unit_id='u' AND idx > 1")
+    con.commit()
+    con.close()
+
+    stats = search.build_index(full=False)
+    assert embedded == [], "a renumber with no text change must not re-embed"
+    with search.connect_pg() as pg:
+        chunk_pos = sorted(r["msg_idx"] for r in
+                           pg.execute("SELECT msg_idx FROM chunks WHERE unit_id='u'"))
+        msg_pos = sorted(r["idx"] for r in
+                         pg.execute("SELECT idx FROM messages WHERE unit_id='u'"))
+    assert chunk_pos == msg_pos, "chunk positions must mirror the renumbered messages"
+    assert stats["repositioned_chunks"] == len(msg_pos) - 1   # only idx 0 stayed put
+    assert stats["dropped_chunks"] == 1                       # the deleted message's chunk
+    assert search.build_index(full=False)["repositioned_chunks"] == 0   # settled
+
+
+def test_embedding_is_split_into_bounded_calls_and_reports_progress(monkeypatch,
+                                                                    capsys):
+    """`encode` tokenises and pads whatever list it is handed before any forward
+    pass, so an unbounded call holds the peak of the whole job at once. Bounded, the
+    rows must still come back in the caller's order, because each is zipped back to
+    its own chunk.
+
+    Progress is asserted for the same reason the code prints it: without a progress
+    line a live run cannot be told from a deadlock. A single-call embed (a query)
+    must stay silent.
+
+    The `mock_embed` fixture replaces `_embed` itself, so it cannot test `_embed`;
+    this fakes the model one layer down instead."""
+    import search
+    calls = []
+
+    class FakeModel:
+        """One-hot per text, keyed by its length, so a reordered batch is visible."""
+
+        def encode(self, texts, **kw):
+            calls.append(len(texts))
+            return {"dense_vecs": [[1.0 if j == len(t) % search.DENSE_DIM else 0.0
+                                    for j in range(search.DENSE_DIM)] for t in texts],
+                    "lexical_weights": [{0: float(len(t))} for t in texts]}
+
+    monkeypatch.setattr(search, "_model", FakeModel)
+    monkeypatch.setattr(search, "EMBED_CALL_TEXTS", 4)
+
+    texts = [f"decision number {i}" * (i + 1) for i in range(10)]
+    dense, sparse = search._embed(texts, max_length=64)
+
+    assert calls == [4, 4, 2]                      # bounded, and nothing dropped
+    assert len(dense) == len(sparse) == len(texts)
+    assert [d.index(1.0) for d in dense] == [len(t) % search.DENSE_DIM for t in texts]
+    assert [s[0] for s in sparse] == [float(len(t)) for t in texts]
+
+    # one line per call, each naming how far along the whole job is
+    done = [line.split()[-1] for line in capsys.readouterr().err.splitlines()]
+    assert done == [f"4/{len(texts)}", f"8/{len(texts)}", f"10/{len(texts)}"]
+
+    calls.clear()
+    search._embed(["one query"], max_length=64)     # fits in a single call
+    assert calls == [1] and capsys.readouterr().err == ""
+
+
+def test_sender_facet_restricts_to_one_role_across_sources(pg_test_db, mock_embed):
+    """Whose words a hit is decides whether it can be read as the user's own
+    decision, and the corpus is overwhelmingly not theirs. Without this facet a
+    decision-shaped query returns the agent's paraphrase of a decision and buries
+    the user's own turn. The facet names a ROLE, not a stored string, because
+    claude.ai stores the user as one spelling and every other source another — a
+    caller must not have to know which."""
+    import cc
+    search = pg_test_db
+    _seed_cc("ccs", "clync design", "clync",
+             ["drop the clamp, the producer should never emit it",
+              "dropping the clamp as you asked"],
+             senders=[cc.HUMAN_SENDER, cc.ASSISTANT_SENDER])
+    _seed("chat", "web chat", T1, ["drop the clamp in the web chat too"])
+    search.build_index(full=False)
+
+    def senders_of(**kw):
+        # per_unit=2 so the mixed-authorship unit shows both its turns; at the
+        # default ceiling of 1 it would show only its best-scoring one.
+        return {h["sender"] for h in
+                search.hybrid_search("drop the clamp", topk=20, per_unit=2, **kw)}
+
+    assert senders_of() == {cc.HUMAN_SENDER, cc.ASSISTANT_SENDER, cc.CHAT_HUMAN_SENDER}
+    # One role reaches the user's turn in BOTH spellings, and excludes the agent's.
+    assert senders_of(sender="user") == {cc.HUMAN_SENDER, cc.CHAT_HUMAN_SENDER}
+    assert senders_of(sender="assistant") == {cc.ASSISTANT_SENDER}
+
+
+def test_a_hit_can_be_read_around_without_fetching_the_whole_unit(pg_test_db, mock_embed):
+    """The position of a hit is what makes it readable. `hybrid_search` has always
+    returned `msg_idx`, but the MCP rendering dropped it, so a caller holding a hit
+    could only fetch the entire unit and string-match its way back. The capability
+    under test is the round trip: find a hit, take its position out of the rendered
+    row, and read the window around it."""
+    import re
+    import mcp_server
+    search = pg_test_db
+    bodies = [f"unrelated filler chatter number {i}" for i in range(30)]
+    bodies[23] = "the marmoset calibration procedure requires a torque wrench"
+    _seed("long", "Long conversation", T1, bodies)
+    search.build_index(full=False)
+
+    rendered = mcp_server.search_transcripts("marmoset calibration torque", limit=3)
+    found = re.search(r"uuid=(\S+?),.*?msg_idx=(\d+)", rendered)
+    assert found, f"the rendered hit carries no position to read around:\n{rendered}"
+    uuid, idx = found.group(1), int(found.group(2))
+
+    window = mcp_server.get_conversation(uuid, from_idx=idx, to_idx=idx)
+    assert bodies[23] in window
+    assert bodies[0] not in window
+
+
+def test_sender_role_must_be_registered(pg_test_db, mock_embed):
+    # A raw stored sender is not a role: asking for one must fail loudly rather than
+    # quietly working for whichever source happens to spell it that way.
+    import cc
+    import pytest
+    search = pg_test_db
+    with pytest.raises(ValueError, match="sender role"):
+        search.hybrid_search("x", sender=cc.NO_ORIGIN_SENDER)
+
+
+def test_sender_facet_rejected_in_browse_mode(pg_test_db, mock_embed):
+    """A browse ranks units by recency and has no matched message, so it cannot
+    honour a facet about authorship — `_browse` reads `units`, which carries no
+    sender. Silently ignoring it would return every unit as if the filter applied."""
+    import pytest
+    search = pg_test_db
+    with pytest.raises(ValueError, match="sender"):
+        search.hybrid_search("", sender="user")
+    with pytest.raises(ValueError, match="sender"):
+        search.hybrid_search("x", sender="user", sort="recency")
+
+
+def test_per_unit_admits_several_episodes_from_one_long_unit(pg_test_db, mock_embed):
+    """A long session holds MANY decisions, not one. Collapsing to one chunk per
+    unit leaves the second decision inside such a session unreachable at any topk.
+    `per_unit` raises that ceiling; the default stays 1 so every existing caller's
+    budget still spans distinct units."""
+    search = pg_test_db
+    bodies = [f"unrelated filler chatter number {i}" for i in range(12)]
+    for i in (2, 6, 10):
+        bodies[i] = f"the marmoset calibration decision number {i}"
+    _seed("long", "Long conversation", T1, bodies)
+    search.build_index(full=False)
+
+    one = search.hybrid_search("marmoset calibration decision", topk=10)
+    assert [h["msg_idx"] for h in one] == [2]                  # default unchanged
+
+    three = search.hybrid_search("marmoset calibration decision", topk=10, per_unit=3)
+    assert sorted(h["msg_idx"] for h in three) == [2, 6, 10]
+    assert {h["unit_id"] for h in three} == {"long"}
+    # topk still caps the total; per_unit only lifts the per-unit ceiling
+    assert len(search.hybrid_search("marmoset calibration decision",
+                                    topk=2, per_unit=3)) == 2

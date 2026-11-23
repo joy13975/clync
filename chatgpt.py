@@ -21,8 +21,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
+from urllib.parse import urlencode
 
 from curl_cffi import requests as creq
+from curl_cffi.requests.exceptions import Timeout
 
 # Reuse cc.py's truncation SSOT — one definition of "how long is a kept title /
 # tool one-liner / tool-output head", shared across every source (cc, codex, this).
@@ -35,12 +38,10 @@ IMPERSONATE = "chrome"
 # sends NO Retry-After header. So a full history backfill is inherently slow
 # (order ~an hour for a few hundred conversations) — the design leans on the
 # caller's per-conversation commit + incremental update_time skip to make it
-# resumable across runs, rather than trying to outrun a hard server limit. The
-# retry budget below is sized so a single conversation never hard-fails while
-# sitting inside one throttle window (~8 attempts, backoff capped at 30s => it
-# keeps retrying for ~3 min, comfortably longer than the refill interval).
+# resumable across runs, rather than trying to outrun a hard server limit.
 REQUEST_PACING_S = 1.0          # steady inter-request gap (uses the burst, paces the rest)
-_MAX_ATTEMPTS = 8               # request retries for every _RETRY_STATUS code below
+_MAX_ATTEMPTS = 20
+_MAX_RETRY_WAIT_S = 60.0
 # Statuses that are external transients, not a verdict about our request: 403
 # (Cloudflare JS challenge), 429 (rate limit), and 5xx from ChatGPT's own backend.
 # The 5xx entries are load-bearing: a single 503 {"detail":"Unable to fetch
@@ -48,8 +49,6 @@ _MAX_ATTEMPTS = 8               # request retries for every _RETRY_STATUS code b
 # JWKS to verify our (valid) Bearer JWT — used to abort the whole ChatGPT leg on
 # the FIRST list page, losing a day of history for a fault entirely on their side.
 _RETRY_STATUS = (403, 429, 500, 502, 503, 504)
-_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 _LIST_PAGE = 100                # conversations per list page (max the API honours)
 SESSION_COOKIE = "__Secure-next-auth.session-token"
 
@@ -92,7 +91,7 @@ class ChatGPTClient:
     """Authenticated read-only client for the ChatGPT private web API.
 
     Mirrors ``clync.ClaudeClient``: request pacing + a Cloudflare-403 backoff
-    retry, a persistent 401/403 raised loudly as an expired login. The
+    retry, with unauthorized logins and forbidden requests reported separately. The
     accessToken is fetched once (lazily) from the session-token cookie and
     cached for the client's lifetime."""
 
@@ -105,57 +104,76 @@ class ChatGPTClient:
         self._last_request = 0.0
 
     def _request(self, url: str, *, bearer: str | None):
-        # Retries every _RETRY_STATUS code — Cloudflare 403 (JS-challenge under
-        # load), 429 (ChatGPT rate limit — real on a full ~hundreds-of-conversation
-        # backfill), and ChatGPT's own 5xx — with backoff, honouring a Retry-After
-        # header when the server sends one. Persistent means: a real auth/clearance
-        # failure (403), a rate limit that outlasted the backoff (429), or a
-        # server-side outage (5xx) — all raise loudly (the caller's
-        # per-conversation commit makes an incremental re-run resume cleanly).
+        # These read-only GETs can be repeated after an external transport timeout.
         import time
         backoff = 4.0
-        headers = {"User-Agent": _UA, "Accept": "application/json"}
+        headers = {"Accept": "application/json"}
         if bearer:
             headers["Authorization"] = f"Bearer {bearer}"
         for attempt in range(_MAX_ATTEMPTS):
             gap = REQUEST_PACING_S - (time.monotonic() - self._last_request)
             if gap > 0:
                 time.sleep(gap)
-            r = self._s.get(url, headers=headers, impersonate=IMPERSONATE, timeout=30)
-            self._last_request = time.monotonic()
-            if r.status_code == 200:
-                return r
-            if r.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
-                ra = r.headers.get("Retry-After")
-                if ra and ra.strip().isdigit():
-                    wait = min(float(ra), 60.0)
+            try:
+                r = self._s.get(url, headers=headers, impersonate=IMPERSONATE, timeout=30)
+            except Timeout as e:
+                if attempt == _MAX_ATTEMPTS - 1:
+                    raise RuntimeError(
+                        f"ChatGPT GET {url} timed out on attempt {attempt + 1}/"
+                        f"{_MAX_ATTEMPTS}; retry budget exhausted: {e}") from e
+                logging.getLogger(__name__).warning(
+                    "ChatGPT GET %s timed out (attempt %s/%s); retrying in %ss",
+                    url, attempt + 1, _MAX_ATTEMPTS, backoff)
+                ra = None
+            else:
+                if r.status_code == 200:
+                    return r
+                if r.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
+                    ra = r.headers.get("Retry-After")
+                    logging.getLogger(__name__).warning(
+                        "ChatGPT GET %s returned %s (attempt %s/%s; cf-mitigated=%s)",
+                        url, r.status_code, attempt + 1, _MAX_ATTEMPTS,
+                        r.headers.get("cf-mitigated"))
+                elif r.status_code == 401:
+                    where = (f"the '{self._profile}' Chrome profile" if self._profile
+                             else "Chrome")
+                    raise RuntimeError(
+                        f"ChatGPT returned 401 — authentication was rejected for GET {url}. "
+                        f"Open {CHATGPT_HOST} in {where} and "
+                        "LOG IN (a Chrome profile existing does NOT mean it is logged "
+                        "into ChatGPT), then re-run.")
+                elif r.status_code == 403:
+                    reason = ("Cloudflare challenge blocked the request"
+                              if r.headers.get("cf-mitigated") == "challenge"
+                              else "ChatGPT refused the request")
+                    raise RuntimeError(
+                        f"ChatGPT returned 403 — {reason} after {_MAX_ATTEMPTS} attempts: "
+                        f"GET {url} (content-type={r.headers.get('Content-Type')}). "
+                        f"Your Chrome login may still be valid. "
+                        f"Response: {r.text[:200]}")
+                elif r.status_code == 429:
+                    raise RuntimeError(
+                        f"ChatGPT rate-limited this sync (429) even after "
+                        f"{_MAX_ATTEMPTS} backoff attempts. Wait a few minutes and "
+                        f"re-run `clync sync-chatgpt` — per-conversation commits make "
+                        f"it resume where it stopped.")
+                elif r.status_code >= 500:
+                    raise RuntimeError(
+                        f"ChatGPT's backend returned {r.status_code} even after "
+                        f"{_MAX_ATTEMPTS} backoff attempts — this is a fault on "
+                        f"OpenAI's side, not your login: GET {url} -> {r.text[:160]}. "
+                        f"Re-run `clync sync-chatgpt` when it recovers; "
+                        f"per-conversation commits make it resume where it stopped.")
                 else:
-                    wait = backoff
-                    backoff = min(backoff * 2, 30.0)
-                time.sleep(wait)
-                continue
-            if r.status_code in (401, 403):
-                where = (f"the '{self._profile}' Chrome profile" if self._profile
-                         else "Chrome")
-                raise RuntimeError(
-                    f"ChatGPT returned {r.status_code} — your login is expired or "
-                    f"Cloudflare is blocking. Open {CHATGPT_HOST} in {where} and "
-                    "LOG IN (a Chrome profile existing does NOT mean it is logged "
-                    "into ChatGPT), then re-run.")
-            if r.status_code == 429:
-                raise RuntimeError(
-                    f"ChatGPT rate-limited this sync (429) even after "
-                    f"{_MAX_ATTEMPTS} backoff attempts. Wait a few minutes and "
-                    f"re-run `clync sync-chatgpt` — per-conversation commits make "
-                    f"it resume where it stopped.")
-            if r.status_code >= 500:
-                raise RuntimeError(
-                    f"ChatGPT's backend returned {r.status_code} even after "
-                    f"{_MAX_ATTEMPTS} backoff attempts — this is a fault on "
-                    f"OpenAI's side, not your login: GET {url} -> {r.text[:160]}. "
-                    f"Re-run `clync sync-chatgpt` when it recovers; "
-                    f"per-conversation commits make it resume where it stopped.")
-            raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
+                    raise RuntimeError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
+            finally:
+                self._last_request = time.monotonic()
+            if ra and ra.strip().isdigit():
+                wait = min(float(ra), _MAX_RETRY_WAIT_S)
+            else:
+                wait = backoff
+                backoff = min(backoff * 2, _MAX_RETRY_WAIT_S)
+            time.sleep(wait)
 
     def _access_token(self) -> str:
         if self._token:
@@ -177,30 +195,55 @@ class ChatGPTClient:
         return (j.get("user") or {}).get("email")
 
     def iter_conversations(self):
-        """Yield every conversation's list metadata (id, title, create_time,
-        update_time), newest-updated first, paging until the listing is
-        exhausted. The listing is the deletion-reconcile authority: a
-        conversation absent here is gone upstream."""
+        conversations = {c["id"]: c for c in self._iter_general_conversations()}
+        for item in self._iter_cursor_pages(
+                "/gizmos/snorlax/sidebar",
+                conversations_per_gizmo=0, owned_only="false", limit=20):
+            project = item["gizmo"]["gizmo"]
+            pid, name = project["id"], project["display"]["name"]
+            for conv in self._iter_cursor_pages(f"/gizmos/{pid}/conversations"):
+                conversations[conv["id"]] = {
+                    **conv, "project_uuid": pid, "project_name": name}
+        yield from conversations.values()
+
+    def _iter_cursor_pages(self, path: str, **params):
+        seen = set()
+        while True:
+            page = self._request(
+                f"{CHATGPT_HOST}/backend-api{path}?{urlencode(params)}",
+                bearer=self._access_token()).json()
+            items, cursor = page["items"], page["cursor"]
+            if not isinstance(items, list):
+                raise ValueError(f"ChatGPT {path}: items is not a list")
+            yield from items
+            if cursor is None:
+                return
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError(f"ChatGPT {path}: invalid or repeated pagination cursor")
+            seen.add(cursor)
+            params["cursor"] = cursor
+
+    def _iter_general_conversations(self):
         tok = self._access_token()
-        offset, total = 0, None
-        seen = 0
+        offset = 0
         while True:
             j = self._request(
                 f"{CHATGPT_HOST}/backend-api/conversations"
                 f"?offset={offset}&limit={_LIST_PAGE}&order=updated",
                 bearer=tok).json()
-            items = j.get("items") or []
-            total = j.get("total") if total is None else total
+            items = j["items"]
+            if not isinstance(items, list):
+                raise ValueError("ChatGPT conversations: items is not a list")
+            total = j["total"]
             if not items:
-                break
-            for it in items:
-                yield it
-            seen += len(items)
+                if offset < total:
+                    raise ValueError(
+                        f"ChatGPT conversations ended after {offset} of {total} items")
+                return
+            yield from items
             offset += len(items)
-            if len(items) < _LIST_PAGE:
-                break
-            if total is not None and seen >= total:
-                break
+            if offset >= total:
+                return
 
     def get_conversation(self, conv_id: str) -> dict:
         """One conversation's full detail (title, create_time, current_node,
