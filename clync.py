@@ -2117,6 +2117,91 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _share_client():
+    share_dir = str(REPO_DIR / "share-client")
+    if share_dir not in sys.path:
+        sys.path.insert(0, share_dir)
+    import clync_share_client
+    return clync_share_client
+
+
+def cmd_connect(args) -> int:
+    sc = _share_client()
+    entry = sc.connect_endpoint(
+        args.lambda_arn,
+        alias=args.alias,
+        profile=args.profile,
+        set_default=args.set_default,
+    )
+    print(f"Connected {entry['alias']} ({entry['owner']}) -> {entry['arn']}")
+    print(f"  modes : {', '.join(entry['modes'])}")
+    print(f"  caller: {entry['caller_arn']}")
+    print(f"  config: {sc.shares_path()}")
+    print("Reload existing MCP clients to expose the connected endpoint.")
+    return 0
+
+
+def cmd_disconnect(args) -> int:
+    sc = _share_client()
+    if sc.disconnect_endpoint(args.alias):
+        print(f"Disconnected {args.alias}")
+        return 0
+    print(f"No clync-share endpoint named {args.alias!r}", file=sys.stderr)
+    return 1
+
+
+def cmd_shares(args) -> int:
+    sc = _share_client()
+    cfg = sc.load_shares()
+    eps = cfg.get("endpoints") or {}
+    if not eps:
+        print(f"No clync-share endpoints configured ({sc.shares_path()}).")
+        return 0
+    for alias, ep in sorted(eps.items()):
+        mark = " [default]" if cfg.get("default_owner") == alias else ""
+        prof = f" profile={ep['profile']}" if ep.get("profile") else ""
+        print(f"- {alias}{mark}: {ep['arn']} modes={','.join(ep.get('modes', []))}{prof}")
+    return 0
+
+
+def cmd_ask(args) -> int:
+    sc = _share_client()
+    cfg = sc.load_shares()
+    ep = cfg.get("endpoints", {}).get(args.alias)
+    if not ep:
+        print(f"Unknown clync-share endpoint {args.alias!r}; run `clync shares`.", file=sys.stderr)
+        return 1
+    res = sc.invoke_share_lambda(
+        ep["arn"], "ask", {"question": args.question, "limit": args.limit},
+        profile=ep.get("profile"), region=ep.get("region"))
+    print(sc._format_ask_response(ep.get("owner", args.alias), res))
+    return 0
+
+
+def cmd_resolve_citation(args) -> int:
+    sc = _share_client()
+    cfg = sc.load_shares()
+    eps = cfg.get("endpoints") or {}
+    target = eps.get(args.alias) if args.alias else None
+    if target is None:
+        for ep in eps.values():
+            if "owner" in (ep.get("modes") or []) and args.handle.startswith(
+                f"clync-{ep.get('owner', ep['alias'])}-"
+            ):
+                target = ep
+                break
+    if target is None and cfg.get("default_owner"):
+        target = eps.get(cfg["default_owner"])
+    if target is None:
+        print("No matching owner clync-share endpoint; pass --as <alias>.", file=sys.stderr)
+        return 1
+    res = sc.invoke_share_lambda(
+        target["arn"], "resolve_citation", {"handle": args.handle},
+        profile=target.get("profile"), region=target.get("region"))
+    print(res.get("text", json.dumps(res, indent=2)))
+    return 0
+
+
 def cmd_sessions(args) -> int:
     import live_search
     if args.session_action == "search":
@@ -2357,6 +2442,32 @@ def main() -> int:
     sp = sub.add_parser("status", help="scheduled-sync status + recent run log")
     sp.add_argument("--tail", type=int, default=15, help="log lines to show")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("connect", help="connect an IAM-authenticated clync-share Lambda ARN")
+    sp.add_argument("lambda_arn", help="Lambda ARN (arn:aws:lambda:<region>:<account>:function:<name>)")
+    sp.add_argument("--as", dest="alias", help="short alias for this endpoint")
+    sp.add_argument("--profile", help="AWS profile to use for this endpoint")
+    sp.add_argument("--default", dest="set_default", action="store_true",
+                    help="mark as default cloud owner archive")
+    sp.set_defaults(func=cmd_connect)
+
+    sp = sub.add_parser("disconnect", help="remove a connected clync-share endpoint")
+    sp.add_argument("alias")
+    sp.set_defaults(func=cmd_disconnect)
+
+    sub.add_parser("shares", help="list connected clync-share endpoints"
+                   ).set_defaults(func=cmd_shares)
+
+    sp = sub.add_parser("ask", help="ask a connected clync-share endpoint")
+    sp.add_argument("alias")
+    sp.add_argument("question")
+    sp.add_argument("--limit", type=int, default=8)
+    sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("resolve-citation", help="resolve an opaque clync-share citation handle (owner only)")
+    sp.add_argument("handle")
+    sp.add_argument("--as", dest="alias", help="owner endpoint alias")
+    sp.set_defaults(func=cmd_resolve_citation)
 
     args = p.parse_args()
     return args.func(args)

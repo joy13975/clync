@@ -313,5 +313,22 @@ def get_conversation(uuid: str, from_idx: int | None = None,
         return str(e)
 
 
+def _register_share_endpoints() -> None:
+    import sys
+    from pathlib import Path
+
+    share_dir = str(Path(__file__).resolve().parent / "share-client")
+    if share_dir not in sys.path:
+        sys.path.insert(0, share_dir)
+    import clync_share_client
+
+    cfg = clync_share_client.load_shares()
+    if cfg.get("endpoints"):
+        clync_share_client.register_share_tools(mcp, endpoints=cfg["endpoints"])
+
+
+_register_share_endpoints()
+
+
 if __name__ == "__main__":
     mcp.run()

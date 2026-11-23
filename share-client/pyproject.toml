@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clync-share-client"
+version = "0.1.0"
+description = "Lightweight IAM-authenticated MCP relay and CLI for clync-share Lambda endpoints (no PyTorch or Postgres)."
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.35",
+    "mcp>=1.2,<2",
+]
+
+[project.scripts]
+clync-share = "clync_share_client:main"
+
+[tool.setuptools]
+py-modules = ["clync_share_client"]

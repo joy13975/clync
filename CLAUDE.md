@@ -17,9 +17,10 @@ This file is an index — the actual documentation lives in these:
 | `opencode_source.py` | OpenCode v2 API ingest: root-only scope, no machine messages or tool-result bodies, dirty-session retry. |
 | `mcp_server.py` (docstring) | The MCP tools: `search_history` (default — distilled positions AND raw transcripts in one call), the `search_insights` / `search_transcripts` drill-downs, and `get_conversation`. |
 | `search.py` (module docstring) | Hybrid search: clync's own contained PG17+pgvector cluster, BGE-M3 indexing, HNSW-indexed dense+sparse RRF query (ADR 0005). |
+| `clync_cipher.py`, `share-client/`, `cloud/` | Opt-in serverless `clync-share` on AWS: lite cipher, lightweight IAM-authenticated MCP relay (`clync connect` / `clync-share`), per-owner ECR container Lambda, and CloudTrail tamper alerting (ADR 0006). |
 | `live_search.py`, `live_files.py`, `live_external.py` | Independent live finder, candidate-record reads, and native Grok/OpenCode readers; shared contracts in `live_types.py`. |
 | `dream.py` (module docstring) | **The Dream layer:** distills grounded, stance-tagged insights + per-topic digests out of the raw transcripts using headless `claude -p`. Two separate run modes: incremental nightly, explicit bulk backfill. |
-| [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004), HNSW hybrid search (0005). |
+| [docs/adr/](docs/adr/) | Architecture decisions: why no cross-encoder reranker (0001), why BGE-M3 (0002), why Postgres-only + Claude Code ingest (0003), the Dream knowledge-distillation layer (0004), HNSW hybrid search (0005), serverless `clync-share` (0006). |
 
 ## One-command setup
 

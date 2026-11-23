@@ -254,6 +254,30 @@ pass the same profiles, schedule, and Dream preference as before. `doctor`
 reports missing database supervision. `uninstall` removes both launchd jobs
 and stops the database while retaining its data.
 
+## Cloud `clync-share` (opt-in serverless AWS)
+
+`clync-share` deploys an encrypted per-owner Postgres schema + arm64 ECR Container Lambda
+(direct `lambda:InvokeFunction` with per-call SigV4 STS verification — no ALB/API Gateway)
+exposing two optional interfaces: owner-only full recall (`search_history`, `resolve_citation`)
+and read-only, live-redacted teammate Q&A (`ask_<owner>`) with opaque citation handles
+(`clync-<owner>-<rand>`). See [ADR 0006](docs/adr/0006-serverless-clync-share.md).
+
+**Connect from an existing `clync` install:**
+
+```sh
+clync connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner> --profile <aws-profile>
+clync shares
+clync ask <owner> "What did we decide about HNSW parameters?"
+clync resolve-citation clync-<owner>-<id>   # owner only
+```
+
+**Connect without installing `clync` (teammates, zero PyTorch/Postgres):**
+
+```sh
+uvx --from "git+https://github.com/joy13975/clync#subdirectory=share-client" \
+  clync-share connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner> --profile <aws-profile>
+```
+
 ## Data and resources
 
 History and the index live under `~/.local/share/clync` by default
