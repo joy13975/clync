@@ -111,6 +111,13 @@ class ClyncCipher:
         rotated = self.rotation_matrix @ arr
         return rotated.tolist()
 
+    def rotate_dense_batch(self, mat: np.ndarray) -> np.ndarray:
+        """Rotate an (N, dense_dim) float32 matrix in one BLAS GEMM call."""
+        arr = np.asarray(mat, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != self.dense_dim:
+            raise ValueError(f"expected shape (N, {self.dense_dim}), got {arr.shape}")
+        return arr @ self.rotation_matrix.T
+
     def permute_sparse(self, weights: dict[int, float]) -> dict[int, float]:
         perm = self.sparse_permutation
         out: dict[int, float] = {}

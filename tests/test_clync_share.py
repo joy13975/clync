@@ -54,6 +54,9 @@ def test_dense_rotation_preserves_cosine_similarity_while_hiding_coordinates():
     assert not np.allclose(a, ra)
     assert float(ra @ rb) == pytest.approx(float(a @ b), abs=1e-5)
     assert float(np.linalg.norm(ra)) == pytest.approx(1.0, abs=1e-5)
+    batch = cipher.rotate_dense_batch(np.stack([a, b]))
+    assert np.allclose(batch[0], ra, atol=1e-5)
+    assert np.allclose(batch[1], rb, atol=1e-5)
 
 
 def test_sparse_permutation_preserves_inner_product_and_hides_token_ids():

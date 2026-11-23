@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import hashlib
 import io
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+import numpy as np
 from botocore.exceptions import ClientError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -684,8 +686,10 @@ def _encrypt_unit_group(
     units: list[dict[str, Any]],
     msgs: list[dict[str, Any]],
     chunks: list[dict[str, Any]],
-) -> list[str]:
-    records: list[str] = []
+) -> tuple[list[str], list[str]]:
+    """Return (unit_records, child_records) so units ingest before parallel child batches."""
+    unit_records: list[str] = []
+    child_records: list[str] = []
     for u in units:
         meta_json = json.dumps(
             {
@@ -700,7 +704,7 @@ def _encrypt_unit_group(
                 "git_branch": u["git_branch"],
             }
         )
-        records.append(
+        unit_records.append(
             json.dumps(
                 {
                     "t": "unit",
@@ -718,7 +722,7 @@ def _encrypt_unit_group(
         if m["idx"] is None:
             continue
         payload = json.dumps({"sender": m["sender"], "text": m["text"] or ""})
-        records.append(
+        child_records.append(
             json.dumps(
                 {
                     "t": "msg",
@@ -730,39 +734,67 @@ def _encrypt_unit_group(
                 }
             )
         )
-    for c in chunks:
-        payload = json.dumps(
-            {
-                "source": c["source"],
-                "unit_name": c["unit_name"],
-                "sender": c["sender"],
-                "lang": c["lang"],
-                "text": c["text"],
-            }
-        )
-        rot_dense = cipher.rotate_dense(parse_dense_literal(c["dense"]))
-        perm_sparse = cipher.permute_sparse_literal(c["sparse"])
-        records.append(
-            json.dumps(
+    if chunks:
+        dense_mat = np.asarray([parse_dense_literal(c["dense"]) for c in chunks], dtype=np.float32)
+        rot_mat = cipher.rotate_dense_batch(dense_mat)
+        for c, rot_row in zip(chunks, rot_mat):
+            payload = json.dumps(
                 {
-                    "t": "chunk",
-                    "chunk_id": c["chunk_id"],
-                    "unit_id": c["unit_id"],
-                    "source_hmac": cipher.hmac_facet("source", c["source"]),
-                    "repo_hmac": cipher.hmac_facet("repo", c["repo"]),
-                    "project_hmac": cipher.hmac_facet("project", c["project_name"]),
-                    "sender_hmac": cipher.hmac_facet("sender", c["sender"]),
-                    "lang_hmac": cipher.hmac_facet("lang", c["lang"]),
-                    "msg_idx": c["msg_idx"],
-                    "chunk_idx": c["chunk_idx"],
-                    "updated_at": c["updated_at"].isoformat() if c["updated_at"] else None,
-                    "payload_ct": cipher.encrypt_text(payload, aad=f"chunks:{c['chunk_id']}"),
-                    "dense": dense_literal(rot_dense),
-                    "sparse": perm_sparse,
+                    "source": c["source"],
+                    "unit_name": c["unit_name"],
+                    "sender": c["sender"],
+                    "lang": c["lang"],
+                    "text": c["text"],
                 }
             )
-        )
-    return records
+            perm_sparse = cipher.permute_sparse_literal(c["sparse"])
+            child_records.append(
+                json.dumps(
+                    {
+                        "t": "chunk",
+                        "chunk_id": c["chunk_id"],
+                        "unit_id": c["unit_id"],
+                        "source_hmac": cipher.hmac_facet("source", c["source"]),
+                        "repo_hmac": cipher.hmac_facet("repo", c["repo"]),
+                        "project_hmac": cipher.hmac_facet("project", c["project_name"]),
+                        "sender_hmac": cipher.hmac_facet("sender", c["sender"]),
+                        "lang_hmac": cipher.hmac_facet("lang", c["lang"]),
+                        "msg_idx": c["msg_idx"],
+                        "chunk_idx": c["chunk_idx"],
+                        "updated_at": c["updated_at"].isoformat() if c["updated_at"] else None,
+                        "payload_ct": cipher.encrypt_text(payload, aad=f"chunks:{c['chunk_id']}"),
+                        "dense": dense_literal(rot_row),
+                        "sparse": perm_sparse,
+                    }
+                )
+            )
+    return unit_records, child_records
+
+
+def _upload_and_ingest_batch(
+    *,
+    owner: str,
+    profile: str | None,
+    region: str,
+    bucket: str,
+    lambda_arn: str,
+    tag: str,
+    batch: list[str],
+) -> dict[str, int]:
+    raw_gz = gzip.compress(("\n".join(batch) + "\n").encode("utf-8"), compresslevel=1)
+    digest = hashlib.sha256(raw_gz).hexdigest()[:12]
+    key = f"{owner}/push/{int(time.time())}-{tag}-{digest}.ndjson.gz"
+    s3 = boto3.Session(profile_name=profile, region_name=region).client("s3")
+    s3.put_object(Bucket=bucket, Key=key, Body=raw_gz)
+    res = share_client.invoke_share_lambda(
+        lambda_arn,
+        "ingest",
+        {"s3_key": key, "ensure_hnsw": False},
+        profile=profile,
+        region=region,
+        read_timeout=LAMBDA_TIMEOUT_SECS + 30,
+    )
+    return {k: int(v) for k, v in (res.get("ingested") or {}).items()}
 
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -792,7 +824,9 @@ def cmd_push(args: argparse.Namespace) -> int:
                     units.append(du)
                     seen_u.add(du["unit_id"])
 
-        pushed_units: dict[str, str] = {} if args.full else dict(state.get("pushed_units") or {})
+        pushed_units: dict[str, str] = (
+            {} if (args.full and not args.limit_units) else dict(state.get("pushed_units") or {})
+        )
         units = _filter_changed_units(units, pushed_units, full=bool(args.full))
         if not units:
             print("Up to date (0 changed units; pass --full to force re-push).", flush=True)
@@ -800,7 +834,6 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         session = boto3.Session(profile_name=profile, region_name=state["region"])
         kms = session.client("kms")
-        s3 = session.client("s3")
         dk_plain = kms.decrypt(
             KeyId=state["kms_key_arn"],
             CiphertextBlob=base64.b64decode(state["data_key_ct_b64"]),
@@ -810,65 +843,98 @@ def cmd_push(args: argparse.Namespace) -> int:
 
         batch_size = max(500, int(args.batch_records))
         unit_chunk_size = max(1, int(args.units_per_wave))
+        concurrency = max(1, int(args.concurrency))
         total_ingested = {"units": 0, "messages": 0, "chunks": 0}
-        drop_hnsw_first = bool(args.full) and len(units) >= 200
+        drop_hnsw_first = bool(args.full) and not args.limit_units and len(units) >= 200
         n_waves = (len(units) + unit_chunk_size - 1) // unit_chunk_size
         t_start = time.perf_counter()
         print(
             f"Pushing {len(units)} changed unit(s) in {n_waves} wave(s) "
-            f"(profile={profile or 'default'}, drop_hnsw={drop_hnsw_first})...",
+            f"(profile={profile or 'default'}, concurrency={concurrency}, drop_hnsw={drop_hnsw_first})...",
             flush=True,
         )
 
-        for w_idx in range(n_waves):
-            w_units = units[w_idx * unit_chunk_size : (w_idx + 1) * unit_chunk_size]
-            w_ids = [u["unit_id"] for u in w_units]
-            msgs = con.execute(
-                "SELECT unit_id, idx, sender, text, created_at FROM messages "
-                "WHERE unit_id = ANY(%s) ORDER BY unit_id, idx",
-                (w_ids,),
-            ).fetchall()
-            chunks = con.execute(
-                "SELECT chunk_id, unit_id, source, unit_name, sender, lang, msg_idx, chunk_idx, "
-                "updated_at, repo, project_name, text, dense::text AS dense, sparse::text AS sparse "
-                "FROM chunks WHERE unit_id = ANY(%s)",
-                (w_ids,),
-            ).fetchall()
-            records = _encrypt_unit_group(cipher, w_units, msgs, chunks)
-            n_batches = max(1, (len(records) + batch_size - 1) // batch_size)
-            for b_idx in range(n_batches):
-                batch = records[b_idx * batch_size : (b_idx + 1) * batch_size]
-                raw_gz = gzip.compress(("\n".join(batch) + "\n").encode("utf-8"))
-                digest = hashlib.sha256(raw_gz).hexdigest()[:12]
-                key = f"{args.owner}/push/{int(time.time())}-w{w_idx:03d}-b{b_idx:03d}-{digest}.ndjson.gz"
-                s3.put_object(Bucket=state["staging_bucket"], Key=key, Body=raw_gz)
-                is_first = w_idx == 0 and b_idx == 0
-                is_last = w_idx == n_waves - 1 and b_idx == n_batches - 1
-                res = share_client.invoke_share_lambda(
-                    state["lambda_arn"],
-                    "ingest",
-                    {
-                        "s3_key": key,
-                        "drop_hnsw": drop_hnsw_first and is_first,
-                        "ensure_hnsw": is_last,
-                    },
+        if drop_hnsw_first:
+            share_client.invoke_share_lambda(
+                state["lambda_arn"],
+                "ingest",
+                {"drop_hnsw": True, "ensure_hnsw": False},
+                profile=profile,
+                region=state["region"],
+                read_timeout=LAMBDA_TIMEOUT_SECS + 30,
+            )
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            for w_idx in range(n_waves):
+                w_units = units[w_idx * unit_chunk_size : (w_idx + 1) * unit_chunk_size]
+                w_ids = [u["unit_id"] for u in w_units]
+                msgs = con.execute(
+                    "SELECT unit_id, idx, sender, text, created_at FROM messages "
+                    "WHERE unit_id = ANY(%s) ORDER BY unit_id, idx",
+                    (w_ids,),
+                ).fetchall()
+                chunks = con.execute(
+                    "SELECT chunk_id, unit_id, source, unit_name, sender, lang, msg_idx, chunk_idx, "
+                    "updated_at, repo, project_name, text, dense::text AS dense, sparse::text AS sparse "
+                    "FROM chunks WHERE unit_id = ANY(%s)",
+                    (w_ids,),
+                ).fetchall()
+                unit_recs, child_recs = _encrypt_unit_group(cipher, w_units, msgs, chunks)
+
+                # Ingest units first so FK references exist before parallel child batches run.
+                unit_ing = _upload_and_ingest_batch(
+                    owner=args.owner,
                     profile=profile,
                     region=state["region"],
-                    read_timeout=LAMBDA_TIMEOUT_SECS + 30,
+                    bucket=state["staging_bucket"],
+                    lambda_arn=state["lambda_arn"],
+                    tag=f"w{w_idx:03d}-units",
+                    batch=unit_recs,
                 )
                 for k in total_ingested:
-                    total_ingested[k] += int(res.get("ingested", {}).get(k, 0))
-            for u in w_units:
-                pushed_units[u["unit_id"]] = u["updated_at"].isoformat() if u.get("updated_at") else ""
-            state["pushed_units"] = pushed_units
-            state["last_push_at"] = datetime.now(timezone.utc).isoformat()
-            _save_state(args.owner, state)
-            print(
-                f"  wave {w_idx + 1}/{n_waves}: +{len(w_units)} units, +{len(msgs)} msgs, +{len(chunks)} chunks "
-                f"({n_batches} batch(es), elapsed {time.perf_counter() - t_start:.1f}s)",
-                flush=True,
-            )
-    print("Push complete:", json.dumps(total_ingested), flush=True)
+                    total_ingested[k] += unit_ing.get(k, 0)
+
+                child_batches = [
+                    child_recs[i : i + batch_size] for i in range(0, len(child_recs), batch_size)
+                ]
+                futs = [
+                    pool.submit(
+                        _upload_and_ingest_batch,
+                        owner=args.owner,
+                        profile=profile,
+                        region=state["region"],
+                        bucket=state["staging_bucket"],
+                        lambda_arn=state["lambda_arn"],
+                        tag=f"w{w_idx:03d}-b{b_idx:03d}",
+                        batch=batch,
+                    )
+                    for b_idx, batch in enumerate(child_batches)
+                ]
+                for fut in futs:
+                    ing = fut.result()
+                    for k in total_ingested:
+                        total_ingested[k] += ing.get(k, 0)
+
+                for u in w_units:
+                    pushed_units[u["unit_id"]] = u["updated_at"].isoformat() if u.get("updated_at") else ""
+                state["pushed_units"] = pushed_units
+                state["last_push_at"] = datetime.now(timezone.utc).isoformat()
+                _save_state(args.owner, state)
+                print(
+                    f"  wave {w_idx + 1}/{n_waves}: +{len(w_units)} units, +{len(msgs)} msgs, +{len(chunks)} chunks "
+                    f"({1 + len(child_batches)} batch(es), elapsed {time.perf_counter() - t_start:.1f}s)",
+                    flush=True,
+                )
+
+        share_client.invoke_share_lambda(
+            state["lambda_arn"],
+            "ingest",
+            {"ensure_hnsw": True},
+            profile=profile,
+            region=state["region"],
+            read_timeout=LAMBDA_TIMEOUT_SECS + 30,
+        )
+    print(f"Push complete in {time.perf_counter() - t_start:.1f}s:", json.dumps(total_ingested), flush=True)
     return 0
 
 
@@ -910,7 +976,8 @@ def main(argv: list[str] | None = None) -> int:
     p_push.add_argument("--include-dream", action="store_true", help="always include dream insight units")
     p_push.add_argument("--full", action="store_true", help="ignore local push watermark and re-push selected units")
     p_push.add_argument("--batch-records", type=int, default=4000)
-    p_push.add_argument("--units-per-wave", type=int, default=250)
+    p_push.add_argument("--units-per-wave", type=int, default=500)
+    p_push.add_argument("--concurrency", type=int, default=6)
 
     args = parser.parse_args(argv)
     if args.cmd == "deploy":

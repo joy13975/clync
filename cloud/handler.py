@@ -639,36 +639,65 @@ def _handle_ingest(con: psycopg.Connection, params: dict[str, Any]) -> dict[str,
                 )
         with con.cursor() as cur:
             if unit_rows:
-                cur.executemany(
+                cur.execute(
+                    "CREATE TEMP TABLE tmp_units ("
+                    "unit_id text, source_hmac text, kind_hmac text, repo_hmac text, "
+                    "project_hmac text, updated_at timestamptz, meta_ct text) ON COMMIT DROP"
+                )
+                with cur.copy(
+                    "COPY tmp_units (unit_id, source_hmac, kind_hmac, repo_hmac, project_hmac, updated_at, meta_ct) FROM STDIN"
+                ) as copy:
+                    for row in unit_rows:
+                        copy.write_row(row)
+                cur.execute(
                     "INSERT INTO units (unit_id, source_hmac, kind_hmac, repo_hmac, project_hmac, updated_at, meta_ct) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "SELECT unit_id, source_hmac, kind_hmac, repo_hmac, project_hmac, updated_at, meta_ct FROM tmp_units "
                     "ON CONFLICT (unit_id) DO UPDATE SET "
                     "source_hmac=EXCLUDED.source_hmac, kind_hmac=EXCLUDED.kind_hmac, "
                     "repo_hmac=EXCLUDED.repo_hmac, project_hmac=EXCLUDED.project_hmac, "
-                    "updated_at=EXCLUDED.updated_at, meta_ct=EXCLUDED.meta_ct",
-                    unit_rows,
+                    "updated_at=EXCLUDED.updated_at, meta_ct=EXCLUDED.meta_ct"
                 )
                 counts["units"] = len(unit_rows)
             if msg_rows:
-                cur.executemany(
+                cur.execute(
+                    "CREATE TEMP TABLE tmp_messages ("
+                    "unit_id text, msg_idx int, sender_hmac text, created_at timestamptz, payload_ct text) ON COMMIT DROP"
+                )
+                with cur.copy(
+                    "COPY tmp_messages (unit_id, msg_idx, sender_hmac, created_at, payload_ct) FROM STDIN"
+                ) as copy:
+                    for row in msg_rows:
+                        copy.write_row(row)
+                cur.execute(
                     "INSERT INTO messages (unit_id, msg_idx, sender_hmac, created_at, payload_ct) "
-                    "VALUES (%s,%s,%s,%s,%s) "
+                    "SELECT unit_id, msg_idx, sender_hmac, created_at, payload_ct FROM tmp_messages "
                     "ON CONFLICT (unit_id, msg_idx) DO UPDATE SET "
-                    "sender_hmac=EXCLUDED.sender_hmac, created_at=EXCLUDED.created_at, payload_ct=EXCLUDED.payload_ct",
-                    msg_rows,
+                    "sender_hmac=EXCLUDED.sender_hmac, created_at=EXCLUDED.created_at, payload_ct=EXCLUDED.payload_ct"
                 )
                 counts["messages"] = len(msg_rows)
             if chunk_rows:
-                cur.executemany(
-                    f"INSERT INTO chunks (chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
-                    f"sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse) "
-                    f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({DENSE_DIM}),%s::sparsevec({SPARSE_DIM})) "
-                    f"ON CONFLICT (chunk_id) DO UPDATE SET "
-                    f"source_hmac=EXCLUDED.source_hmac, repo_hmac=EXCLUDED.repo_hmac, "
-                    f"project_hmac=EXCLUDED.project_hmac, sender_hmac=EXCLUDED.sender_hmac, "
-                    f"lang_hmac=EXCLUDED.lang_hmac, updated_at=EXCLUDED.updated_at, "
-                    f"payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse",
-                    chunk_rows,
+                cur.execute(
+                    f"CREATE TEMP TABLE tmp_chunks ("
+                    f"chunk_id text, unit_id text, source_hmac text, repo_hmac text, project_hmac text, "
+                    f"sender_hmac text, lang_hmac text, msg_idx int, chunk_idx int, updated_at timestamptz, "
+                    f"payload_ct text, dense vector({DENSE_DIM}), sparse sparsevec({SPARSE_DIM})) ON COMMIT DROP"
+                )
+                with cur.copy(
+                    "COPY tmp_chunks (chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
+                    "sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse) FROM STDIN"
+                ) as copy:
+                    for row in chunk_rows:
+                        copy.write_row(row)
+                cur.execute(
+                    "INSERT INTO chunks (chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
+                    "sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse) "
+                    "SELECT chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
+                    "sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse FROM tmp_chunks "
+                    "ON CONFLICT (chunk_id) DO UPDATE SET "
+                    "source_hmac=EXCLUDED.source_hmac, repo_hmac=EXCLUDED.repo_hmac, "
+                    "project_hmac=EXCLUDED.project_hmac, sender_hmac=EXCLUDED.sender_hmac, "
+                    "lang_hmac=EXCLUDED.lang_hmac, updated_at=EXCLUDED.updated_at, "
+                    "payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse"
                 )
                 counts["chunks"] = len(chunk_rows)
         con.commit()
