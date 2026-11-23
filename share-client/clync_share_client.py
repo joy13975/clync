@@ -7,6 +7,7 @@ cloud MCP access.
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from typing import Any
 LAMBDA_ARN_RE = re.compile(
     r"^arn:aws[a-z-]*:lambda:(?P<region>[a-z0-9-]+):(?P<account>\d{12}):function:(?P<name>[A-Za-z0-9-_]+)(?::(?P<qualifier>[A-Za-z0-9-_$]+))?$"
 )
+ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::(?P<account>\d{12}):role/(?P<role>.+)$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 SHARES_FILENAME = "shares.json"
 MCP_SERVER_NAME = "clync-share"
@@ -109,14 +111,19 @@ def invoke_share_lambda(
     *,
     profile: str | None = None,
     region: str | None = None,
+    read_timeout: int = 120,
 ) -> dict[str, Any]:
     """Invoke a clync-share Lambda with a fresh SigV4 STS caller proof."""
     import boto3
+    from botocore.config import Config
 
     parsed = parse_lambda_arn(lambda_arn)
     use_region = region or parsed["region"]
     session = boto3.Session(profile_name=profile, region_name=use_region)
-    client = session.client("lambda")
+    client = session.client(
+        "lambda",
+        config=Config(read_timeout=max(60, int(read_timeout)), retries={"max_attempts": 1}),
+    )
     payload = {
         "action": action,
         "params": params or {},
@@ -136,6 +143,54 @@ def invoke_share_lambda(
     return data
 
 
+def _profile_priority(name: str, role_hint: str) -> tuple[int, str]:
+    """Rank matching AWS profiles for clync-share: PowerUser first, Admin second, ReadOnly last."""
+    text = f"{name} {role_hint}".lower()
+    if "readonly" in text or re.search(r"(^|[-_/])ro($|[-_/])", name.lower()):
+        return (3, name)
+    if "poweruser" in text or re.search(r"(^|[-_/])pu($|[-_/])", name.lower()):
+        return (0, name)
+    if "admin" in text:
+        return (1, name)
+    return (2, name)
+
+
+def list_profiles_for_account(account_id: str, config_path: Path | None = None) -> list[str]:
+    """Return AWS CLI profiles configured for `account_id`, ordered by invoke suitability."""
+    cfg_file = config_path or Path(os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws/config"))
+    if not cfg_file.exists():
+        return []
+    parser = configparser.RawConfigParser()
+    parser.read(cfg_file)
+    matches: list[tuple[tuple[int, str], str]] = []
+    for section in parser.sections():
+        if section == "default":
+            prof_name = "default"
+        elif section.startswith("profile "):
+            prof_name = section[len("profile ") :].strip()
+        else:
+            continue
+        if not prof_name:
+            continue
+        sso_acct = parser.get(section, "sso_account_id", fallback="").strip()
+        role_arn = parser.get(section, "role_arn", fallback="").strip()
+        role_match = ROLE_ARN_RE.match(role_arn)
+        acct = sso_acct or (role_match.group("account") if role_match else "")
+        if acct != account_id:
+            continue
+        role_hint = parser.get(section, "sso_role_name", fallback="") or (
+            role_match.group("role") if role_match else ""
+        )
+        matches.append((_profile_priority(prof_name, role_hint), prof_name))
+    matches.sort(key=lambda item: item[0])
+    return [name for _, name in matches]
+
+
+def resolve_profile_for_account(account_id: str, config_path: Path | None = None) -> str | None:
+    profiles = list_profiles_for_account(account_id, config_path=config_path)
+    return profiles[0] if profiles else None
+
+
 def connect_endpoint(
     lambda_arn: str,
     *,
@@ -143,15 +198,49 @@ def connect_endpoint(
     profile: str | None = None,
     set_default: bool = False,
 ) -> dict[str, Any]:
-    """Verify IAM access via handshake and persist endpoint to shares.json."""
+    """Verify IAM access via handshake and persist endpoint to shares.json.
+
+    When `profile` is omitted and `AWS_PROFILE` is unset, automatically picks a
+    matching AWS profile for the Lambda ARN's account from `~/.aws/config`.
+    """
     parsed = parse_lambda_arn(lambda_arn)
-    info = invoke_share_lambda(parsed["arn"], "handshake", {}, profile=profile, region=parsed["region"])
+    candidates: list[str | None]
+    if profile:
+        candidates = [profile]
+    elif os.environ.get("AWS_PROFILE"):
+        candidates = [os.environ["AWS_PROFILE"]]
+    else:
+        matched = list_profiles_for_account(parsed["account"])
+        candidates = list(matched) if matched else [None]
+
+    chosen_profile: str | None = candidates[0]
+    info: dict[str, Any] | None = None
+    last_exc: Exception | None = None
+    for idx, cand in enumerate(candidates):
+        try:
+            info = invoke_share_lambda(parsed["arn"], "handshake", {}, profile=cand, region=parsed["region"])
+            chosen_profile = cand
+            break
+        except Exception as exc:
+            last_exc = exc
+            # Only try another matching profile on authorization refusal; fail loud on expired SSO or network errors.
+            msg = str(exc)
+            is_authz_denial = (
+                "AccessDeniedException" in msg
+                or "not authorized" in msg
+                or "rejected 'handshake'" in msg
+            )
+            if not is_authz_denial or idx == len(candidates) - 1:
+                hint = f" (using auto-detected AWS profile {cand!r})" if (not profile and cand) else ""
+                raise RuntimeError(f"clync-share connect failed{hint}: {exc}") from exc
+    assert info is not None, last_exc
+
     resolved_alias = validate_alias(alias or default_alias_for(parsed["function_name"], info.get("owner")))
     entry = {
         "alias": resolved_alias,
         "arn": parsed["arn"],
         "region": parsed["region"],
-        "profile": profile,
+        "profile": chosen_profile,
         "owner": info.get("owner", resolved_alias),
         "modes": info.get("modes", []),
         "tools": info.get("tools", []),
@@ -423,9 +512,10 @@ def main(argv: list[str] | None = None) -> int:
             set_default=args.set_default,
         )
         print(f"Connected {entry['alias']} ({entry['owner']}) -> {entry['arn']}")
-        print(f"  modes : {', '.join(entry['modes'])}")
-        print(f"  caller: {entry['caller_arn']}")
-        print(f"  config: {shares_path()}")
+        print(f"  modes  : {', '.join(entry['modes'])}")
+        print(f"  profile: {entry['profile'] or '(default AWS credentials)'}")
+        print(f"  caller : {entry['caller_arn']}")
+        print(f"  config : {shares_path()}")
         if not args.no_mcp:
             if _register_claude_mcp():
                 print(f"  MCP   : registered `{MCP_SERVER_NAME}` in Claude Code (reload session to use)")

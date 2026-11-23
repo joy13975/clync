@@ -283,6 +283,9 @@ def _ensure_owner_schema(con: psycopg.Connection, *, create_hnsw: bool = False) 
                 "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'chunks'"
             ).fetchall()
         }
+        if "idx_chunks_dense_hnsw" not in existing or "idx_chunks_sparse_hnsw" not in existing:
+            con.execute("SET LOCAL maintenance_work_mem = '2GB'")
+            con.execute("SET LOCAL max_parallel_maintenance_workers = 4")
         if "idx_chunks_dense_hnsw" not in existing:
             con.execute(
                 f"CREATE INDEX idx_chunks_dense_hnsw ON chunks USING hnsw "
@@ -573,7 +576,12 @@ def _handle_get_conversation(con: psycopg.Connection, cipher: ClyncCipher, param
 def _handle_ingest(con: psycopg.Connection, params: dict[str, Any]) -> dict[str, Any]:
     s3_key = params.get("s3_key")
     ensure_hnsw = bool(params.get("ensure_hnsw", False))
+    drop_hnsw = bool(params.get("drop_hnsw", False))
     _ensure_owner_schema(con, create_hnsw=False)
+    if drop_hnsw:
+        con.execute("DROP INDEX IF EXISTS idx_chunks_dense_hnsw")
+        con.execute("DROP INDEX IF EXISTS idx_chunks_sparse_hnsw")
+        con.commit()
     counts = {"units": 0, "messages": 0, "chunks": 0}
     if s3_key:
         if not STAGING_BUCKET or not str(s3_key).startswith(f"{OWNER}/"):
@@ -581,73 +589,88 @@ def _handle_ingest(con: psycopg.Connection, params: dict[str, Any]) -> dict[str,
         s3 = boto3.client("s3", region_name=AWS_REGION)
         raw_gz = s3.get_object(Bucket=STAGING_BUCKET, Key=s3_key)["Body"].read()
         lines = gzip.decompress(raw_gz).decode("utf-8").splitlines()
+        unit_rows: list[tuple[Any, ...]] = []
+        msg_rows: list[tuple[Any, ...]] = []
+        chunk_rows: list[tuple[Any, ...]] = []
+        for line in lines:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            kind = rec["t"]
+            if kind == "unit":
+                unit_rows.append(
+                    (
+                        rec["unit_id"],
+                        rec["source_hmac"],
+                        rec["kind_hmac"],
+                        rec.get("repo_hmac"),
+                        rec.get("project_hmac"),
+                        rec.get("updated_at"),
+                        rec["meta_ct"],
+                    )
+                )
+            elif kind == "msg":
+                msg_rows.append(
+                    (
+                        rec["unit_id"],
+                        rec["msg_idx"],
+                        rec.get("sender_hmac"),
+                        rec.get("created_at"),
+                        rec["payload_ct"],
+                    )
+                )
+            elif kind == "chunk":
+                chunk_rows.append(
+                    (
+                        rec["chunk_id"],
+                        rec["unit_id"],
+                        rec["source_hmac"],
+                        rec.get("repo_hmac"),
+                        rec.get("project_hmac"),
+                        rec.get("sender_hmac"),
+                        rec.get("lang_hmac"),
+                        rec.get("msg_idx"),
+                        rec.get("chunk_idx"),
+                        rec.get("updated_at"),
+                        rec["payload_ct"],
+                        rec["dense"],
+                        rec["sparse"],
+                    )
+                )
         with con.cursor() as cur:
-            for line in lines:
-                if not line.strip():
-                    continue
-                rec = json.loads(line)
-                kind = rec["t"]
-                if kind == "unit":
-                    cur.execute(
-                        "INSERT INTO units (unit_id, source_hmac, kind_hmac, repo_hmac, project_hmac, updated_at, meta_ct) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                        "ON CONFLICT (unit_id) DO UPDATE SET "
-                        "source_hmac=EXCLUDED.source_hmac, kind_hmac=EXCLUDED.kind_hmac, "
-                        "repo_hmac=EXCLUDED.repo_hmac, project_hmac=EXCLUDED.project_hmac, "
-                        "updated_at=EXCLUDED.updated_at, meta_ct=EXCLUDED.meta_ct",
-                        (
-                            rec["unit_id"],
-                            rec["source_hmac"],
-                            rec["kind_hmac"],
-                            rec.get("repo_hmac"),
-                            rec.get("project_hmac"),
-                            rec.get("updated_at"),
-                            rec["meta_ct"],
-                        ),
-                    )
-                    counts["units"] += 1
-                elif kind == "msg":
-                    cur.execute(
-                        "INSERT INTO messages (unit_id, msg_idx, sender_hmac, created_at, payload_ct) "
-                        "VALUES (%s,%s,%s,%s,%s) "
-                        "ON CONFLICT (unit_id, msg_idx) DO UPDATE SET "
-                        "sender_hmac=EXCLUDED.sender_hmac, created_at=EXCLUDED.created_at, payload_ct=EXCLUDED.payload_ct",
-                        (
-                            rec["unit_id"],
-                            rec["msg_idx"],
-                            rec.get("sender_hmac"),
-                            rec.get("created_at"),
-                            rec["payload_ct"],
-                        ),
-                    )
-                    counts["messages"] += 1
-                elif kind == "chunk":
-                    cur.execute(
-                        f"INSERT INTO chunks (chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
-                        f"sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse) "
-                        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({DENSE_DIM}),%s::sparsevec({SPARSE_DIM})) "
-                        f"ON CONFLICT (chunk_id) DO UPDATE SET "
-                        f"source_hmac=EXCLUDED.source_hmac, repo_hmac=EXCLUDED.repo_hmac, "
-                        f"project_hmac=EXCLUDED.project_hmac, sender_hmac=EXCLUDED.sender_hmac, "
-                        f"lang_hmac=EXCLUDED.lang_hmac, updated_at=EXCLUDED.updated_at, "
-                        f"payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse",
-                        (
-                            rec["chunk_id"],
-                            rec["unit_id"],
-                            rec["source_hmac"],
-                            rec.get("repo_hmac"),
-                            rec.get("project_hmac"),
-                            rec.get("sender_hmac"),
-                            rec.get("lang_hmac"),
-                            rec.get("msg_idx"),
-                            rec.get("chunk_idx"),
-                            rec.get("updated_at"),
-                            rec["payload_ct"],
-                            rec["dense"],
-                            rec["sparse"],
-                        ),
-                    )
-                    counts["chunks"] += 1
+            if unit_rows:
+                cur.executemany(
+                    "INSERT INTO units (unit_id, source_hmac, kind_hmac, repo_hmac, project_hmac, updated_at, meta_ct) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (unit_id) DO UPDATE SET "
+                    "source_hmac=EXCLUDED.source_hmac, kind_hmac=EXCLUDED.kind_hmac, "
+                    "repo_hmac=EXCLUDED.repo_hmac, project_hmac=EXCLUDED.project_hmac, "
+                    "updated_at=EXCLUDED.updated_at, meta_ct=EXCLUDED.meta_ct",
+                    unit_rows,
+                )
+                counts["units"] = len(unit_rows)
+            if msg_rows:
+                cur.executemany(
+                    "INSERT INTO messages (unit_id, msg_idx, sender_hmac, created_at, payload_ct) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (unit_id, msg_idx) DO UPDATE SET "
+                    "sender_hmac=EXCLUDED.sender_hmac, created_at=EXCLUDED.created_at, payload_ct=EXCLUDED.payload_ct",
+                    msg_rows,
+                )
+                counts["messages"] = len(msg_rows)
+            if chunk_rows:
+                cur.executemany(
+                    f"INSERT INTO chunks (chunk_id, unit_id, source_hmac, repo_hmac, project_hmac, "
+                    f"sender_hmac, lang_hmac, msg_idx, chunk_idx, updated_at, payload_ct, dense, sparse) "
+                    f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({DENSE_DIM}),%s::sparsevec({SPARSE_DIM})) "
+                    f"ON CONFLICT (chunk_id) DO UPDATE SET "
+                    f"source_hmac=EXCLUDED.source_hmac, repo_hmac=EXCLUDED.repo_hmac, "
+                    f"project_hmac=EXCLUDED.project_hmac, sender_hmac=EXCLUDED.sender_hmac, "
+                    f"lang_hmac=EXCLUDED.lang_hmac, updated_at=EXCLUDED.updated_at, "
+                    f"payload_ct=EXCLUDED.payload_ct, dense=EXCLUDED.dense, sparse=EXCLUDED.sparse",
+                    chunk_rows,
+                )
+                counts["chunks"] = len(chunk_rows)
         con.commit()
         s3.delete_object(Bucket=STAGING_BUCKET, Key=s3_key)
     if ensure_hnsw:

@@ -1997,6 +1997,7 @@ def cmd_uninstall(args) -> int:
 BIN_LINK = Path.home() / ".local/bin/clync"
 SKILL_LINK = Path.home() / ".claude/skills/clync"          # history-search (auto-fires)
 OPS_SKILL_LINK = Path.home() / ".claude/skills/clync-ops"  # operate/troubleshoot (invoked)
+CONNECT_SKILL_LINK = Path.home() / ".claude/skills/clync-connect"  # connect clync-share ARN
 MCP_NAME = "clync"
 
 
@@ -2043,6 +2044,9 @@ def cmd_setup(args) -> int:
     _relink(OPS_SKILL_LINK, REPO_DIR / "skill-ops")
     print(f"✓ ops skill: {OPS_SKILL_LINK} -> skill-ops/  "
           f"(resolves to {OPS_SKILL_LINK.resolve()})")
+    _relink(CONNECT_SKILL_LINK, REPO_DIR / "skill-connect")
+    print(f"✓ connect skill: {CONNECT_SKILL_LINK} -> skill-connect/  "
+          f"(resolves to {CONNECT_SKILL_LINK.resolve()})")
 
     # Search is core (ADR 0003): provision the contained cluster + build the initial
     # index unconditionally. Real provisioning/embedding failures fail loud — a
@@ -2078,7 +2082,7 @@ def cmd_unsetup(args) -> int:
     cmd_uninstall(args)  # launchd
     subprocess.run(["claude", "mcp", "remove", MCP_NAME], capture_output=True, text=True)
     print(f"✓ MCP server '{MCP_NAME}' unregistered")
-    for link in (BIN_LINK, SKILL_LINK, OPS_SKILL_LINK):
+    for link in (BIN_LINK, SKILL_LINK, OPS_SKILL_LINK, CONNECT_SKILL_LINK):
         if link.is_symlink():
             link.unlink()
             print(f"✓ removed {link}")
@@ -2134,9 +2138,10 @@ def cmd_connect(args) -> int:
         set_default=args.set_default,
     )
     print(f"Connected {entry['alias']} ({entry['owner']}) -> {entry['arn']}")
-    print(f"  modes : {', '.join(entry['modes'])}")
-    print(f"  caller: {entry['caller_arn']}")
-    print(f"  config: {sc.shares_path()}")
+    print(f"  modes  : {', '.join(entry['modes'])}")
+    print(f"  profile: {entry['profile'] or '(default AWS credentials)'}")
+    print(f"  caller : {entry['caller_arn']}")
+    print(f"  config : {sc.shares_path()}")
     print("Reload existing MCP clients to expose the connected endpoint.")
     return 0
 

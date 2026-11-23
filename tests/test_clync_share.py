@@ -260,3 +260,53 @@ def test_push_delta_watermark_skips_unchanged_and_honors_full():
     ]
 
 
+def test_connect_auto_detects_aws_profile_by_account_and_prefers_poweruser(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLYNC_DATA_HOME", str(tmp_path))
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    aws_cfg = tmp_path / "aws_config"
+    aws_cfg.write_text(
+        "[profile other-acct]\n"
+        "sso_account_id = 999988887777\n"
+        "sso_role_name = AWSPowerUserAccess\n\n"
+        "[profile team-ro]\n"
+        "sso_account_id = 111122223333\n"
+        "sso_role_name = ReadOnlyAccess\n\n"
+        "[profile team-admin]\n"
+        "sso_account_id = 111122223333\n"
+        "sso_role_name = AWSAdministratorAccess\n\n"
+        "[profile team-pu]\n"
+        "sso_account_id = 111122223333\n"
+        "sso_role_name = AWSPowerUserAccess\n\n"
+        "[profile assumed-role]\n"
+        "role_arn = arn:aws:iam::444455556666:role/DevPowerUser\n"
+    )
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(aws_cfg))
+
+    assert clync_share_client.list_profiles_for_account("111122223333") == [
+        "team-pu",
+        "team-admin",
+        "team-ro",
+    ]
+    assert clync_share_client.list_profiles_for_account("444455556666") == ["assumed-role"]
+
+    seen_profiles: list[str | None] = []
+
+    def fake_invoke(fn_arn, action, params, *, profile=None, region=None):
+        seen_profiles.append(profile)
+        return {
+            "owner": "alice",
+            "modes": ["ask"],
+            "tools": ["ask_alice"],
+            "caller_arn": "arn:aws:sts::111122223333:assumed-role/AWSPowerUserAccess/bob",
+        }
+
+    monkeypatch.setattr(clync_share_client, "invoke_share_lambda", fake_invoke)
+    entry = clync_share_client.connect_endpoint(
+        "arn:aws:lambda:us-east-1:111122223333:function:clync-share-alice"
+    )
+    assert seen_profiles == ["team-pu"]
+    assert entry["profile"] == "team-pu"
+    assert clync_share_client.load_shares()["endpoints"]["alice"]["profile"] == "team-pu"
+
+
+

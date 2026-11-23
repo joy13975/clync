@@ -48,11 +48,11 @@ An EventBridge rule watches CloudTrail for unexpected `kms:Decrypt` (outside the
 
 ### 6. Zero-install client onboarding (`clync connect` / `share-client/`)
 
-- Existing `clync` users run `clync connect <lambda-arn> [--profile <p>] [--as <alias>]`, which executes a live IAM handshake, saves `$CLYNC_DATA_HOME/shares.json`, and exposes the connected endpoints inside `mcp_server.py`.
+- Existing `clync` users run `clync connect <lambda-arn>` (or `/clync-connect <lambda-arn>`), which auto-selects the matching AWS profile for the ARN's account from `~/.aws/config`, executes a live IAM handshake, saves `$CLYNC_DATA_HOME/shares.json`, and exposes the connected endpoints inside `mcp_server.py`.
 - Teammates without `clync` installed run the lightweight `share-client/` package (`mcp` + `boto3` only, zero PyTorch/Postgres):
   ```sh
   uvx --from "git+https://github.com/joy13975/clync#subdirectory=share-client" \
-    clync-share connect <lambda-arn> --profile <aws-profile>
+    clync-share connect <lambda-arn>
   ```
 
 ## Consequences

@@ -262,20 +262,22 @@ exposing two optional interfaces: owner-only full recall (`search_history`, `res
 and read-only, live-redacted teammate Q&A (`ask_<owner>`) with opaque citation handles
 (`clync-<owner>-<rand>`). See [ADR 0006](docs/adr/0006-serverless-clync-share.md).
 
-**Connect from an existing `clync` install:**
+**Connect from an existing `clync` install (auto-detects the matching AWS profile from `~/.aws/config`):**
 
 ```sh
-clync connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner> --profile <aws-profile>
+clync connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner>
 clync shares
 clync ask <owner> "What did we decide about HNSW parameters?"
 clync resolve-citation clync-<owner>-<id>   # owner only
 ```
 
+Or invoke `/clync-connect <lambda-arn>` in Claude Code (`clync setup` installs the `clync-connect` skill alongside `clync` and `clync-ops`).
+
 **Connect without installing `clync` (teammates, zero PyTorch/Postgres):**
 
 ```sh
 uvx --from "git+https://github.com/joy13975/clync#subdirectory=share-client" \
-  clync-share connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner> --profile <aws-profile>
+  clync-share connect arn:aws:lambda:<region>:<account>:function:clync-share-<owner>
 ```
 
 ## Data and resources

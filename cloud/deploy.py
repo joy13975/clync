@@ -39,7 +39,7 @@ import clync_share_client as share_client  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DATA_HOME = Path(os.environ.get("CLYNC_DATA_HOME", Path.home() / ".local/share/clync"))
 LAMBDA_MEMORY_MB = 10240
-LAMBDA_TIMEOUT_SECS = 120
+LAMBDA_TIMEOUT_SECS = 600
 BATCH_CHUNKS_MAX = 2500
 LOG_FORWARD_FILTER_PATTERN = (
     '?ERROR ?CRITICAL ?FATAL ?"\\"error\\"" ?"\\"critical\\"" ?"\\"fatal\\"" ?"Traceback (most recent call last)"'
@@ -679,58 +679,12 @@ def _filter_changed_units(
     return changed
 
 
-def cmd_push(args: argparse.Namespace) -> int:
-    import clync
-
-    state = _load_state(args.owner)
-    if not state:
-        raise SystemExit(f"no cloud deployment state for {args.owner!r} at {_state_path(args.owner)}")
-
-    with clync.connect_pg() as con:
-        unit_sql = "SELECT unit_id, kind, source, title, summary, model, project_uuid, project_name, repo, worktree, git_branch, updated_at FROM units ORDER BY updated_at DESC NULLS LAST"
-        if args.limit_units:
-            unit_sql += f" LIMIT {int(args.limit_units)}"
-        units = con.execute(unit_sql).fetchall()
-        if args.include_dream:
-            dream_units = con.execute(
-                "SELECT unit_id, kind, source, title, summary, model, project_uuid, project_name, repo, worktree, git_branch, updated_at "
-                "FROM units WHERE source = 'dream'"
-            ).fetchall()
-            seen_u = {u["unit_id"] for u in units}
-            for du in dream_units:
-                if du["unit_id"] not in seen_u:
-                    units.append(du)
-                    seen_u.add(du["unit_id"])
-
-        pushed_units: dict[str, str] = dict(state.get("pushed_units") or {})
-        units = _filter_changed_units(units, pushed_units, full=bool(args.full))
-        if not units:
-            print("Up to date (0 changed units; pass --full to force re-push).", flush=True)
-            return 0
-        unit_ids = [u["unit_id"] for u in units]
-
-        msgs = con.execute(
-            "SELECT unit_id, idx, sender, text, created_at FROM messages WHERE unit_id = ANY(%s) ORDER BY unit_id, idx",
-            (unit_ids,),
-        ).fetchall()
-        chunks = con.execute(
-            "SELECT chunk_id, unit_id, source, unit_name, sender, lang, msg_idx, chunk_idx, updated_at, repo, project_name, text, dense::text AS dense, sparse::text AS sparse "
-            "FROM chunks WHERE unit_id = ANY(%s)",
-            (unit_ids,),
-        ).fetchall()
-
-    session = boto3.Session(profile_name=args.profile, region_name=state["region"])
-    kms = session.client("kms")
-    s3 = session.client("s3")
-    dk_plain = kms.decrypt(
-        KeyId=state["kms_key_arn"],
-        CiphertextBlob=base64.b64decode(state["data_key_ct_b64"]),
-        EncryptionContext={"clync_owner": args.owner},
-    )["Plaintext"]
-    cipher = ClyncCipher(dk_plain)
-
-    print(f"Encrypting {len(units)} units, {len(msgs)} messages, {len(chunks)} chunks...")
-    t0 = time.perf_counter()
+def _encrypt_unit_group(
+    cipher: ClyncCipher,
+    units: list[dict[str, Any]],
+    msgs: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+) -> list[str]:
     records: list[str] = []
     for u in units:
         meta_json = json.dumps(
@@ -808,39 +762,112 @@ def cmd_push(args: argparse.Namespace) -> int:
                 }
             )
         )
-    print(f"Encrypted {len(records)} records in {time.perf_counter() - t0:.1f}s")
+    return records
 
-    batch_size = max(100, int(args.batch_records))
-    total_ingested = {"units": 0, "messages": 0, "chunks": 0}
-    n_batches = (len(records) + batch_size - 1) // batch_size
-    for idx in range(n_batches):
-        batch = records[idx * batch_size : (idx + 1) * batch_size]
-        raw_gz = gzip.compress(("\n".join(batch) + "\n").encode("utf-8"))
-        digest = hashlib.sha256(raw_gz).hexdigest()[:12]
-        key = f"{args.owner}/push/{int(time.time())}-{idx:04d}-{digest}.ndjson.gz"
-        s3.put_object(Bucket=state["staging_bucket"], Key=key, Body=raw_gz)
-        is_last = idx == n_batches - 1
-        res = share_client.invoke_share_lambda(
-            state["lambda_arn"],
-            "ingest",
-            {"s3_key": key, "ensure_hnsw": is_last},
-            profile=args.profile,
-            region=state["region"],
+
+def cmd_push(args: argparse.Namespace) -> int:
+    import clync
+
+    state = _load_state(args.owner)
+    if not state:
+        raise SystemExit(f"no cloud deployment state for {args.owner!r} at {_state_path(args.owner)}")
+
+    profile = args.profile or share_client.resolve_profile_for_account(state["account_id"])
+    with clync.connect_pg() as con:
+        unit_sql = (
+            "SELECT unit_id, kind, source, title, summary, model, project_uuid, project_name, "
+            "repo, worktree, git_branch, updated_at FROM units ORDER BY updated_at DESC NULLS LAST"
         )
-        for k in total_ingested:
-            total_ingested[k] += int(res.get("ingested", {}).get(k, 0))
+        if args.limit_units:
+            unit_sql += f" LIMIT {int(args.limit_units)}"
+        units = con.execute(unit_sql).fetchall()
+        if args.include_dream:
+            dream_units = con.execute(
+                "SELECT unit_id, kind, source, title, summary, model, project_uuid, project_name, "
+                "repo, worktree, git_branch, updated_at FROM units WHERE source = 'dream'"
+            ).fetchall()
+            seen_u = {u["unit_id"] for u in units}
+            for du in dream_units:
+                if du["unit_id"] not in seen_u:
+                    units.append(du)
+                    seen_u.add(du["unit_id"])
+
+        pushed_units: dict[str, str] = {} if args.full else dict(state.get("pushed_units") or {})
+        units = _filter_changed_units(units, pushed_units, full=bool(args.full))
+        if not units:
+            print("Up to date (0 changed units; pass --full to force re-push).", flush=True)
+            return 0
+
+        session = boto3.Session(profile_name=profile, region_name=state["region"])
+        kms = session.client("kms")
+        s3 = session.client("s3")
+        dk_plain = kms.decrypt(
+            KeyId=state["kms_key_arn"],
+            CiphertextBlob=base64.b64decode(state["data_key_ct_b64"]),
+            EncryptionContext={"clync_owner": args.owner},
+        )["Plaintext"]
+        cipher = ClyncCipher(dk_plain)
+
+        batch_size = max(500, int(args.batch_records))
+        unit_chunk_size = max(1, int(args.units_per_wave))
+        total_ingested = {"units": 0, "messages": 0, "chunks": 0}
+        drop_hnsw_first = bool(args.full) and len(units) >= 200
+        n_waves = (len(units) + unit_chunk_size - 1) // unit_chunk_size
+        t_start = time.perf_counter()
         print(
-            f"  batch {idx + 1}/{n_batches} ({len(raw_gz) / 1024:.1f} KB gz) -> "
-            f"{res['ingested']} hnsw={res['hnsw_ensured']}",
+            f"Pushing {len(units)} changed unit(s) in {n_waves} wave(s) "
+            f"(profile={profile or 'default'}, drop_hnsw={drop_hnsw_first})...",
             flush=True,
         )
-    if args.full:
-        pushed_units = {}
-    for u in units:
-        pushed_units[u["unit_id"]] = u["updated_at"].isoformat() if u.get("updated_at") else ""
-    state["pushed_units"] = pushed_units
-    state["last_push_at"] = datetime.now(timezone.utc).isoformat()
-    _save_state(args.owner, state)
+
+        for w_idx in range(n_waves):
+            w_units = units[w_idx * unit_chunk_size : (w_idx + 1) * unit_chunk_size]
+            w_ids = [u["unit_id"] for u in w_units]
+            msgs = con.execute(
+                "SELECT unit_id, idx, sender, text, created_at FROM messages "
+                "WHERE unit_id = ANY(%s) ORDER BY unit_id, idx",
+                (w_ids,),
+            ).fetchall()
+            chunks = con.execute(
+                "SELECT chunk_id, unit_id, source, unit_name, sender, lang, msg_idx, chunk_idx, "
+                "updated_at, repo, project_name, text, dense::text AS dense, sparse::text AS sparse "
+                "FROM chunks WHERE unit_id = ANY(%s)",
+                (w_ids,),
+            ).fetchall()
+            records = _encrypt_unit_group(cipher, w_units, msgs, chunks)
+            n_batches = max(1, (len(records) + batch_size - 1) // batch_size)
+            for b_idx in range(n_batches):
+                batch = records[b_idx * batch_size : (b_idx + 1) * batch_size]
+                raw_gz = gzip.compress(("\n".join(batch) + "\n").encode("utf-8"))
+                digest = hashlib.sha256(raw_gz).hexdigest()[:12]
+                key = f"{args.owner}/push/{int(time.time())}-w{w_idx:03d}-b{b_idx:03d}-{digest}.ndjson.gz"
+                s3.put_object(Bucket=state["staging_bucket"], Key=key, Body=raw_gz)
+                is_first = w_idx == 0 and b_idx == 0
+                is_last = w_idx == n_waves - 1 and b_idx == n_batches - 1
+                res = share_client.invoke_share_lambda(
+                    state["lambda_arn"],
+                    "ingest",
+                    {
+                        "s3_key": key,
+                        "drop_hnsw": drop_hnsw_first and is_first,
+                        "ensure_hnsw": is_last,
+                    },
+                    profile=profile,
+                    region=state["region"],
+                    read_timeout=LAMBDA_TIMEOUT_SECS + 30,
+                )
+                for k in total_ingested:
+                    total_ingested[k] += int(res.get("ingested", {}).get(k, 0))
+            for u in w_units:
+                pushed_units[u["unit_id"]] = u["updated_at"].isoformat() if u.get("updated_at") else ""
+            state["pushed_units"] = pushed_units
+            state["last_push_at"] = datetime.now(timezone.utc).isoformat()
+            _save_state(args.owner, state)
+            print(
+                f"  wave {w_idx + 1}/{n_waves}: +{len(w_units)} units, +{len(msgs)} msgs, +{len(chunks)} chunks "
+                f"({n_batches} batch(es), elapsed {time.perf_counter() - t_start:.1f}s)",
+                flush=True,
+            )
     print("Push complete:", json.dumps(total_ingested), flush=True)
     return 0
 
@@ -882,7 +909,8 @@ def main(argv: list[str] | None = None) -> int:
     p_push.add_argument("--limit-units", type=int, default=0, help="optional cap on most recent units to push")
     p_push.add_argument("--include-dream", action="store_true", help="always include dream insight units")
     p_push.add_argument("--full", action="store_true", help="ignore local push watermark and re-push selected units")
-    p_push.add_argument("--batch-records", type=int, default=1500)
+    p_push.add_argument("--batch-records", type=int, default=4000)
+    p_push.add_argument("--units-per-wave", type=int, default=250)
 
     args = parser.parse_args(argv)
     if args.cmd == "deploy":
