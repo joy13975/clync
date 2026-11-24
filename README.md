@@ -260,7 +260,12 @@ and stops the database while retaining its data.
 (direct `lambda:InvokeFunction` with per-call SigV4 STS verification — no ALB/API Gateway)
 exposing two optional interfaces: owner-only full recall (`search_history`, `resolve_citation`)
 and read-only, live-redacted teammate Q&A (`ask_<owner>`) with opaque citation handles
-(`clync-<owner>-<rand>`). See [ADR 0006](docs/adr/0006-serverless-clync-share.md).
+(`clync-<owner>-<rand>`). See [ADR 0006](docs/adr/0006-serverless-clync-share.md) and the
+agent-executable [connect guide](docs/connect.md).
+
+**One-sentence agent onboarding (works whether `clync` is installed or not):**
+
+> Read `https://raw.githubusercontent.com/joy13975/clync/main/docs/connect.md` and install/update clync on this host, then connect to `arn:aws:lambda:<region>:<account>:function:clync-share-<owner>`
 
 **Connect from an existing `clync` install (auto-detects the matching AWS profile from `~/.aws/config`):**
 

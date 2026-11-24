@@ -2137,6 +2137,14 @@ def cmd_connect(args) -> int:
         profile=args.profile,
         set_default=args.set_default,
     )
+    if (
+        SKILL_LINK.is_symlink()
+        and SKILL_LINK.resolve() == (REPO_DIR / "skill").resolve()
+        and not CONNECT_SKILL_LINK.exists()
+        and not CONNECT_SKILL_LINK.is_symlink()
+    ):
+        _relink(CONNECT_SKILL_LINK, REPO_DIR / "skill-connect")
+        print(f"✓ connect skill: {CONNECT_SKILL_LINK} -> skill-connect/")
     print(f"Connected {entry['alias']} ({entry['owner']}) -> {entry['arn']}")
     print(f"  modes  : {', '.join(entry['modes'])}")
     print(f"  profile: {entry['profile'] or '(default AWS credentials)'}")
