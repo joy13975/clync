@@ -17,7 +17,7 @@ Check if an existing `clync` checkout is linked on this host:
 readlink ~/.local/bin/clync ~/.claude/skills/clync 2>/dev/null || command -v clync || true
 ```
 
-- **Installed** (a local `clync` repo path was found) → follow **Path A**.
+- **Installed** (a local `clync` repo path was found) → try **Path A** first.
 - **Not installed** (no output) → follow **Path B** (lightweight client-only install:
   `boto3` + `mcp` only, zero PyTorch/Postgres/Chrome setup). If the user explicitly asked
   for full local conversation archiving too, see [README.md](../README.md) after connecting.
@@ -28,13 +28,13 @@ readlink ~/.local/bin/clync ~/.claude/skills/clync 2>/dev/null || command -v cly
 
 Let `<REPO>` be the resolved `clync` repository directory (parent of `clync` or `skill/`).
 
-1. **Check working tree & remote:**
+1. **Check working tree and remote:**
    ```sh
    git -C "<REPO>" status --short
    git -C "<REPO>" remote -v
    ```
-   - If the working tree has uncommitted changes, stop and report them rather than clobbering user work.
-   - Ensure the public repo `https://github.com/joy13975/clync.git` (or `git@github.com:joy13975/clync.git`) is configured as `origin` (if `origin` points elsewhere, add or fetch from `https://github.com/joy13975/clync.git`).
+   - Ensure `https://github.com/joy13975/clync.git` (or `git@github.com:joy13975/clync.git`) is fetched.
+   - If the working tree has uncommitted changes, **do not clobber them** — switch immediately to **Path B** so the share endpoint connects right now, and mention the untouched local changes in your final report.
 
 2. **Pull latest `main` and sync dependencies:**
    ```sh
@@ -42,16 +42,16 @@ Let `<REPO>` be the resolved `clync` repository directory (parent of `clync` or 
    git -C "<REPO>" pull --ff-only origin main
    uv sync --quiet --project "<REPO>"
    ```
-   *(If `pull --ff-only` fails due to an older rewritten history and `git status --short` is clean, reset local `main` to `origin/main` after confirming with the user or checking `git log -n 3`.)*
+   - If `pull --ff-only` fails (diverged/rewritten upstream history), **do not force-reset without asking** — switch immediately to **Path B** so the share endpoint connects right now, and mention in your final report that `<REPO>` diverged from `origin/main` and can be realigned later with `git -C "<REPO>" checkout -B main origin/main && uv sync --project "<REPO>"`.
 
-3. **Ensure skill symlinks are current** (only if `~/.claude/skills/clync` is already used):
-   ```sh
-   ln -sfn "<REPO>/skill-connect" ~/.claude/skills/clync-connect
-   ```
-
-4. **Connect the Lambda ARN:**
+3. **Connect the Lambda ARN** (auto-links `~/.claude/skills/clync-connect` when `~/.claude/skills/clync` points to `<REPO>/skill`):
    ```sh
    uv run --project "<REPO>" python "<REPO>/clync.py" connect "<LAMBDA_ARN>"
+   ```
+
+4. **Remove any redundant standalone `clync-share` MCP server** (since updated `clync` MCP now relays `shares.json` directly):
+   ```sh
+   claude mcp remove --scope user clync-share 2>/dev/null || true
    ```
 
 5. **Verify:**
@@ -61,7 +61,7 @@ Let `<REPO>` be the resolved `clync` repository directory (parent of `clync` or 
 
 ---
 
-## Path B — `clync` is NOT installed (lightweight client-only connect)
+## Path B — Lightweight client-only connect (no `clync` install, or local checkout dirty/diverged)
 
 1. **Ensure `uvx` is installed:**
    ```sh
@@ -88,6 +88,7 @@ Let `<REPO>` be the resolved `clync` repository directory (parent of `clync` or 
    ```sh
    uvx --from "git+https://github.com/joy13975/clync#subdirectory=share-client" clync-share list
    ```
+   If `claude` is installed, verify the MCP server connects cleanly (`claude mcp list` shows `clync-share` connected).
 
 ---
 
@@ -101,8 +102,8 @@ Let `<REPO>` be the resolved `clync` repository directory (parent of `clync` or 
 ## What to report when done
 
 State:
-1. Connected alias, resolved AWS profile, and granted modes (`ask` or `ask, owner`).
+1. Connected alias, resolved AWS profile, granted modes (`ask` or `ask, owner`), and whether Path A (full `clync` updated) or Path B (standalone `clync-share` fallback, plus why Path A was skipped if applicable) ran.
 2. Immediate CLI usage works now without restarting:
    - Path A: `clync ask <alias> "<question>"`
    - Path B: `uvx --from "git+https://github.com/joy13975/clync#subdirectory=share-client" clync-share ask <alias> "<question>"`
-3. Restart / open a new assistant session to expose the native `ask_<alias>` MCP tool (and `/clync-connect` on Path A).
+3. Restart / open a new assistant session to expose the native `ask_<alias>` MCP tool.
