@@ -74,14 +74,33 @@ _ORT_SESS: Any = None
 _TOKENIZER: Any = None
 _DB_TOKEN_CACHE: tuple[float, str] | None = None
 
-REDACTION_SYSTEM_PROMPT = """You answer a teammate's question based ONLY on the owner's retrieved work notes below.
-Strict privacy & redaction rules (MUST obey every rule):
-1. NEVER quote the owner or assistant verbatim. Synthesize and paraphrase in neutral, professional engineering prose.
-2. NEVER include profanity, frustration, scolding, personal/non-work anecdotes, private preferences, employee/HR matters, credentials, API keys, tokens, URLs with secrets, or internal personal paths.
-3. If a retrieved snippet is purely private/non-work or contains nothing relevant to the work question, ignore it.
-4. Ground every factual claim by citing the provided bracketed slot tags like [S1], [S2] immediately after the claim. Only cite slots you actually used.
-5. If the retrieved material does not answer the question, say so plainly without guessing.
+OWNER_SENDERS = ("user", "human", "user_answer")
+STANCE_RE = re.compile(r"\((user_asserted|user_endorsed|user_rejected|co_derived|claude_proposed)\)")
+
+ASK_SYSTEM_PROMPT = """You answer a teammate's question the way {owner} would answer it, so the teammate gets {owner}'s call without asking {owner}. Reason from {owner}'s past decisions in the snippets below, and use nothing else.
+
+Reading the snippets:
+- speaker=OWNER is {owner}'s own words. Its "answering:" part is what {owner} was replying to; the OWNER part is {owner}'s decision and reasoning. These are the strongest evidence.
+- speaker=INSIGHT is a distilled position with a stance. user_asserted or user_endorsed: {owner} holds it. user_rejected: {owner} rejected it. co_derived: worked out together with {owner}. claude_proposed: {owner} never adjudicated it, so it is not {owner}'s view.
+- speaker=ASSISTANT is an AI assistant talking to {owner}. It is {owner}'s view only where an OWNER snippet shows {owner} asked for or accepted it.
+- Where snippets disagree, the newer date wins: {owner} changes their mind on new evidence.
+
+Method: find the past decisions closest to the question. From each, take the situation, what {owner} chose, and the reason {owner} gave. Then apply the principle those decisions share to the question. Cite principles, not anecdotes.
+
+Output, in exactly this shape:
+**{owner}'s answer:** the call {owner} would make, in one or two committed sentences.
+**Why:** the reasons {owner} would give, as principles, each followed by its slot like [S1].
+**Past decisions this rests on:**
+- situation -> what {owner} chose, because the reason [S2]
+(two to five bullets, closest first)
+**Basis:** one line naming the closest past decision and whether it was the same situation, a close analogue, or {owner}'s general principle applied here.
+
+The answer is always a call. Never write that {owner} has no recorded position, that the notes or archive lack something, or how confident you are ("likely", "it seems", "possibly"). Never mention citation handles, resolving them, or asking {owner}. Refer to {owner} by name, never with a gendered pronoun. Only if no snippet relates to the question at all, write the single line "**{owner}'s answer:** nothing in {owner}'s archive relates to this."
+
+Privacy (always): never quote verbatim; paraphrase in neutral engineering prose. Never include profanity, frustration, scolding, personal or non-work matters, HR matters, credentials, tokens, secret-bearing URLs, or personal filesystem paths. Ignore snippets that are private or irrelevant. Cite only slots you used.
 """
+EPISODE_LOOKBACK = 3
+EPISODE_CONTEXT_CHARS = 900
 
 
 def _validate_schema_name() -> str:
@@ -343,7 +362,7 @@ def _hybrid_search(
         params["repo"] = cipher.hmac_facet("repo", repo)
     if sender:
         role_map = {
-            "user": ["human", "user"],
+            "user": list(OWNER_SENDERS),
             "assistant": ["assistant"],
         }
         senders = role_map.get(sender, [sender])
@@ -392,7 +411,7 @@ def _hybrid_search(
     )
     ctes.append(
         "scored AS MATERIALIZED ("
-        "SELECT c.chunk_id, c.unit_id, c.msg_idx, c.chunk_idx, c.payload_ct, "
+        "SELECT c.chunk_id, c.unit_id, c.msg_idx, c.chunk_idx, c.payload_ct, c.updated_at, "
         "1 - (c.dense <=> %(qd)s::vector) AS dense_sim, "
         "f.rrf * (1.0 "
         "+ CASE WHEN c.updated_at IS NULL THEN 0 "
@@ -401,13 +420,13 @@ def _hybrid_search(
         "FROM fused f JOIN chunks c ON c.chunk_id = f.chunk_id)"
     )
     ctes.append(
-        "ranked AS (SELECT chunk_id, unit_id, msg_idx, chunk_idx, payload_ct, score, dense_sim, "
+        "ranked AS (SELECT chunk_id, unit_id, msg_idx, chunk_idx, payload_ct, updated_at, score, dense_sim, "
         "row_number() OVER (PARTITION BY unit_id ORDER BY score DESC) rn FROM scored)"
     )
     sql = (
         "WITH "
         + ",\n".join(ctes)
-        + "\nSELECT chunk_id, unit_id, msg_idx, chunk_idx, payload_ct, score, dense_sim "
+        + "\nSELECT chunk_id, unit_id, msg_idx, chunk_idx, payload_ct, updated_at, score, dense_sim "
         "FROM ranked WHERE rn <= %(per_unit)s"
     )
     rows = con.execute(sql, params).fetchall()
@@ -427,6 +446,7 @@ def _hybrid_search(
                 "text": payload.get("text") or "",
                 "msg_idx": r["msg_idx"],
                 "chunk_idx": r["chunk_idx"],
+                "date": r["updated_at"].date().isoformat() if r["updated_at"] else None,
                 "score": float(r["score"]),
                 "dense_sim": float(r["dense_sim"]),
             }
@@ -435,16 +455,60 @@ def _hybrid_search(
     return out[:topk]
 
 
+def _speaker(hit: dict[str, Any]) -> tuple[str, str]:
+    """(prompt label, reader-facing provenance) for one retrieved chunk."""
+    if hit["source"] == "dream":
+        m = STANCE_RE.search(hit["text"])
+        stance = m.group(1) if m else "unknown"
+        readable = {
+            "user_asserted": f"{OWNER}'s distilled position",
+            "user_endorsed": f"{OWNER}'s distilled position",
+            "user_rejected": f"position {OWNER} rejected",
+            "co_derived": f"conclusion {OWNER} co-derived",
+        }.get(stance, "assistant proposal never adjudicated")
+        return f"INSIGHT stance={stance}", readable
+    if hit["sender"] in OWNER_SENDERS:
+        return "OWNER", f"{OWNER}'s own words"
+    if hit["sender"] == "assistant":
+        return "ASSISTANT", f"assistant reply to {OWNER}"
+    return f"OTHER sender={hit['sender']}", f"{hit['sender']} text"
+
+
+def _answering(con: psycopg.Connection, cipher: ClyncCipher, unit_id: str, msg_idx: int | None) -> str:
+    """The latest non-owner turn just before an owner turn: what the owner was replying to."""
+    if msg_idx is None:
+        return ""
+    rows = con.execute(
+        "SELECT msg_idx, payload_ct FROM messages WHERE unit_id = %s AND msg_idx BETWEEN %s AND %s "
+        "ORDER BY msg_idx DESC",
+        (unit_id, max(0, msg_idx - EPISODE_LOOKBACK), msg_idx - 1),
+    ).fetchall()
+    for r in rows:
+        mp = json.loads(cipher.decrypt_text(r["payload_ct"], aad=f"messages:{unit_id}:{r['msg_idx']}"))
+        text = (mp.get("text") or "").strip()
+        if text and mp.get("sender") not in OWNER_SENDERS:
+            return text[-EPISODE_CONTEXT_CHARS:]
+    return ""
+
+
 def _handle_ask(con: psycopg.Connection, cipher: ClyncCipher, caller: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     question = str(params.get("question", "")).strip()
     if not question:
         raise ValueError("question is required")
     limit = min(15, max(1, int(params.get("limit", 8))))
-    insights = _hybrid_search(con, cipher, question, topk=min(5, limit), source="dream")
-    raw = _hybrid_search(con, cipher, question, topk=limit, source="all")
-    hits = [h for h in insights if h["dense_sim"] >= 0.45] + raw
+    insights = [
+        h for h in _hybrid_search(con, cipher, question, topk=min(5, limit), source="dream") if h["dense_sim"] >= 0.45
+    ]
+    owner_turns = _hybrid_search(con, cipher, question, topk=limit, source="all", sender="user", per_unit=2)
+    context = _hybrid_search(con, cipher, question, topk=max(3, limit // 2), source="all")
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for h in insights + owner_turns + context:
+        if h["chunk_id"] not in seen:
+            seen.add(h["chunk_id"])
+            hits.append(h)
     if not hits:
-        return {"owner": OWNER, "answer": f"No relevant work notes found in {OWNER}'s archive.", "citations": []}
+        return {"owner": OWNER, "answer": f"{OWNER}'s archive has nothing on this.", "citations": []}
 
     _assert_bedrock_logging_off()
     slots: dict[str, dict[str, Any]] = {}
@@ -452,18 +516,23 @@ def _handle_ask(con: psycopg.Connection, cipher: ClyncCipher, caller: dict[str, 
     for idx, h in enumerate(hits, 1):
         slot = f"S{idx}"
         slots[slot] = h
-        kind = "distilled_insight" if h["source"] == "dream" else h["source"]
-        context_lines.append(f"[{slot}] (source_type={kind}, sender={h['sender']}): {h['text'][:1500]}")
+        label, _ = _speaker(h)
+        body = h["text"][:1500]
+        if label == "OWNER":
+            prior = _answering(con, cipher, h["unit_id"], h["msg_idx"])
+            if prior:
+                body = f"answering: {prior}\nOWNER: {body}"
+        context_lines.append(f"[{slot}] (speaker={label}, date={h['date']}): {body}")
 
     user_prompt = (
-        f"Question for {OWNER}: {question}\n\n"
+        f"Teammate's question for {OWNER}: {question}\n\n"
         f"Retrieved snippets (CONFIDENTIAL — DO NOT QUOTE VERBATIM):\n"
         + "\n\n".join(context_lines)
     )
     br = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
     resp = br.converse(
         modelId=BEDROCK_MODEL_ID,
-        system=[{"text": REDACTION_SYSTEM_PROMPT}],
+        system=[{"text": ASK_SYSTEM_PROMPT.format(owner=OWNER)}],
         messages=[{"role": "user", "content": [{"text": user_prompt}]}],
         inferenceConfig={"maxTokens": 1024},
     )
@@ -476,8 +545,6 @@ def _handle_ask(con: psycopg.Connection, cipher: ClyncCipher, caller: dict[str, 
         slot = m.group(1)
         if slot in slots and slot not in cited_slots:
             cited_slots.append(slot)
-    if not cited_slots:
-        cited_slots = list(slots.keys())[:3]
 
     slot_to_handle: dict[str, str] = {}
     citations: list[dict[str, str]] = []
@@ -500,7 +567,14 @@ def _handle_ask(con: psycopg.Connection, cipher: ClyncCipher, caller: dict[str, 
             "INSERT INTO citations (handle, caller_hmac, payload_ct) VALUES (%s, %s, %s)",
             (handle, caller_hmac, payload_ct),
         )
-        citations.append({"handle": handle, "source_type": "insight" if h["source"] == "dream" else h["source"]})
+        citations.append(
+            {
+                "handle": handle,
+                "source_type": "insight" if h["source"] == "dream" else h["source"],
+                "provenance": _speaker(h)[1],
+                "date": h["date"],
+            }
+        )
     con.commit()
 
     def _replace_slot(m: re.Match) -> str:
