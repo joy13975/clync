@@ -341,9 +341,15 @@ def _ensure_log_group(logs, name: str, extra_tags: dict[str, str], owner: str, l
         )
     logs.put_retention_policy(logGroupName=name, retentionInDays=90)
     if log_forwarder_arn:
+        # Update an existing filter to this destination in place: a second one forwards every line twice.
+        existing = [
+            f["filterName"]
+            for f in logs.describe_subscription_filters(logGroupName=name)["subscriptionFilters"]
+            if f["destinationArn"] == log_forwarder_arn
+        ]
         logs.put_subscription_filter(
             logGroupName=name,
-            filterName="clync-share-forward",
+            filterName=existing[0] if existing else "clync-share-forward",
             filterPattern=LOG_FORWARD_FILTER_PATTERN,
             destinationArn=log_forwarder_arn,
         )
