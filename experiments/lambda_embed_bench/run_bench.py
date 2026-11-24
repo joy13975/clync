@@ -253,7 +253,7 @@ def main() -> None:
     ap.add_argument("--region", required=True)
     ap.add_argument("--vpc-id", required=True)
     ap.add_argument("--subnets", required=True, help="Comma-separated subnet IDs")
-    ap.add_argument("--system-name", required=True)
+    ap.add_argument("--tag", dest="tags", action="append", default=[], metavar="KEY=VALUE")
     ap.add_argument("--model-full", required=True)
     ap.add_argument("--model-stripped", required=True)
     ap.add_argument("--tokenizer", required=True)
@@ -265,7 +265,7 @@ def main() -> None:
 
     region = args.region
     subnets = [s.strip() for s in args.subnets.split(",") if s.strip()]
-    tag_kv = {"System": args.system_name, "Environment": "dev", "ManagedBy": "clync-bench"}
+    tag_kv = {**dict(t.split("=", 1) for t in args.tags), "ManagedBy": "clync-bench"}
     tag_list = [{"Key": k, "Value": v} for k, v in tag_kv.items()]
 
     sts = boto3.client("sts", region_name=region)

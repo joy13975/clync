@@ -66,12 +66,22 @@ def _save_state(owner: str, state: dict[str, Any]) -> None:
     path.chmod(0o600)
 
 
-def _tags_dict(system_name: str, owner: str) -> dict[str, str]:
-    return {"System": system_name, "Component": "clync-share", "Owner": owner}
+def _tags_dict(extra_tags: dict[str, str], owner: str) -> dict[str, str]:
+    return {**extra_tags, "Component": "clync-share", "Owner": owner}
 
 
-def _tags_kv(system_name: str, owner: str) -> list[dict[str, str]]:
-    return [{"Key": k, "Value": v} for k, v in _tags_dict(system_name, owner).items()]
+def _parse_tags(pairs: list[str]) -> dict[str, str]:
+    tags: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"--tag expects KEY=VALUE, got {pair!r}")
+        tags[key] = value
+    return tags
+
+
+def _tags_kv(extra_tags: dict[str, str], owner: str) -> list[dict[str, str]]:
+    return [{"Key": k, "Value": v} for k, v in _tags_dict(extra_tags, owner).items()]
 
 
 def _ensure_iam_role(
@@ -146,7 +156,7 @@ def _ensure_kms_key(
     owner_role_arns: list[str],
     lambda_role_arn: str,
     lambda_role_id: str,
-    system_name: str,
+    extra_tags: dict[str, str],
 ) -> tuple[str, str]:
     alias_name = f"alias/clync-share-{owner}"
     policy = _build_kms_policy(account_id, owner_user_ids, lambda_role_arn, lambda_role_id, owner_role_arns)
@@ -166,21 +176,21 @@ def _ensure_kms_key(
         kms.put_key_policy(KeyId=key_id, PolicyName="default", Policy=json.dumps(policy))
         kms.tag_resource(
             KeyId=key_id,
-            Tags=[{"TagKey": k, "TagValue": v} for k, v in _tags_dict(system_name, owner).items()],
+            Tags=[{"TagKey": k, "TagValue": v} for k, v in _tags_dict(extra_tags, owner).items()],
         )
         return key_id, key_arn
 
     created = kms.create_key(
         Description=f"clync-share per-owner encryption key for {owner}",
         Policy=json.dumps(policy),
-        Tags=[{"TagKey": k, "TagValue": v} for k, v in _tags_dict(system_name, owner).items()],
+        Tags=[{"TagKey": k, "TagValue": v} for k, v in _tags_dict(extra_tags, owner).items()],
     )["KeyMetadata"]
     key_id = created["KeyId"]
     kms.create_alias(AliasName=alias_name, TargetKeyId=key_id)
     return key_id, created["Arn"]
 
 
-def _ensure_staging_bucket(s3, bucket: str, region: str, system_name: str, owner: str) -> None:
+def _ensure_staging_bucket(s3, bucket: str, region: str, extra_tags: dict[str, str], owner: str) -> None:
     try:
         s3.head_bucket(Bucket=bucket)
     except ClientError:
@@ -213,10 +223,10 @@ def _ensure_staging_bucket(s3, bucket: str, region: str, system_name: str, owner
             ]
         },
     )
-    s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": _tags_kv(system_name, owner)})
+    s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": _tags_kv(extra_tags, owner)})
 
 
-def _ensure_security_group(ec2, vpc_id: str, name: str, rds_sg_id: str, system_name: str, owner: str) -> str:
+def _ensure_security_group(ec2, vpc_id: str, name: str, rds_sg_id: str, extra_tags: dict[str, str], owner: str) -> str:
     found = ec2.describe_security_groups(
         Filters=[{"Name": "vpc-id", "Values": [vpc_id]}, {"Name": "group-name", "Values": [name]}]
     )["SecurityGroups"]
@@ -227,9 +237,9 @@ def _ensure_security_group(ec2, vpc_id: str, name: str, rds_sg_id: str, system_n
             GroupName=name,
             Description=f"clync-share Lambda egress SG for {owner}",
             VpcId=vpc_id,
-            TagSpecifications=[{"ResourceType": "security-group", "Tags": _tags_kv(system_name, owner)}],
+            TagSpecifications=[{"ResourceType": "security-group", "Tags": _tags_kv(extra_tags, owner)}],
         )["GroupId"]
-    ec2.create_tags(Resources=[sg_id], Tags=_tags_kv(system_name, owner))
+    ec2.create_tags(Resources=[sg_id], Tags=_tags_kv(extra_tags, owner))
     if rds_sg_id:
         try:
             ec2.authorize_security_group_ingress(
@@ -256,7 +266,7 @@ def _ensure_ecr_image(
     repo_name: str,
     model_onnx: Path,
     tokenizer_json: Path,
-    system_name: str,
+    extra_tags: dict[str, str],
     owner: str,
     *,
     skip_build: bool = False,
@@ -269,9 +279,9 @@ def _ensure_ecr_image(
         repo = ecr.create_repository(
             repositoryName=repo_name,
             imageScanningConfiguration={"scanOnPush": False},
-            tags=_tags_kv(system_name, owner),
+            tags=_tags_kv(extra_tags, owner),
         )["repository"]
-    ecr.tag_resource(resourceArn=repo["repositoryArn"], tags=_tags_kv(system_name, owner))
+    ecr.tag_resource(resourceArn=repo["repositoryArn"], tags=_tags_kv(extra_tags, owner))
     image_uri = f"{account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}:latest"
     if skip_build:
         return image_uri
@@ -319,15 +329,15 @@ def _wait_lambda_ready(lam, fn_name: str) -> dict[str, Any]:
     raise TimeoutError(f"Lambda {fn_name} did not become Active")
 
 
-def _ensure_log_group(logs, name: str, system_name: str, owner: str, log_forwarder_arn: str | None) -> None:
+def _ensure_log_group(logs, name: str, extra_tags: dict[str, str], owner: str, log_forwarder_arn: str | None) -> None:
     try:
-        logs.create_log_group(logGroupName=name, tags=_tags_dict(system_name, owner))
+        logs.create_log_group(logGroupName=name, tags=_tags_dict(extra_tags, owner))
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceAlreadyExistsException":
             raise
         logs.tag_resource(
             resourceArn=logs.describe_log_groups(logGroupNamePrefix=name)["logGroups"][0]["arn"].rstrip(":*"),
-            tags=_tags_dict(system_name, owner),
+            tags=_tags_dict(extra_tags, owner),
         )
     logs.put_retention_policy(logGroupName=name, retentionInDays=90)
     if log_forwarder_arn:
@@ -345,7 +355,7 @@ def _deploy_tamper_alert(
     owner: str,
     account_id: str,
     region: str,
-    system_name: str,
+    extra_tags: dict[str, str],
     env_label: str,
     kms_key_id: str,
     main_lambda_name: str,
@@ -363,7 +373,7 @@ def _deploy_tamper_alert(
     rule_name = f"clync-tamper-watch-{owner}"
     log_group = f"/aws/lambda/{alert_fn_name}"
 
-    _ensure_log_group(logs, log_group, system_name, owner, log_forwarder_arn)
+    _ensure_log_group(logs, log_group, extra_tags, owner, log_forwarder_arn)
     assume = {
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}],
@@ -374,7 +384,7 @@ def _deploy_tamper_alert(
         assume,
         {},
         ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"],
-        _tags_kv(system_name, owner),
+        _tags_kv(extra_tags, owner),
     )
 
     buf = io.BytesIO()
@@ -406,7 +416,7 @@ def _deploy_tamper_alert(
             Environment={"Variables": env_vars},
         )
         cfg = _wait_lambda_ready(lam, alert_fn_name)
-        lam.tag_resource(Resource=cfg["FunctionArn"], Tags=_tags_dict(system_name, owner))
+        lam.tag_resource(Resource=cfg["FunctionArn"], Tags=_tags_dict(extra_tags, owner))
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
@@ -420,7 +430,7 @@ def _deploy_tamper_alert(
             Timeout=15,
             MemorySize=256,
             Environment={"Variables": env_vars},
-            Tags=_tags_dict(system_name, owner),
+            Tags=_tags_dict(extra_tags, owner),
         )
         cfg = _wait_lambda_ready(lam, alert_fn_name)
 
@@ -449,7 +459,7 @@ def _deploy_tamper_alert(
         EventPattern=json.dumps(pattern),
         State="ENABLED",
         Description=f"CloudTrail tamper watch for clync-share owner {owner}",
-        Tags=_tags_kv(system_name, owner),
+        Tags=_tags_kv(extra_tags, owner),
     )["RuleArn"]
     try:
         lam.add_permission(
@@ -480,7 +490,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     logs = session.client("logs")
 
     owner = args.owner
-    system_name = args.system_name
+    extra_tags = _parse_tags(args.tags)
     fn_name = f"clync-share-{owner}"
     role_name = f"clync-share-{owner}-role"
     repo_name = f"clync-share-{owner}"
@@ -493,8 +503,8 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     owner_role_arns = [x.strip() for x in args.owner_role_arns.split(",") if x.strip()]
     allowed_role_prefixes = [x.strip() for x in args.allowed_role_prefixes.split(",") if x.strip()]
 
-    print(f"[1/6] Staging bucket {bucket} (tag={system_name})...")
-    _ensure_staging_bucket(s3, bucket, args.region, system_name, owner)
+    print(f"[1/6] Staging bucket {bucket} (tags={_tags_dict(extra_tags, owner)})...")
+    _ensure_staging_bucket(s3, bucket, args.region, extra_tags, owner)
 
     print(f"[2/6] IAM role {role_name} & SG {sg_name}...")
     assume = {
@@ -532,13 +542,13 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         assume,
         inline,
         ["arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"],
-        _tags_kv(system_name, owner),
+        _tags_kv(extra_tags, owner),
     )
-    sg_id = _ensure_security_group(ec2, args.vpc_id, sg_name, args.rds_sg_id, system_name, owner)
+    sg_id = _ensure_security_group(ec2, args.vpc_id, sg_name, args.rds_sg_id, extra_tags, owner)
 
     print(f"[3/6] Per-owner KMS CMK alias/clync-share-{owner} (no account-root statement)...")
     key_id, key_arn = _ensure_kms_key(
-        kms, owner, account_id, owner_user_ids, owner_role_arns, role_arn, role_id, system_name
+        kms, owner, account_id, owner_user_ids, owner_role_arns, role_arn, role_id, extra_tags
     )
     iam.put_role_policy(
         RoleName=role_name,
@@ -565,14 +575,14 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         repo_name,
         Path(args.model_onnx).expanduser(),
         Path(args.tokenizer_json).expanduser(),
-        system_name,
+        extra_tags,
         owner,
         skip_build=args.skip_image_build,
     )
 
     print(f"[5/6] Container Lambda {fn_name} ({LAMBDA_MEMORY_MB} MB, arm64)...")
     main_log_group = f"/aws/lambda/{fn_name}"
-    _ensure_log_group(logs, main_log_group, system_name, owner, args.log_forwarder_arn)
+    _ensure_log_group(logs, main_log_group, extra_tags, owner, args.log_forwarder_arn)
     subnets = [s.strip() for s in args.subnets.split(",") if s.strip()]
     env_vars = {
         "CLYNC_OWNER": owner,
@@ -605,7 +615,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             Environment={"Variables": env_vars},
         )
         cfg = _wait_lambda_ready(lam, fn_name)
-        lam.tag_resource(Resource=cfg["FunctionArn"], Tags=_tags_dict(system_name, owner))
+        lam.tag_resource(Resource=cfg["FunctionArn"], Tags=_tags_dict(extra_tags, owner))
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceNotFoundException":
             raise
@@ -619,7 +629,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             MemorySize=LAMBDA_MEMORY_MB,
             VpcConfig={"SubnetIds": subnets, "SecurityGroupIds": [sg_id]},
             Environment={"Variables": env_vars},
-            Tags=_tags_dict(system_name, owner),
+            Tags=_tags_dict(extra_tags, owner),
         )
         cfg = _wait_lambda_ready(lam, fn_name)
 
@@ -629,7 +639,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         owner=owner,
         account_id=account_id,
         region=args.region,
-        system_name=system_name,
+        extra_tags=extra_tags,
         env_label=args.env_label,
         kms_key_id=key_id,
         main_lambda_name=fn_name,
@@ -643,7 +653,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
             "owner": owner,
             "account_id": account_id,
             "region": args.region,
-            "system_name": system_name,
+            "extra_tags": extra_tags,
             "lambda_arn": cfg["FunctionArn"],
             "lambda_name": fn_name,
             "lambda_role_arn": role_arn,
@@ -977,10 +987,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_dep = sub.add_parser("deploy", help="create/update per-owner clync-share AWS stack")
-    p_dep.add_argument("--owner", required=True, help="owner short slug (e.g. joy)")
+    p_dep.add_argument("--owner", required=True, help="owner short slug (e.g. alice)")
     p_dep.add_argument("--region", required=True)
     p_dep.add_argument("--profile", help="AWS profile")
-    p_dep.add_argument("--system-name", default="clync-share", help="cost-allocation tag value")
+    p_dep.add_argument(
+        "--tag", dest="tags", action="append", default=[], metavar="KEY=VALUE",
+        help="extra tag on every taggable resource (repeatable)",
+    )
     p_dep.add_argument("--env-label", default="dev")
     p_dep.add_argument("--vpc-id", required=True)
     p_dep.add_argument("--subnets", required=True, help="comma-separated private subnet IDs")
@@ -994,7 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
     p_dep.add_argument("--owner-role-arns", required=True, help="comma-separated owner IAM role ARNs for KMS policy")
     p_dep.add_argument("--allowed-role-prefixes", required=True, help="comma-separated caller STS ARN prefixes for read-only ask")
     p_dep.add_argument("--staging-bucket", default="")
-    p_dep.add_argument("--log-forwarder-arn", default="")
+    p_dep.add_argument("--log-forwarder-arn", default="", help="Lambda ARN to subscribe both log groups to")
     p_dep.add_argument("--bedrock-region", required=True, help="region whose Bedrock invocation logging is off")
     p_dep.add_argument("--bedrock-model-id", required=True)
     p_dep.add_argument("--model-onnx", default=str(DATA_HOME / "bench/onnx/bge_m3_int8_dense_sparse.onnx"))

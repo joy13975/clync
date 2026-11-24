@@ -211,6 +211,9 @@ def test_lambda_handler_gates_owner_actions_and_rejects_bad_sts_host(monkeypatch
     monkeypatch.setenv("CLYNC_ALLOWED_ROLE_PREFIXES", "arn:aws:sts::111122223333:assumed-role/TeamPU/")
     monkeypatch.setenv("CLYNC_DATA_KEY_CT_B64", "AAAA")
     monkeypatch.setenv("CLYNC_KMS_KEY_ID", "arn:aws:kms:us-east-1:111122223333:key/abc")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("CLYNC_BEDROCK_REGION", "us-west-2")
+    monkeypatch.setenv("CLYNC_BEDROCK_MODEL_ID", "example.model-v1")
 
     import handler
 

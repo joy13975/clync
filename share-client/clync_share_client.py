@@ -146,9 +146,9 @@ def invoke_share_lambda(
 def _profile_priority(name: str, role_hint: str) -> tuple[int, str]:
     """Rank matching AWS profiles for clync-share: PowerUser first, Admin second, ReadOnly last."""
     text = f"{name} {role_hint}".lower()
-    if "readonly" in text or re.search(r"(^|[-_/])ro($|[-_/])", name.lower()):
+    if "readonly" in text:
         return (3, name)
-    if "poweruser" in text or re.search(r"(^|[-_/])pu($|[-_/])", name.lower()):
+    if "poweruser" in text:
         return (0, name)
     if "admin" in text:
         return (1, name)
