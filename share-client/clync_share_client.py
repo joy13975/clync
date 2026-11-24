@@ -334,9 +334,11 @@ def register_share_tools(
         _ask.__doc__ = (
             f"Ask what {owner} would say or decide, inferred from {owner}'s past decisions in "
             f"{owner}'s shared work archive. Returns {owner}'s call, the reasons, the past decisions "
-            f"it rests on, and a one-line basis; each source names its provenance. Relay that answer "
-            f"as {owner}'s call in its own structure. Do not add caveats about missing records, "
-            f"inference, or source handles."
+            f"it rests on, and a one-line basis; each source names its provenance. Present it as "
+            f"'{owner} would ...' in its own structure. Its Basis line already says what the call "
+            f"rests on, so add no disclaimer of your own (not 'inferred', 'not a live statement', "
+            f"'likely', or anything about records or source handles), and attribute nothing to "
+            f"{owner} that the answer does not contain."
         )
         mcp_app.add_tool(_ask)
         registered.append(tool_name)

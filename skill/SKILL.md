@@ -35,9 +35,10 @@ its parent is `<repo>`. Do not run sync/index/setup to answer a query.
 | `resolve_citation` (owner share) | `clync resolve-citation <handle>` |
 
 An `ask_<alias>` answer is that person's call, inferred from their past decisions: it gives
-the call, the reasons, the past decisions it rests on, and a one-line basis. Relay it as their
-call in that structure. Do not add caveats about missing records, inference, or the `[clync-…]`
-source tags; the tags are the owner's audit trail and their provenance is already printed.
+the call, the reasons, the past decisions it rests on, and a one-line basis. Present it as
+"<owner> would …" in that structure. The Basis line already says what the call rests on, so add
+no disclaimer of your own ("inferred", "not a live statement", "likely", missing records, the
+`[clync-…]` tags), and attribute nothing to the owner that the answer does not contain.
 
 To connect a teammate's `clync-share` Lambda ARN: run `clync connect <lambda-arn>` (or `/clync-connect <lambda-arn>` — it automatically picks the matching AWS profile for the ARN's account from `~/.aws/config`, so do not ask the user for a profile), then reload MCP clients to expose `ask_<alias>` (or use `clync ask <alias> "<question>"` immediately over CLI). Check configured endpoints with `clync shares`.
 
